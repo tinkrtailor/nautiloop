@@ -94,13 +94,15 @@ pub mod bare {
         }
 
         async fn create_branch(&self, branch: &str) -> Result<String> {
-            let head_sha = self
-                .run_git(&["rev-parse", "HEAD"])
-                .await
-                .map_err(|e| crate::error::NemoError::Git(format!("Failed to get HEAD: {e}")))?;
+            // Use origin/main (the fetched remote tip) not bare-repo HEAD
+            let base_ref = match self.run_git(&["rev-parse", "origin/main"]).await {
+                Ok(sha) => sha,
+                Err(_) => self.run_git(&["rev-parse", "HEAD"]).await
+                    .map_err(|e| crate::error::NemoError::Git(format!("Failed to resolve base ref: {e}")))?,
+            };
 
             // Try to create the branch
-            match self.run_git(&["branch", branch, "HEAD"]).await {
+            match self.run_git(&["branch", branch, &base_ref]).await {
                 Ok(_) => {}
                 Err(_) => {
                     // Branch exists — check PR state before reusing
@@ -116,7 +118,7 @@ pub mod bare {
                         Some("MERGED") | Some("CLOSED") => {
                             // Old PR is done: delete branch and recreate fresh
                             let _ = self.run_git(&["branch", "-D", branch]).await;
-                            self.run_git(&["branch", branch, "HEAD"])
+                            self.run_git(&["branch", branch, &base_ref])
                                 .await
                                 .map_err(|e| crate::error::NemoError::Git(
                                     format!("Failed to recreate branch {branch}: {e}")
@@ -124,7 +126,7 @@ pub mod bare {
                         }
                         _ => {
                             // No PR — safe to force-reset
-                            self.run_git(&["branch", "-f", branch, "HEAD"])
+                            self.run_git(&["branch", "-f", branch, &base_ref])
                                 .await
                                 .map_err(|e| crate::error::NemoError::Git(
                                     format!("Failed to reset existing branch {branch}: {e}")
@@ -134,7 +136,7 @@ pub mod bare {
                 }
             }
 
-            Ok(head_sha)
+            Ok(base_ref)
         }
 
         async fn read_file(&self, path: &str, git_ref: &str) -> Result<String> {

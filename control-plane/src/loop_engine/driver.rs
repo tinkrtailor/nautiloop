@@ -956,7 +956,24 @@ impl ConvergentLoopDriver {
             _ => return Ok(record.state),
         };
 
-        let ctx = self.build_context(&updated);
+        let mut ctx = self.build_context(&updated);
+
+        // Restore feedback_path for implementing redispatch (N30):
+        // look at the prior round's stage to determine review vs test feedback
+        if record.state == LoopState::Implementing && record.round > 1 {
+            let rounds = self.store.get_rounds(record.id).await?;
+            // Find the last round before current that produced feedback
+            let prior_round = record.round - 1;
+            let prior_stage = rounds
+                .iter()
+                .rfind(|r| r.round == prior_round)
+                .map(|r| r.stage.as_str());
+            ctx.feedback_path = Some(match prior_stage {
+                Some("test") => format!(".agent/test-feedback-round-{prior_round}.json"),
+                _ => format!(".agent/review-feedback-round-{prior_round}.json"),
+            });
+        }
+
         let job = job_builder::build_job(
             &ctx,
             &stage_config,
@@ -1073,15 +1090,10 @@ impl ConvergentLoopDriver {
     }
 
     fn build_context(&self, record: &LoopRecord) -> LoopContext {
-        // Restore feedback_path from prior round if this is a re-dispatch (round > 1)
-        let feedback_path = if record.round > 1 && record.state == LoopState::Implementing {
-            Some(format!(
-                ".agent/review-feedback-round-{}.json",
-                record.round - 1
-            ))
-        } else {
-            None
-        };
+        // feedback_path is set explicitly by dispatch_implement_with_feedback;
+        // for redispatch/resume, it's restored by redispatch_current_stage.
+        // Default to None here — callers override via ctx.feedback_path = ... when needed.
+        let feedback_path = None;
 
         LoopContext {
             loop_id: record.id,

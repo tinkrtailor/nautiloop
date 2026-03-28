@@ -47,8 +47,8 @@ pub async fn run(client: &NemoClient, engineer: &str, claude: bool, openai: bool
             continue;
         }
 
-        // Register credentials with the control plane
-        match client.register_credentials(engineer, provider, &cred_path).await {
+        // Register credentials with the control plane (send content, not path)
+        match client.register_credentials(engineer, provider, &content).await {
             Ok(()) => {
                 println!("Registered {provider} credentials with control plane");
                 any_found = true;
