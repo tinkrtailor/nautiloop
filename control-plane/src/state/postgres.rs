@@ -5,7 +5,7 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use super::{LoopFlag, StateStore};
-use crate::error::Result;
+use crate::error::{NemoError, Result};
 use crate::types::{
     EngineerCredential, LogEvent, LoopKind, LoopRecord, LoopState, RoundRecord, SubState,
 };
@@ -31,40 +31,46 @@ impl PgStateStore {
     }
 }
 
-/// Helper to parse LoopState from a string.
-fn parse_loop_state(s: &str) -> LoopState {
+/// Helper to parse LoopState from a string. Returns error on unknown values (Finding #12).
+fn parse_loop_state(s: &str) -> Result<LoopState> {
     match s {
-        "PENDING" => LoopState::Pending,
-        "HARDENING" => LoopState::Hardening,
-        "AWAITING_APPROVAL" => LoopState::AwaitingApproval,
-        "IMPLEMENTING" => LoopState::Implementing,
-        "TESTING" => LoopState::Testing,
-        "REVIEWING" => LoopState::Reviewing,
-        "CONVERGED" => LoopState::Converged,
-        "FAILED" => LoopState::Failed,
-        "CANCELLED" => LoopState::Cancelled,
-        "PAUSED" => LoopState::Paused,
-        "AWAITING_REAUTH" => LoopState::AwaitingReauth,
-        "HARDENED" => LoopState::Hardened,
-        "SHIPPED" => LoopState::Shipped,
-        _ => LoopState::Pending,
+        "PENDING" => Ok(LoopState::Pending),
+        "HARDENING" => Ok(LoopState::Hardening),
+        "AWAITING_APPROVAL" => Ok(LoopState::AwaitingApproval),
+        "IMPLEMENTING" => Ok(LoopState::Implementing),
+        "TESTING" => Ok(LoopState::Testing),
+        "REVIEWING" => Ok(LoopState::Reviewing),
+        "CONVERGED" => Ok(LoopState::Converged),
+        "FAILED" => Ok(LoopState::Failed),
+        "CANCELLED" => Ok(LoopState::Cancelled),
+        "PAUSED" => Ok(LoopState::Paused),
+        "AWAITING_REAUTH" => Ok(LoopState::AwaitingReauth),
+        "HARDENED" => Ok(LoopState::Hardened),
+        "SHIPPED" => Ok(LoopState::Shipped),
+        unknown => Err(NemoError::Internal(format!(
+            "Corrupt DB: unknown loop_state '{unknown}'"
+        ))),
     }
 }
 
-fn parse_sub_state(s: &str) -> SubState {
+fn parse_sub_state(s: &str) -> Result<SubState> {
     match s {
-        "DISPATCHED" => SubState::Dispatched,
-        "RUNNING" => SubState::Running,
-        "COMPLETED" => SubState::Completed,
-        _ => SubState::Dispatched,
+        "DISPATCHED" => Ok(SubState::Dispatched),
+        "RUNNING" => Ok(SubState::Running),
+        "COMPLETED" => Ok(SubState::Completed),
+        unknown => Err(NemoError::Internal(format!(
+            "Corrupt DB: unknown sub_state '{unknown}'"
+        ))),
     }
 }
 
-fn parse_loop_kind(s: &str) -> LoopKind {
+fn parse_loop_kind(s: &str) -> Result<LoopKind> {
     match s {
-        "harden" => LoopKind::Harden,
-        "implement" => LoopKind::Implement,
-        _ => LoopKind::Implement,
+        "harden" => Ok(LoopKind::Harden),
+        "implement" => Ok(LoopKind::Implement),
+        unknown => Err(NemoError::Internal(format!(
+            "Corrupt DB: unknown loop_kind '{unknown}'"
+        ))),
     }
 }
 
@@ -101,18 +107,19 @@ fn loop_kind_str(k: LoopKind) -> &'static str {
     }
 }
 
-fn row_to_loop_record(row: &PgRow) -> LoopRecord {
-    LoopRecord {
+fn row_to_loop_record(row: &PgRow) -> Result<LoopRecord> {
+    Ok(LoopRecord {
         id: row.get("id"),
         engineer: row.get("engineer"),
         spec_path: row.get("spec_path"),
         spec_content_hash: row.get("spec_content_hash"),
         branch: row.get("branch"),
-        kind: parse_loop_kind(row.get::<String, _>("kind").as_str()),
-        state: parse_loop_state(row.get::<String, _>("state").as_str()),
+        kind: parse_loop_kind(row.get::<String, _>("kind").as_str())?,
+        state: parse_loop_state(row.get::<String, _>("state").as_str())?,
         sub_state: row
             .get::<Option<String>, _>("sub_state")
-            .map(|s| parse_sub_state(&s)),
+            .map(|s| parse_sub_state(&s))
+            .transpose()?,
         round: row.get("round"),
         max_rounds: row.get("max_rounds"),
         harden: row.get("harden"),
@@ -123,10 +130,12 @@ fn row_to_loop_record(row: &PgRow) -> LoopRecord {
         resume_requested: row.get("resume_requested"),
         paused_from_state: row
             .get::<Option<String>, _>("paused_from_state")
-            .map(|s| parse_loop_state(&s)),
+            .map(|s| parse_loop_state(&s))
+            .transpose()?,
         reauth_from_state: row
             .get::<Option<String>, _>("reauth_from_state")
-            .map(|s| parse_loop_state(&s)),
+            .map(|s| parse_loop_state(&s))
+            .transpose()?,
         failure_reason: row.get("failure_reason"),
         current_sha: row.get("current_sha"),
         session_id: row.get("session_id"),
@@ -141,7 +150,7 @@ fn row_to_loop_record(row: &PgRow) -> LoopRecord {
         spec_pr_url: row.get("spec_pr_url"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
-    }
+    })
 }
 
 fn row_to_round_record(row: &PgRow) -> RoundRecord {
@@ -241,7 +250,7 @@ impl StateStore for PgStateStore {
         .fetch_one(&self.pool)
         .await?;
 
-        Ok(row_to_loop_record(&row))
+        row_to_loop_record(&row)
     }
 
     async fn get_loop(&self, id: Uuid) -> Result<Option<LoopRecord>> {
@@ -250,7 +259,7 @@ impl StateStore for PgStateStore {
             .fetch_optional(&self.pool)
             .await?;
 
-        Ok(row.as_ref().map(row_to_loop_record))
+        row.as_ref().map(row_to_loop_record).transpose()
     }
 
     async fn get_loop_by_branch(&self, branch: &str) -> Result<Option<LoopRecord>> {
@@ -261,17 +270,17 @@ impl StateStore for PgStateStore {
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.as_ref().map(row_to_loop_record))
+        row.as_ref().map(row_to_loop_record).transpose()
     }
 
     async fn get_active_loops(&self) -> Result<Vec<LoopRecord>> {
         let rows = sqlx::query(
-            "SELECT * FROM loops WHERE state NOT IN ('CONVERGED', 'FAILED', 'CANCELLED') ORDER BY created_at ASC",
+            "SELECT * FROM loops WHERE state NOT IN ('CONVERGED', 'FAILED', 'CANCELLED', 'HARDENED', 'SHIPPED') ORDER BY created_at ASC",
         )
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows.iter().map(row_to_loop_record).collect())
+        rows.iter().map(row_to_loop_record).collect()
     }
 
     async fn get_loops_for_engineer(
@@ -295,7 +304,7 @@ impl StateStore for PgStateStore {
             }
         };
 
-        Ok(rows.iter().map(row_to_loop_record).collect())
+        rows.iter().map(row_to_loop_record).collect()
     }
 
     async fn update_loop_state(
@@ -315,17 +324,19 @@ impl StateStore for PgStateStore {
         Ok(())
     }
 
+    /// Update the loop record. Does NOT overwrite flag columns (cancel_requested,
+    /// approve_requested, resume_requested) to avoid read-modify-write race with
+    /// set_loop_flag. Use set_loop_flag for flag changes.
     async fn update_loop(&self, record: &LoopRecord) -> Result<()> {
         sqlx::query(
             r#"
             UPDATE loops SET
                 state = $2::loop_state, sub_state = $3::sub_state, round = $4,
-                cancel_requested = $5, approve_requested = $6, resume_requested = $7,
-                paused_from_state = $8::loop_state, reauth_from_state = $9::loop_state,
-                failure_reason = $10, current_sha = $11, session_id = $12,
-                active_job_name = $13, retry_count = $14,
-                merge_sha = $15, merged_at = $16,
-                hardened_spec_path = $17, spec_pr_url = $18,
+                paused_from_state = $5::loop_state, reauth_from_state = $6::loop_state,
+                failure_reason = $7, current_sha = $8, session_id = $9,
+                active_job_name = $10, retry_count = $11,
+                merge_sha = $12, merged_at = $13,
+                hardened_spec_path = $14, spec_pr_url = $15,
                 updated_at = NOW()
             WHERE id = $1
             "#,
@@ -334,9 +345,6 @@ impl StateStore for PgStateStore {
         .bind(loop_state_str(record.state))
         .bind(record.sub_state.map(sub_state_str))
         .bind(record.round)
-        .bind(record.cancel_requested)
-        .bind(record.approve_requested)
-        .bind(record.resume_requested)
         .bind(record.paused_from_state.map(loop_state_str))
         .bind(record.reauth_from_state.map(loop_state_str))
         .bind(&record.failure_reason)

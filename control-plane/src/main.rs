@@ -1,20 +1,22 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 use tokio::sync::{watch, Notify};
 use tracing_subscriber::EnvFilter;
 
 use nemo_control_plane::api::{self, AppState};
 use nemo_control_plane::config::NemoConfig;
-use nemo_control_plane::git::mock::MockGitOperations;
-use nemo_control_plane::k8s::mock::MockJobDispatcher;
+use nemo_control_plane::git::GitOperations;
+use nemo_control_plane::k8s::client::KubeJobDispatcher;
+use nemo_control_plane::k8s::JobDispatcher;
 use nemo_control_plane::loop_engine::{ConvergentLoopDriver, Reconciler};
-use nemo_control_plane::state::memory::MemoryStateStore;
+use nemo_control_plane::state::postgres::PgStateStore;
+use nemo_control_plane::state::StateStore;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -26,11 +28,42 @@ async fn main() -> anyhow::Result<()> {
     let config = NemoConfig::default();
     let config_arc = Arc::new(config.clone());
 
-    // For now, use in-memory/mock implementations.
-    // Production: use PgStateStore, KubeJobDispatcher, real GitOperations.
-    let store: Arc<MemoryStateStore> = Arc::new(MemoryStateStore::new());
-    let dispatcher: Arc<MockJobDispatcher> = Arc::new(MockJobDispatcher::new());
-    let git: Arc<MockGitOperations> = Arc::new(MockGitOperations::new());
+    // Connect to Postgres and run migrations
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| config.cluster.database_url.clone());
+
+    let pool = PgPoolOptions::new()
+        .max_connections(config.cluster.max_connections)
+        .connect(&database_url)
+        .await?;
+
+    let pg_store = PgStateStore::new(pool);
+    pg_store.run_migrations().await?;
+    tracing::info!("Database migrations complete");
+
+    let store: Arc<dyn StateStore> = Arc::new(pg_store);
+
+    // Build K8s job dispatcher
+    let dispatcher: Arc<dyn JobDispatcher> = match kube::Client::try_default().await {
+        Ok(kube_client) => {
+            tracing::info!("Connected to Kubernetes cluster");
+            Arc::new(KubeJobDispatcher::new(
+                kube_client,
+                config.cluster.jobs_namespace.clone(),
+            ))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to connect to Kubernetes, using mock dispatcher");
+            Arc::new(nemo_control_plane::k8s::mock::MockJobDispatcher::new())
+        }
+    };
+
+    // Build git operations (bare repo)
+    let bare_repo_path = std::env::var("NEMO_BARE_REPO_PATH")
+        .unwrap_or_else(|_| "/data/bare-repo.git".to_string());
+    let git: Arc<dyn GitOperations> = Arc::new(
+        nemo_control_plane::git::bare::BareRepoGitOperations::new(&bare_repo_path),
+    );
 
     // Build the loop driver
     let driver = Arc::new(ConvergentLoopDriver::new(

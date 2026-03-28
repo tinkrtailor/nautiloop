@@ -184,9 +184,21 @@ pub mod memory {
             Ok(())
         }
 
+        /// Update the loop record. Preserves flag columns (cancel_requested,
+        /// approve_requested, resume_requested) to match Postgres behavior and
+        /// avoid read-modify-write race with set_loop_flag.
         async fn update_loop(&self, record: &LoopRecord) -> Result<()> {
             let mut loops = self.loops.write().await;
-            loops.insert(record.id, record.clone());
+            if let Some(existing) = loops.get(&record.id) {
+                let mut merged = record.clone();
+                // Preserve flags from existing record (only set_loop_flag should modify these)
+                merged.cancel_requested = existing.cancel_requested;
+                merged.approve_requested = existing.approve_requested;
+                merged.resume_requested = existing.resume_requested;
+                loops.insert(record.id, merged);
+            } else {
+                loops.insert(record.id, record.clone());
+            }
             Ok(())
         }
 

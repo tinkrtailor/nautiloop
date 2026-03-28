@@ -146,6 +146,24 @@ impl ConvergentLoopDriver {
                             updated.sub_state = Some(SubState::Running);
                             self.store.update_loop(&updated).await?;
                         }
+
+                        // Divergence detection: if branch SHA changed unexpectedly, pause
+                        if let Some(ref expected_sha) = record.current_sha
+                            && self.git.has_diverged(&record.branch, expected_sha).await?
+                        {
+                            tracing::warn!(
+                                loop_id = %record.id,
+                                branch = %record.branch,
+                                "Branch diverged while job running, pausing loop"
+                            );
+                            let mut paused = record.clone();
+                            paused.state = LoopState::Paused;
+                            paused.sub_state = None;
+                            paused.paused_from_state = Some(record.state);
+                            self.store.update_loop(&paused).await?;
+                            return Ok(LoopState::Paused);
+                        }
+
                         Ok(record.state)
                     }
                     JobStatus::Succeeded => {
@@ -170,10 +188,13 @@ impl ConvergentLoopDriver {
         }
     }
 
-    /// Handle a successfully completed job: evaluate and advance.
+    /// Handle a successfully completed job: ingest output, then evaluate and advance.
     async fn handle_job_completed(&self, record: &LoopRecord) -> Result<LoopState> {
         let mut updated = record.clone();
         updated.sub_state = Some(SubState::Completed);
+
+        // Ingest job output: read verdict from git, update round record, set current_sha
+        self.ingest_job_output(&mut updated).await?;
 
         match record.state {
             LoopState::Hardening => self.evaluate_harden_stage(&mut updated).await,
@@ -184,6 +205,84 @@ impl ConvergentLoopDriver {
                 // Should not happen
                 Ok(record.state)
             }
+        }
+    }
+
+    /// Ingest output from a completed job: read verdict from git, update round record, set current_sha.
+    async fn ingest_job_output(&self, record: &mut LoopRecord) -> Result<()> {
+        // Get the branch tip SHA and set current_sha
+        if let Some(sha) = self.git.get_branch_sha(&record.branch).await? {
+            record.current_sha = Some(sha);
+        }
+
+        // Determine verdict file path based on current stage
+        let verdict_path = self.verdict_path_for_stage(record).await;
+
+        // Read verdict JSON from git
+        let git_ref = record
+            .current_sha
+            .as_deref()
+            .unwrap_or(&record.branch);
+        let verdict_json = match self.git.read_file(&verdict_path, git_ref).await {
+            Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(
+                        loop_id = %record.id,
+                        path = verdict_path,
+                        error = %e,
+                        "Failed to parse verdict JSON"
+                    );
+                    None
+                }
+            },
+            Err(_) => {
+                tracing::debug!(
+                    loop_id = %record.id,
+                    path = verdict_path,
+                    "No verdict file found"
+                );
+                None
+            }
+        };
+
+        // Update the round record with output + completion time
+        let rounds = self.store.get_rounds(record.id).await?;
+        if let Some(round) = rounds
+            .iter()
+            .rfind(|r| r.round == record.round && r.completed_at.is_none())
+        {
+            let mut updated_round = round.clone();
+            updated_round.output = verdict_json;
+            updated_round.completed_at = Some(chrono::Utc::now());
+            if let Some(started) = round.started_at {
+                let duration = chrono::Utc::now() - started;
+                updated_round.duration_secs = Some(duration.num_seconds());
+            }
+            self.store.update_round(&updated_round).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Determine the verdict file path based on current stage and sub-stage.
+    async fn verdict_path_for_stage(&self, record: &LoopRecord) -> String {
+        match record.state {
+            LoopState::Implementing => ".agent/implement-output.json".to_string(),
+            LoopState::Testing => ".agent/test-output.json".to_string(),
+            LoopState::Reviewing => ".agent/review-verdict.json".to_string(),
+            LoopState::Hardening => {
+                // Determine if this was an audit or revise job
+                if let Ok(rounds) = self.store.get_rounds(record.id).await {
+                    let last = rounds.iter().rfind(|r| r.round == record.round);
+                    match last.map(|r| r.stage.as_str()) {
+                        Some("revise") => return ".agent/revise-output.json".to_string(),
+                        _ => return ".agent/audit-verdict.json".to_string(),
+                    }
+                }
+                ".agent/audit-verdict.json".to_string()
+            }
+            _ => ".agent/verdict.json".to_string(),
         }
     }
 
@@ -447,9 +546,11 @@ impl ConvergentLoopDriver {
     /// Handle AWAITING_APPROVAL: check for approve flag.
     async fn handle_awaiting_approval(&self, record: &LoopRecord) -> Result<LoopState> {
         if record.approve_requested {
-            let mut updated = record.clone();
-            updated.approve_requested = false;
-            self.start_implementing(&updated).await
+            // Clear the flag with a narrow update (avoids read-modify-write race)
+            self.store
+                .set_loop_flag(record.id, crate::state::LoopFlag::Approve, false)
+                .await?;
+            self.start_implementing(record).await
         } else {
             // Still waiting
             Ok(LoopState::AwaitingApproval)
@@ -459,11 +560,14 @@ impl ConvergentLoopDriver {
     /// Handle PAUSED: check for resume flag.
     async fn handle_paused(&self, record: &LoopRecord) -> Result<LoopState> {
         if record.resume_requested {
-            let mut updated = record.clone();
-            updated.resume_requested = false;
+            // Clear the flag with a narrow update
+            self.store
+                .set_loop_flag(record.id, crate::state::LoopFlag::Resume, false)
+                .await?;
 
             // Resume to the stage we paused from
             if let Some(paused_from) = record.paused_from_state {
+                let mut updated = record.clone();
                 updated.state = paused_from;
                 updated.paused_from_state = None;
                 self.redispatch_current_stage(&updated).await
@@ -479,10 +583,13 @@ impl ConvergentLoopDriver {
     /// Handle AWAITING_REAUTH: check for resume flag (after creds re-pushed).
     async fn handle_awaiting_reauth(&self, record: &LoopRecord) -> Result<LoopState> {
         if record.resume_requested {
-            let mut updated = record.clone();
-            updated.resume_requested = false;
+            // Clear the flag with a narrow update
+            self.store
+                .set_loop_flag(record.id, crate::state::LoopFlag::Resume, false)
+                .await?;
 
             if let Some(reauth_from) = record.reauth_from_state {
+                let mut updated = record.clone();
                 updated.state = reauth_from;
                 updated.reauth_from_state = None;
                 self.redispatch_current_stage(&updated).await
@@ -504,12 +611,16 @@ impl ConvergentLoopDriver {
                 .await;
         }
 
+        // Clear the cancel flag with a narrow update
+        self.store
+            .set_loop_flag(record.id, crate::state::LoopFlag::Cancel, false)
+            .await?;
+
         let mut updated = record.clone();
         updated.state = LoopState::Cancelled;
         updated.sub_state = None;
         updated.failure_reason = Some("Cancelled by user".to_string());
         updated.active_job_name = None;
-        updated.cancel_requested = false;
         self.store.update_loop(&updated).await?;
 
         tracing::info!(loop_id = %record.id, "Loop CANCELLED by user");
@@ -732,7 +843,18 @@ impl ConvergentLoopDriver {
         updated.sub_state = Some(SubState::Dispatched);
 
         let stage_config = match record.state {
-            LoopState::Hardening => self.audit_stage_config(), // simplified: could be revise
+            LoopState::Hardening => {
+                // Determine which harden sub-stage to redispatch by checking the latest round
+                let rounds = self.store.get_rounds(record.id).await?;
+                let last_stage = rounds
+                    .iter()
+                    .rfind(|r| r.round == record.round)
+                    .map(|r| r.stage.as_str());
+                match last_stage {
+                    Some("revise") => self.revise_stage_config(record),
+                    _ => self.audit_stage_config(),
+                }
+            }
             LoopState::Implementing => self.implement_stage_config(record),
             LoopState::Testing => self.test_stage_config(),
             LoopState::Reviewing => self.review_stage_config(record),
@@ -1381,6 +1503,129 @@ mod tests {
         let updated = store.get_loop(record.id).await.unwrap().unwrap();
         assert_eq!(updated.state, LoopState::Converged);
         assert!(updated.failure_reason.unwrap().contains("above auto-merge threshold"));
+    }
+
+    #[tokio::test]
+    async fn test_output_ingestion_on_job_completion() {
+        let store = Arc::new(MemoryStateStore::new());
+        let dispatcher = Arc::new(MockJobDispatcher::new());
+        let git = Arc::new(MockGitOperations::new());
+        let driver = ConvergentLoopDriver::new(
+            store.clone(),
+            dispatcher.clone(),
+            git.clone(),
+            NemoConfig::default(),
+        );
+
+        // Set up branch SHA and verdict file in git
+        git.set_branch_sha("agent/alice/test-abc12345", "aabbccdd11223344")
+            .await;
+        git.add_file(
+            ".agent/review-verdict.json",
+            r#"{"clean": true, "confidence": 0.95, "issues": [], "summary": "LGTM", "token_usage": {"input": 1000, "output": 200}}"#,
+        )
+        .await;
+
+        // Create a loop in REVIEWING/DISPATCHED state
+        let mut record = make_pending_loop(true);
+        record.state = LoopState::Reviewing;
+        record.sub_state = Some(SubState::Dispatched);
+        record.round = 1;
+        record.active_job_name = Some("review-job".to_string());
+        store.create_loop(&record).await.unwrap();
+
+        // Create the round record (output is None initially)
+        let round_id = Uuid::new_v4();
+        let round_record = RoundRecord {
+            id: round_id,
+            loop_id: record.id,
+            round: 1,
+            stage: "review".to_string(),
+            input: None,
+            output: None,
+            started_at: Some(chrono::Utc::now() - chrono::Duration::seconds(30)),
+            completed_at: None,
+            duration_secs: None,
+            job_name: Some("review-job".to_string()),
+        };
+        store.create_round(&round_record).await.unwrap();
+
+        // Set job to succeeded
+        let job = k8s_openapi::api::batch::v1::Job {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                name: Some("review-job".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        dispatcher.create_job(&job).await.unwrap();
+        dispatcher
+            .set_job_status("review-job", JobStatus::Succeeded)
+            .await;
+
+        // Tick: should ingest output, then evaluate -> CONVERGED
+        let new_state = driver.tick(record.id).await.unwrap();
+        assert_eq!(new_state, LoopState::Converged);
+
+        // Verify round record was updated with output
+        let rounds = store.get_rounds(record.id).await.unwrap();
+        let updated_round = rounds.iter().find(|r| r.id == round_id).unwrap();
+        assert!(updated_round.output.is_some(), "Round output should be populated after ingestion");
+        assert!(updated_round.completed_at.is_some(), "completed_at should be set");
+        assert!(updated_round.duration_secs.is_some(), "duration_secs should be set");
+
+        // Verify current_sha was set
+        let updated_loop = store.get_loop(record.id).await.unwrap().unwrap();
+        assert_eq!(
+            updated_loop.current_sha,
+            Some("aabbccdd11223344".to_string()),
+            "current_sha should be populated from branch tip"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_divergence_detection_pauses_loop() {
+        let store = Arc::new(MemoryStateStore::new());
+        let dispatcher = Arc::new(MockJobDispatcher::new());
+        let git = Arc::new(MockGitOperations::new());
+        let driver = ConvergentLoopDriver::new(
+            store.clone(),
+            dispatcher.clone(),
+            git.clone(),
+            NemoConfig::default(),
+        );
+
+        // Set branch to a different SHA than expected
+        git.set_branch_sha("agent/alice/test-abc12345", "diverged_sha")
+            .await;
+
+        let mut record = make_pending_loop(true);
+        record.state = LoopState::Implementing;
+        record.sub_state = Some(SubState::Dispatched);
+        record.round = 1;
+        record.current_sha = Some("original_sha".to_string());
+        record.active_job_name = Some("impl-job".to_string());
+        store.create_loop(&record).await.unwrap();
+
+        // Create job in Running state
+        let job = k8s_openapi::api::batch::v1::Job {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                name: Some("impl-job".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        dispatcher.create_job(&job).await.unwrap();
+        dispatcher
+            .set_job_status("impl-job", JobStatus::Running)
+            .await;
+
+        let new_state = driver.tick(record.id).await.unwrap();
+        assert_eq!(new_state, LoopState::Paused);
+
+        let updated = store.get_loop(record.id).await.unwrap().unwrap();
+        assert_eq!(updated.state, LoopState::Paused);
+        assert_eq!(updated.paused_from_state, Some(LoopState::Implementing));
     }
 
     #[tokio::test]

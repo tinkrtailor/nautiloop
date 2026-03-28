@@ -91,7 +91,7 @@ pub struct LogEventResponse {
 pub struct CancelResponse {
     pub loop_id: Uuid,
     pub state: LoopState,
-    pub reason: String,
+    pub cancel_requested: bool,
 }
 
 /// POST /approve/:id response body.

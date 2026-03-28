@@ -34,12 +34,15 @@ pub async fn start(
     let spec_content = state.git.read_file(&req.spec_path, "HEAD").await?;
     let branch = generate_branch_name(&req.engineer, &req.spec_path, &spec_content);
 
-    // Check for active loop on this branch
+    // Check for active loop on this branch (early check; DB unique index is the real guard)
     if state.store.has_active_loop_for_branch(&branch).await? {
         return Err(NemoError::ActiveLoopConflict {
             branch: branch.clone(),
         });
     }
+
+    // Create branch in git before any DB writes (Finding #11)
+    let branch_sha = state.git.create_branch(&branch).await?;
 
     let loop_id = Uuid::new_v4();
     let now = chrono::Utc::now();
@@ -90,7 +93,7 @@ pub async fn start(
         paused_from_state: None,
         reauth_from_state: None,
         failure_reason: None,
-        current_sha: None,
+        current_sha: Some(branch_sha),
         session_id: None,
         active_job_name: None,
         retry_count: 0,
@@ -104,7 +107,17 @@ pub async fn start(
         updated_at: now,
     };
 
-    state.store.create_loop(&record).await?;
+    // Create loop; the DB unique index on (branch, active state) prevents duplicates
+    // even under concurrent requests (Finding #5).
+    match state.store.create_loop(&record).await {
+        Ok(_) => {}
+        Err(NemoError::Database(ref e)) if is_unique_violation(e) => {
+            return Err(NemoError::ActiveLoopConflict {
+                branch: branch.clone(),
+            });
+        }
+        Err(e) => return Err(e),
+    }
 
     tracing::info!(
         loop_id = %loop_id,
@@ -222,10 +235,11 @@ pub async fn cancel(
         .set_loop_flag(id, LoopFlag::Cancel, true)
         .await?;
 
+    // Return current state + cancel_requested flag (not CANCELLED, which hasn't happened yet)
     Ok(Json(CancelResponse {
         loop_id: id,
-        state: LoopState::Cancelled,
-        reason: "Cancelled by user".to_string(),
+        state: record.state,
+        cancel_requested: true,
     }))
 }
 
@@ -341,10 +355,18 @@ pub async fn inspect(
     }))
 }
 
+/// Check if a sqlx error is a unique constraint violation (Postgres code 23505).
+fn is_unique_violation(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::Database(db_err) => db_err.code().as_deref() == Some("23505"),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{build_router, AppState};
+    use crate::api::AppState;
     use crate::config::NemoConfig;
     use crate::git::mock::MockGitOperations;
     use crate::state::memory::MemoryStateStore;

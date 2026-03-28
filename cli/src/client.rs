@@ -88,6 +88,17 @@ impl NemoClient {
         Ok(resp.json().await?)
     }
 
+    /// Register credentials with the control plane.
+    pub async fn register_credentials(&self, provider: &str, cred_path: &str) -> Result<()> {
+        let body = serde_json::json!({
+            "provider": provider,
+            "credential_ref": cred_path,
+            "valid": true,
+        });
+        let _: serde_json::Value = self.post("/credentials", &body).await?;
+        Ok(())
+    }
+
     /// Stream SSE events from a URL. Returns raw text lines.
     pub async fn get_stream(&self, path: &str) -> Result<reqwest::Response> {
         let url = format!("{}{path}", self.base_url);
