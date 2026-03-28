@@ -19,7 +19,12 @@ pub fn build_job(
     bare_repo_pvc: &str,
 ) -> Job {
     let short_id = &ctx.loop_id.to_string()[..8];
-    let job_name = format!("nemo-{short_id}-{}-r{}", stage.name, ctx.round);
+    // Include retry count in name to avoid AlreadyExists on redispatch
+    let job_name = if ctx.retry_count > 0 {
+        format!("nemo-{short_id}-{}-r{}-t{}", stage.name, ctx.round, ctx.retry_count)
+    } else {
+        format!("nemo-{short_id}-{}-r{}", stage.name, ctx.round)
+    };
 
     let mut labels = BTreeMap::new();
     labels.insert("app".to_string(), "nemo".to_string());
@@ -177,6 +182,7 @@ mod tests {
             current_sha: "abc123".to_string(),
             round: 2,
             max_rounds: 15,
+            retry_count: 0,
             session_id: Some("session-123".to_string()),
             feedback_path: Some(".agent/review-feedback-round-1.json".to_string()),
         }

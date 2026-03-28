@@ -11,6 +11,7 @@ use crate::types::api::LogEventResponse;
 /// Stream logs for a loop via SSE.
 ///
 /// For active loops: tails from Postgres, sending new events as they appear.
+/// Uses (timestamp, id) composite cursor to avoid skipping rows at same timestamp.
 /// Closes when the loop reaches a terminal state.
 pub async fn stream_logs(
     store: Arc<dyn StateStore>,
@@ -20,11 +21,12 @@ pub async fn stream_logs(
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     let stream = async_stream::stream! {
         let mut last_timestamp = chrono::DateTime::<chrono::Utc>::MIN_UTC;
+        let mut last_id: Option<Uuid> = None;
         let poll_interval = Duration::from_millis(500);
 
         loop {
-            // Get new logs since last timestamp
-            let logs = match store.get_logs_after(loop_id, last_timestamp).await {
+            // Get new logs since last cursor (timestamp, id)
+            let logs = match store.get_logs_after(loop_id, last_timestamp, last_id).await {
                 Ok(logs) => logs,
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to get logs for SSE");
@@ -35,9 +37,18 @@ pub async fn stream_logs(
             for log in &logs {
                 // Apply filters
                 if round.is_some_and(|r| log.round != r) {
+                    // Still advance cursor even for filtered events
+                    if log.timestamp >= last_timestamp {
+                        last_timestamp = log.timestamp;
+                        last_id = Some(log.id);
+                    }
                     continue;
                 }
                 if stage.as_ref().is_some_and(|s| log.stage != *s) {
+                    if log.timestamp >= last_timestamp {
+                        last_timestamp = log.timestamp;
+                        last_id = Some(log.id);
+                    }
                     continue;
                 }
 
@@ -52,8 +63,10 @@ pub async fn stream_logs(
                     yield Ok(Event::default().data(json));
                 }
 
-                if log.timestamp > last_timestamp {
+                // Advance composite cursor
+                if log.timestamp >= last_timestamp {
                     last_timestamp = log.timestamp;
+                    last_id = Some(log.id);
                 }
             }
 

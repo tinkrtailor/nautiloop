@@ -71,11 +71,13 @@ pub trait StateStore: Send + Sync + 'static {
         stage: Option<&str>,
     ) -> Result<Vec<LogEvent>>;
 
-    /// Get log events after a given timestamp (for SSE tailing).
+    /// Get log events after a given cursor (timestamp, id) for SSE tailing.
+    /// Returns events with timestamp > after, OR timestamp == after AND id > after_id.
     async fn get_logs_after(
         &self,
         loop_id: Uuid,
         after: chrono::DateTime<chrono::Utc>,
+        after_id: Option<Uuid>,
     ) -> Result<Vec<LogEvent>>;
 
     /// Get or create engineer credentials.
@@ -286,11 +288,17 @@ pub mod memory {
             &self,
             loop_id: Uuid,
             after: chrono::DateTime<chrono::Utc>,
+            after_id: Option<Uuid>,
         ) -> Result<Vec<LogEvent>> {
             let logs = self.logs.read().await;
             Ok(logs
                 .iter()
-                .filter(|l| l.loop_id == loop_id && l.timestamp > after)
+                .filter(|l| {
+                    l.loop_id == loop_id
+                        && (l.timestamp > after
+                            || (l.timestamp == after
+                                && after_id.is_some_and(|id| l.id > id)))
+                })
                 .cloned()
                 .collect())
         }

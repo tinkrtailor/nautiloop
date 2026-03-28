@@ -29,8 +29,8 @@ pub trait GitOperations: Send + Sync + 'static {
     /// Delete a branch (cleanup on failure).
     async fn delete_branch(&self, branch: &str) -> Result<()>;
 
-    /// Check if a branch has a merged or closed PR. Returns true if a PR exists and is not open.
-    async fn has_closed_pr(&self, branch: &str) -> Result<bool>;
+    /// Get the PR state for a branch (OPEN, MERGED, CLOSED). Returns None if no PR exists.
+    async fn get_pr_state(&self, branch: &str) -> Option<String>;
 
     /// Check if CI checks have passed on a branch/PR. Returns true if all checks pass.
     async fn ci_passed(&self, branch: &str) -> Result<bool>;
@@ -103,22 +103,33 @@ pub mod bare {
             match self.run_git(&["branch", branch, "HEAD"]).await {
                 Ok(_) => {}
                 Err(_) => {
-                    // Branch exists — check if it has a merged/closed PR
-                    if self.has_closed_pr(branch).await.unwrap_or(false) {
-                        // Old branch has a merged/closed PR: delete and recreate fresh
-                        let _ = self.run_git(&["branch", "-D", branch]).await;
-                        self.run_git(&["branch", branch, "HEAD"])
-                            .await
-                            .map_err(|e| crate::error::NemoError::Git(
-                                format!("Failed to recreate branch {branch}: {e}")
-                            ))?;
-                    } else {
-                        // No PR or open PR — force-reset to HEAD for a fresh start
-                        self.run_git(&["branch", "-f", branch, "HEAD"])
-                            .await
-                            .map_err(|e| crate::error::NemoError::Git(
-                                format!("Failed to reset existing branch {branch}: {e}")
-                            ))?;
+                    // Branch exists — check PR state before reusing
+                    let pr_state = self.get_pr_state(branch).await;
+                    match pr_state.as_deref() {
+                        Some("OPEN") => {
+                            // Open PR exists: refuse reuse, caller should not silently
+                            // invalidate an active PR. Return error.
+                            return Err(crate::error::NemoError::Git(format!(
+                                "Branch {branch} has an open PR. Close or merge it before restarting."
+                            )));
+                        }
+                        Some("MERGED") | Some("CLOSED") => {
+                            // Old PR is done: delete branch and recreate fresh
+                            let _ = self.run_git(&["branch", "-D", branch]).await;
+                            self.run_git(&["branch", branch, "HEAD"])
+                                .await
+                                .map_err(|e| crate::error::NemoError::Git(
+                                    format!("Failed to recreate branch {branch}: {e}")
+                                ))?;
+                        }
+                        _ => {
+                            // No PR — safe to force-reset
+                            self.run_git(&["branch", "-f", branch, "HEAD"])
+                                .await
+                                .map_err(|e| crate::error::NemoError::Git(
+                                    format!("Failed to reset existing branch {branch}: {e}")
+                                ))?;
+                        }
                     }
                 }
             }
@@ -197,21 +208,20 @@ pub mod bare {
             Ok(())
         }
 
-        async fn has_closed_pr(&self, branch: &str) -> Result<bool> {
+        async fn get_pr_state(&self, branch: &str) -> Option<String> {
             let output = Command::new("gh")
                 .args(["pr", "view", branch, "--json", "state", "--jq", ".state"])
                 .current_dir(&self.repo_path)
                 .output()
                 .await
-                .map_err(|e| crate::error::NemoError::Git(format!("Failed to run gh: {e}")))?;
+                .ok()?;
 
             if !output.status.success() {
-                // No PR exists for this branch
-                return Ok(false);
+                return None;
             }
 
             let state = String::from_utf8_lossy(&output.stdout).trim().to_uppercase();
-            Ok(state == "MERGED" || state == "CLOSED")
+            if state.is_empty() { None } else { Some(state) }
         }
 
         async fn ci_passed(&self, branch: &str) -> Result<bool> {
@@ -227,6 +237,13 @@ pub mod bare {
         }
 
         async fn create_pr(&self, branch: &str, title: &str, body: &str) -> Result<String> {
+            // Push branch to origin before creating PR
+            self.run_git(&["push", "-u", "origin", branch])
+                .await
+                .map_err(|e| crate::error::NemoError::Git(format!(
+                    "Failed to push {branch} to origin: {e}"
+                )))?;
+
             let output = Command::new("gh")
                 .args(["pr", "create", "--head", branch, "--title", title, "--body", body])
                 .current_dir(&self.repo_path)
@@ -369,8 +386,8 @@ pub mod mock {
             Ok(())
         }
 
-        async fn has_closed_pr(&self, _branch: &str) -> Result<bool> {
-            Ok(false)
+        async fn get_pr_state(&self, _branch: &str) -> Option<String> {
+            None
         }
 
         async fn ci_passed(&self, _branch: &str) -> Result<bool> {

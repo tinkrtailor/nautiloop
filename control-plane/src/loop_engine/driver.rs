@@ -1073,6 +1073,16 @@ impl ConvergentLoopDriver {
     }
 
     fn build_context(&self, record: &LoopRecord) -> LoopContext {
+        // Restore feedback_path from prior round if this is a re-dispatch (round > 1)
+        let feedback_path = if record.round > 1 && record.state == LoopState::Implementing {
+            Some(format!(
+                ".agent/review-feedback-round-{}.json",
+                record.round - 1
+            ))
+        } else {
+            None
+        };
+
         LoopContext {
             loop_id: record.id,
             engineer: record.engineer.clone(),
@@ -1081,8 +1091,9 @@ impl ConvergentLoopDriver {
             current_sha: record.current_sha.clone().unwrap_or_default(),
             round: record.round as u32,
             max_rounds: record.max_rounds as u32,
+            retry_count: record.retry_count as u32,
             session_id: record.session_id.clone(),
-            feedback_path: None,
+            feedback_path,
         }
     }
 

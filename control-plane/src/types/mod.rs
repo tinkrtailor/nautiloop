@@ -113,6 +113,7 @@ pub struct LoopContext {
     pub current_sha: String,
     pub round: u32,
     pub max_rounds: u32,
+    pub retry_count: u32,
     pub session_id: Option<String>,
     pub feedback_path: Option<String>,
 }
