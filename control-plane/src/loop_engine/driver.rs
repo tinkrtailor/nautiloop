@@ -751,6 +751,10 @@ impl ConvergentLoopDriver {
                 updated.state = reauth_from;
                 updated.reauth_from_state = None;
                 updated.retry_count += 1; // Bump to generate unique job name
+                // Refresh current_sha so divergence check doesn't false-pause
+                if let Ok(Some(sha)) = self.git.get_branch_sha(&record.branch).await {
+                    updated.current_sha = Some(sha);
+                }
                 let result = self.redispatch_current_stage(&updated).await?;
                 self.store
                     .set_loop_flag(record.id, crate::state::LoopFlag::Resume, false)
