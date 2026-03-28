@@ -105,9 +105,11 @@ CLI tool using git worktrees locally or over SSH. No K8s dependency.
 **1. Control Plane (Rust binary, runs as k3s deployment)**
 - REST API for job submission, status, logs
 - Loop engine: dispatches implement job, waits for completion, dispatches review job, evaluates verdict, loops or exits
-- Job state machine: PENDING -> HARDENING -> IMPLEMENTING -> TESTING -> REVIEWING -> CONVERGED | FAILED
-- Full pipeline: `nemo submit --harden spec.md` runs harden loop first, then implementation loop
-- Skip hardening: `nemo submit spec.md` skips to implementation (for pre-hardened specs)
+- Job state machine: PENDING -> HARDENING -> IMPLEMENTING -> TESTING -> REVIEWING -> CONVERGED | HARDENED | SHIPPED | FAILED
+- Full pipeline: `nemo start --harden spec.md` runs harden loop first, then implementation loop
+- Skip hardening: `nemo start spec.md` skips to implementation (for pre-hardened specs)
+- Harden only: `nemo harden spec.md` runs spec hardening loop, merges hardened spec PR, stops
+- Auto-merge: `nemo ship spec.md` runs implementation loop and auto-merges on convergence
 - Per-engineer credential store (git SSH keys / PATs + model subscription credentials as K8s secrets)
 - Postgres for state (eng review decided Postgres over SQLite for concurrent access from split control plane). Postgres runs as k3s pod with PVC.
 
@@ -124,10 +126,19 @@ CLI tool using git worktrees locally or over SSH. No K8s dependency.
 - Review verdict enforced via OpenCode's SDK-level JSON Schema structured output (retries on validation failure)
 - **Image strategy:** Nemo ships a slim base image (git, claude-code, opencode, common runtimes, `ghcr.io/anomalyco/opencode` as base for reviewer). Each monorepo provides a `Dockerfile.nemo` (or `nemo.image` in `nemo.toml`) that extends the base with project-specific toolchains (Rust, JVM, Node, Solidity/Foundry, Python, etc.). `nemo init` generates a starter Dockerfile based on detected toolchains. This keeps Nemo stack-agnostic.
 
-**3. nemo CLI**
-- `nemo submit spec.md` -- submit a pre-hardened spec for implementation
-- `nemo submit --harden spec.md` -- run full pipeline: harden spec first, then implement
-- `nemo submit --harden-only spec.md` -- harden a spec without implementing (planning phase)
+**3. nemo CLI — three verbs**
+
+| Command | What it does | Terminal state |
+|---------|-------------|----------------|
+| `nemo harden spec.md` | Harden spec, merge spec PR | HARDENED |
+| `nemo start spec.md` | Implement, create PR | CONVERGED |
+| `nemo start --harden spec.md` | Harden first, approval gate, then implement | CONVERGED |
+| `nemo ship spec.md` | Implement + auto-merge | SHIPPED |
+| `nemo ship --harden spec.md` | Harden + implement + auto-merge | SHIPPED |
+
+`--harden` is the only shared flag. It prepends the hardening phase to `start` or `ship`. On `ship`, it skips the approval gate.
+
+Other commands:
 - `nemo status` -- show all running loops for current user
 - `nemo status --team` -- show all loops across the team
 - `nemo logs <loop-id>` -- stream logs for a specific loop
@@ -215,7 +226,9 @@ nemo init                         # generates nemo.toml (commit this)
 nemo auth                         # pipes credentials to cluster
 
 # Daily:
-nemo submit --harden spec.md      # go
+nemo start --harden spec.md      # harden + implement
+nemo ship spec.md                # implement + auto-merge
+nemo harden spec.md              # harden only
 ```
 
 **4. Terraform Module (distribution mechanism)**
@@ -452,7 +465,7 @@ The review job outputs a JSON file at `.agent/review-verdict.json`:
 2. **Cost tracking**: Token usage per loop, per engineer, per day. The review verdict schema includes `token_usage`. The control plane should aggregate this. Where does cost data surface? Dashboard? CLI? Daily email?
 3. **Spec format**: Do existing specs in `specs/` work as-is, or does the system need a wrapper format with metadata (target services, test commands, review thresholds, max rounds)?
 4. **Network security: solved.** Auth sidecar architecture. Agent containers get open internet (for docs, deps, research) but NO mounted secrets. Model API auth and git push proxy through a sidecar container (localhost:9090, :9091). Sidecar also runs a transparent egress logger (:9092) that logs all outbound traffic from the agent container for audit. Secrets never touch the agent container's filesystem. Malicious code can reach the internet but has nothing to exfiltrate.
-5. **Naming**: Resolved. **Nemo**. Latin for "nobody." `nemo submit --harden spec.md`.
+5. **Naming**: Resolved. **Nemo**. Latin for "nobody." Three verbs: `nemo harden`, `nemo start`, `nemo ship`.
 
 ## Success Criteria
 

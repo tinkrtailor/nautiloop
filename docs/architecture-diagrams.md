@@ -106,7 +106,7 @@ graph LR
 
 ## 3. Full Loop Lifecycle
 
-The complete flow from `nemo submit --harden` through spec hardening, engineer approval, implementation rounds, and convergence to a PR.
+The complete flow from `nemo start --harden` through spec hardening, engineer approval, implementation rounds, and convergence to a PR.
 
 ```mermaid
 sequenceDiagram
@@ -116,7 +116,7 @@ sequenceDiagram
     participant LE as Loop Engine
     participant K8s as K8s / Agent Pods
 
-    E->>API: nemo submit --harden spec.md
+    E->>API: nemo start --harden spec.md
     API->>PG: INSERT loop (state=PENDING, harden=true)
     API-->>E: 201 {loop_id, branch}
 
@@ -210,7 +210,7 @@ stateDiagram-v2
 
     HARDENING --> HARDENING: audit not clean\n(loop: revise then re-audit)
     HARDENING --> AWAITING_APPROVAL: audit clean
-    HARDENING --> CONVERGED: --harden-only\n+ audit clean
+    HARDENING --> HARDENED: nemo harden\n+ audit clean
 
     AWAITING_APPROVAL --> IMPLEMENTING: approve / auto-approve
 
@@ -242,6 +242,7 @@ stateDiagram-v2
 
     REVIEWING --> IMPLEMENTING: verdict has issues\n(feedback to impl)
     REVIEWING --> CONVERGED: verdict clean
+    REVIEWING --> SHIPPED: verdict clean\n+ ship_mode
 
     IMPLEMENTING --> FAILED: max rounds exceeded
     REVIEWING --> FAILED: max rounds exceeded
@@ -253,6 +254,8 @@ stateDiagram-v2
     }
 
     CONVERGED --> [*]
+    HARDENED --> [*]
+    SHIPPED --> [*]
     FAILED --> [*]
     CANCELLED --> [*]
 
@@ -517,12 +520,12 @@ graph TD
     subgraph Engineer["👤 Engineer's Daily Workflow"]
         direction TB
         WRITE["Write a spec<br/><i>specs/feat/invoice-cancel.md</i>"]
-        SUBMIT["<b>nemo submit --harden spec.md</b><br/>One command. Walk away."]
+        SUBMIT["<b>nemo start --harden spec.md</b><br/>One command. Walk away.<br/><i>or: nemo ship --harden spec.md</i>"]
         MONITOR["<b>nemo status</b><br/>Check progress anytime"]
         REVIEW_SPEC["Hardened spec ready!<br/>Read the improved spec"]
         APPROVE["<b>nemo approve</b><br/>Green-light implementation"]
         PR["Clean PR appears 🎉<br/>Tests pass. Review clean."]
-        MERGE["Review PR, merge"]
+        MERGE["Review PR, merge<br/><i>(nemo ship: auto-merged)</i>"]
     end
 
     subgraph Nemo["⚡ Nemo (runs on shared cluster)"]

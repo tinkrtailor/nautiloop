@@ -38,7 +38,7 @@ The three binaries that compose the Nemo control plane: a loop engine that drive
         (implement)     (review)        (test)
 ```
 
-The API server and loop engine are separate k3s Deployments. They share a Postgres database. The API server writes commands (submit, cancel, approve); the loop engine reads them and drives state transitions.
+The API server and loop engine are separate k3s Deployments. They share a Postgres database. The API server writes commands (start, cancel, approve); the loop engine reads them and drives state transitions.
 
 ## Requirements
 
@@ -46,7 +46,7 @@ The API server and loop engine are separate k3s Deployments. They share a Postgr
 
 - FR-1: The system shall provide a `ConvergentLoopDriver` that accepts a `LoopKind` enum (Harden or Implement) and dispatches stages accordingly
 - FR-2: The system shall transition loops through states: PENDING -> HARDENING -> AWAITING_APPROVAL -> IMPLEMENTING -> TESTING -> REVIEWING -> CONVERGED | FAILED | CANCELLED, with PAUSED reachable from any active sub-state and AWAITING_REAUTH reachable from any state where a job is active (DISPATCHED or RUNNING)
-- FR-3: The system shall gate implementation behind AWAITING_APPROVAL, requiring explicit `POST /approve/:id` (opt-out via `--auto-approve` on submit)
+- FR-3: The system shall gate implementation behind AWAITING_APPROVAL, requiring explicit `POST /approve/:id` (opt-out via `--auto-approve` on start)
 - FR-4: The system shall feed test failures back to the implement stage as structured feedback including at minimum: service name, test command, exit code, stdout (last 10KB), stderr (last 10KB)
 - FR-5: The system shall create branches named `agent/{engineer}/{spec-slug}-{short-hash}` (short-hash = first 8 chars of SHA-256 of the original submitted spec content, making the branch name stable across harden rounds; supersedes design doc's loop-ID-based naming)
 - FR-6: The system shall invoke headless agents: `claude -p --output-format stream-json` (implementer), `opencode run --format json` (reviewer)
@@ -55,9 +55,25 @@ The API server and loop engine are separate k3s Deployments. They share a Postgr
 - FR-9: The system shall retry malformed verdict JSON 2x before marking the loop FAILED
 - FR-10: The system shall transition to AWAITING_REAUTH when agent credentials expire mid-loop
 - FR-11: The system shall track sub-states per stage: DISPATCHED / RUNNING / COMPLETED
-- FR-12: The API server shall expose REST endpoints for submit, status, logs, cancel, approve, and inspect
-- FR-13: The CLI shall provide commands: submit, status, logs, cancel, approve, inspect, resume, init, auth, config
+- FR-12: The API server shall expose REST endpoints for start, status, logs, cancel, approve, and inspect
+- FR-13: The CLI shall provide three verbs (`harden`, `start`, `ship`) plus utility commands: status, logs, cancel, approve, inspect, resume, init, auth, config
 - FR-14: V1: all authenticated users have full access to all loops (no per-user authorization)
+
+#### nemo ship
+
+- FR-15: `nemo ship` shall set a `ship_mode: bool` flag on the loop record. When `ship_mode = true` and the loop converges, the engine auto-merges instead of just creating a PR.
+- FR-16: `nemo ship` shall wait for external CI checks to pass (if `require_passing_ci = true` in repo config) before merging. If CI fails, fall back to creating a PR with status NEEDS_HUMAN_REVIEW.
+- FR-17: `nemo ship` shall respect a `max_rounds_for_auto_merge` threshold (default: 5, configurable in `nemo.toml`). If the loop converges within the threshold, auto-merge. If it takes more rounds, create a PR instead of merging, with a note: "Converged in N rounds (above auto-merge threshold of M). Created PR for human review."
+- FR-18: `nemo ship` shall merge using the repo's configured merge strategy (merge commit, squash, or rebase — read from `nemo.toml` or default to squash).
+- FR-19: If auto-merge fails (merge conflict, branch protection rule, CI failure), the loop shall fall back to creating a PR with status NEEDS_HUMAN_REVIEW and the merge failure reason.
+- FR-20: `nemo ship --harden` shall run the harden loop, skip AWAITING_APPROVAL, run the implementation loop, and auto-merge on convergence. Full pipeline, zero human gates.
+
+#### nemo harden
+
+- FR-21: `nemo harden spec.md` shall run the spec hardening loop (adversarial audit/revise cycle) until the spec passes audit.
+- FR-22: On convergence, `nemo harden` shall create a spec branch, commit the hardened spec, create a PR for the hardened spec, and merge it using the configured merge strategy.
+- FR-23: `nemo harden` terminates at HARDENED. It does not enter AWAITING_APPROVAL or IMPLEMENTING.
+- FR-24: If the harden loop hits max rounds without convergence, it creates a PR with status NEEDS_HUMAN_REVIEW and terminates at FAILED.
 
 ### Non-Functional Requirements
 
@@ -67,6 +83,8 @@ The API server and loop engine are separate k3s Deployments. They share a Postgr
 - NFR-4: Loop engine must recover all in-progress loops on restart (crash recovery from Postgres state)
 - NFR-5: CLI binary size < 15 MB (static Rust binary, cross-compiled for linux-amd64 and darwin-arm64)
 - NFR-6: All API endpoints authenticated via API key or mTLS
+- NFR-7: `nemo ship` shall not bypass branch protection rules. It merges via the GitHub/GitLab API, which enforces protection rules. If protection requires review approvals, `nemo ship` falls back to PR creation.
+- NFR-8: `nemo ship` shall log the auto-merge event to Postgres (loop_id, merge_sha, merge_strategy, ci_status)
 
 ## Behavior
 
@@ -198,10 +216,29 @@ If Test fails: loop feeds `TestFailure` items back as feedback to next Implement
 If Review returns `clean: false`: loop feeds `verdict.issues` back as feedback to next Implement round.
 Convergence: `ReviewVerdict.clean == true` AND `TestOutput.passed == true`. Max rounds from `nemo.toml` `limits.max_rounds_implement` (default: 15).
 
+### nemo ship — Post-Convergence Flow
+
+1. Loop converges in N rounds
+2. If N <= `max_rounds_for_auto_merge`:
+   a. Create PR
+   b. Wait for CI (if `require_passing_ci`)
+   c. Merge PR via git host API
+   d. State -> SHIPPED (terminal)
+3. If N > threshold:
+   a. Create PR with note: "Converged in N rounds (above auto-merge threshold of M). Created PR for human review."
+   b. State -> CONVERGED (needs human review of PR)
+
+### nemo harden — Post-Convergence Flow
+
+1. Audit returns clean
+2. Create PR for the hardened spec
+3. Merge spec PR (if `auto_merge_spec_pr = true`)
+4. State -> HARDENED (terminal)
+
 ### State Machine
 
 ```
-                              submit
+                              start
                                 |
                                 v
                            +---------+
@@ -220,12 +257,12 @@ Convergence: `ReviewVerdict.clean == true` AND `TestOutput.passed == true`. Max 
    |     no  / \ yes                             |
    |    +---+   +--------+                       |
    |    |       |        |                       |
-   |    |       | harden_only?                   |
+   |    |       | harden_only? (nemo harden)     |
    |    |       | yes  / \ no                    |
    |    |       v     /   \                      v
    |    |  +-----------+   +-------------------+   +-------------------+
-   +----+  | CONVERGED |   | AWAITING_APPROVAL |   | AWAITING_APPROVAL |
-           |(harden)   |   | (if not auto)     |   | (if not auto)     |
+   +----+  | HARDENED  |   | AWAITING_APPROVAL |   | AWAITING_APPROVAL |
+           |(terminal) |   | (if not auto)     |   | (if not auto)     |
            +-----------+   +--------+----------+   +--------+----------+
                                      |                       |
                                 approve / auto-approve       |
@@ -257,7 +294,26 @@ Convergence: `ReviewVerdict.clean == true` AND `TestOutput.passed == true`. Max 
                        |          v     +-----> feedback to IMPLEMENTING
                        |   +-----------+
                        |   | CONVERGED |
-                       |   +-----------+
+                       |   +-----+-----+
+                       |         |
+                       |   ship_mode?
+                       |    yes / \ no
+                       |       /   \
+                       |      v     v
+                       |  +--------+  (done — PR created)
+                       |  | rounds |
+                       |  | <= M?  |
+                       |  +--+--+--+
+                       |   yes  no
+                       |    |    +----> (PR created, not merged)
+                       |    v
+                       |  CI green?
+                       |   yes / \ no
+                       |      /   \
+                       |     v     +----> (PR created, NEEDS_HUMAN_REVIEW)
+                       |  +---------+
+                       |  | SHIPPED |
+                       |  +---------+
                        |
                        |   (max rounds exceeded OR unrecoverable error)
                        |          |
@@ -344,7 +400,7 @@ Special transitions:
 
 **Endpoints:**
 
-#### `POST /submit`
+#### `POST /start`
 
 Submit a spec for processing.
 
@@ -363,7 +419,16 @@ Request:
 }
 ```
 
-When `harden_only: true`, the loop terminates at CONVERGED with `phase: "harden"` after the spec passes audit, skipping AWAITING_APPROVAL and implementation entirely.
+When `harden_only: true` (i.e., `nemo harden`), the loop terminates at HARDENED after the spec passes audit. The hardened spec PR is merged. AWAITING_APPROVAL and implementation are skipped entirely.
+
+The CLI verbs map to API fields:
+| CLI command | `harden` | `harden_only` | `ship_mode` |
+|-------------|----------|---------------|-------------|
+| `nemo harden spec.md` | `true` | `true` | `false` |
+| `nemo start spec.md` | `false` | `false` | `false` |
+| `nemo start --harden spec.md` | `true` | `false` | `false` |
+| `nemo ship spec.md` | `false` | `false` | `true` |
+| `nemo ship --harden spec.md` | `true` | `false` | `true` |
 
 Response (201):
 ```json
@@ -373,6 +438,9 @@ Response (201):
   "state": "PENDING"
 }
 ```
+
+Response for shipped loops includes `merge_sha` and `merged_at` when in SHIPPED state.
+Response for hardened loops includes `hardened_spec_path` and `spec_pr_url` when in HARDENED state.
 
 Behavior:
 - Validate spec_path exists in the repo (git ls-tree on bare repo)
@@ -488,7 +556,7 @@ The API server and loop engine share only Postgres. No direct RPC.
 
 | Command | Mechanism | How engine reads it |
 |---------|-----------|---------------------|
-| Submit | INSERT into `loops` table | Engine's reconciliation tick picks up PENDING rows |
+| Start | INSERT into `loops` table | Engine's reconciliation tick picks up PENDING rows |
 | Cancel | UPDATE `loops SET cancel_requested = true` | Engine checks flag each tick; deletes Job, sets CANCELLED |
 | Approve | UPDATE `loops SET approve_requested = true` | Engine checks flag each tick; transitions to IMPLEMENTING, dispatches first impl Job |
 | Resume | UPDATE `loops SET resume_requested = true` | Engine checks flag each tick; re-dispatches interrupted stage |
@@ -501,16 +569,27 @@ Optional optimization: use Postgres `NOTIFY/LISTEN` to wake the engine immediate
 The CLI is a standalone Rust binary that calls the API server over HTTPS.
 
 ```
-nemo <command> [options]
+nemo <verb> [options] [spec-path]
 
-COMMANDS:
-  submit <spec-path>        Submit a spec for processing
-    --harden                Run hardening loop first
-    --harden-only           Harden only, do not implement
+THREE VERBS:
+  harden <spec-path>        Harden spec, merge spec PR. Terminal: HARDENED
+    --auto-approve          Skip AWAITING_APPROVAL gate (N/A for harden)
+    --model-impl <model>    Override implementor model
+    --model-review <model>  Override reviewer model
+
+  start <spec-path>         Implement, create PR. Terminal: CONVERGED
+    --harden                Harden first, approval gate, then implement
     --auto-approve          Skip AWAITING_APPROVAL gate
     --model-impl <model>    Override implementor model
     --model-review <model>  Override reviewer model
 
+  ship <spec-path>          Implement + auto-merge. Terminal: SHIPPED
+    --harden                Harden first (skips approval gate), then implement + merge
+    --auto-approve          (implied, no-op)
+    --model-impl <model>    Override implementor model
+    --model-review <model>  Override reviewer model
+
+UTILITY COMMANDS:
   status                    Show your running loops
     --team                  Show all engineers' loops
     --json                  Output as JSON
@@ -544,6 +623,27 @@ Config resolution order (see `docs/design.md` SS Configuration Layers):
 2. `~/.nemo/config.toml` (engineer)
 3. `nemo.toml` in repo root (team)
 4. Cluster defaults (lowest)
+
+#### Ship and Harden Configuration
+
+```toml
+# nemo.toml
+
+[ship]
+allowed = true                     # enable nemo ship (default: false)
+require_passing_ci = true          # wait for CI before merge (default: true)
+require_harden = false             # force --harden on nemo ship (default: false)
+max_rounds_for_auto_merge = 5      # threshold (default: 5)
+merge_strategy = "squash"          # squash | merge | rebase (default: squash)
+
+[harden]
+merge_strategy = "squash"          # squash | merge | rebase for spec PRs (default: squash)
+auto_merge_spec_pr = true          # auto-merge the hardened spec PR (default: true)
+```
+
+If `[ship] allowed = false` (or section absent), `nemo ship` returns an error: "nemo ship is not enabled for this repo. Set [ship] allowed = true in nemo.toml."
+
+If `require_harden = true` and the engineer runs `nemo ship spec.md` without `--harden`, auto-add `--harden`.
 
 ### Review Verdict Schema
 
@@ -668,6 +768,16 @@ The implement agent receives both the spec path and the feedback file path. The 
 | Max rounds exceeded | Create PR with status NEEDS_HUMAN_REVIEW and remaining issues attached. State -> FAILED with reason "Max rounds exceeded". |
 | `nemo logs` on CONVERGED/CANCELLED loop | Return full historical logs from Postgres (all rounds). No SSE streaming (connection closes after last line). |
 | Postgres connection lost | Loop engine retries with exponential backoff (1s, 2s, 4s... up to 60s). API server returns 503. |
+| `nemo ship` on repo with `[ship] allowed = false` | Error: "nemo ship is not enabled for this repo" |
+| Ship converges in 1 round, CI passes | Auto-merge. Best case. |
+| Ship converges in N rounds (N > threshold) | PR created, not merged. Note explains why. |
+| CI fails after convergence (ship mode) | PR created with NEEDS_HUMAN_REVIEW. |
+| Merge conflict during ship (main advanced) | PR created with NEEDS_HUMAN_REVIEW. |
+| Branch protection requires approvals (ship) | Merge API returns 403. Fall back to PR. |
+| `require_harden = true`, no --harden on ship | Auto-add --harden, proceed. |
+| `nemo cancel` during ship | Same as regular cancel. |
+| `nemo harden` max rounds exceeded | Spec PR created with NEEDS_HUMAN_REVIEW. State -> FAILED. |
+| `nemo harden` spec already hardened | Runs audit; if clean on round 1, merges immediately. |
 
 ## Error Handling
 
@@ -683,6 +793,10 @@ The implement agent receives both the spec path and the feedback file path. The 
 | Expired model credentials | - | Loop -> AWAITING_REAUTH | Run `nemo auth --claude` or `--openai` |
 | K8s API unreachable | 503 | "Cluster unavailable" | Check k3s health |
 | Postgres unreachable | 503 | "Database unavailable" | Check Postgres pod |
+| Ship not enabled | 400 | "nemo ship is not enabled for this repo" | Set `[ship] allowed = true` in `nemo.toml` |
+| CI timeout during ship (>30 min) | - | Fall back to PR, NEEDS_HUMAN_REVIEW | Check CI pipeline |
+| Merge API failure | - | Fall back to PR, log error | Check git host API access |
+| Git push rejected during ship | - | Fall back to PR, NEEDS_HUMAN_REVIEW | Check branch protection settings |
 
 ## Out of Scope
 
@@ -694,6 +808,9 @@ The implement agent receives both the spec path and the feedback file path. The 
 - Auth sidecar and credential proxy architecture (separate spec)
 - `opencode serve` persistent sidecar mode (V1 uses per-job process invocation)
 - Multi-node k3s topology (V1 is single-node; code is node-count agnostic)
+- Auto-deploy after merge (that's the repo's CI/CD, not Nemo's job)
+- Rollback if merged code breaks production
+- Multi-PR atomic merge (ship multiple specs as one merge)
 
 ## Acceptance Criteria
 
@@ -705,12 +822,23 @@ The implement agent receives both the spec path and the feedback file path. The 
 - [ ] Review issues produce a feedback file and re-dispatch Implement
 - [ ] Malformed verdict JSON retries 2x then marks FAILED
 - [ ] Expired credentials transition loop to AWAITING_REAUTH; `nemo auth` resumes it
-- [ ] `POST /submit` returns 409 when branch already has an active loop
+- [ ] `POST /start` returns 409 when branch already has an active loop
 - [ ] `DELETE /cancel/:id` kills the active K8s Job and transitions to CANCELLED
 - [ ] `GET /logs/:id` streams real-time SSE from active loop, returns full history for completed loop
 - [ ] `GET /inspect/:user/:branch` returns full round history with verdicts
 - [ ] Loop engine recovers all in-progress loops after crash/restart
-- [ ] CLI `nemo submit --harden spec.md` triggers hardening then implementation pipeline
+- [ ] CLI `nemo start --harden spec.md` triggers hardening then implementation pipeline
+- [ ] CLI `nemo harden spec.md` triggers hardening loop only, terminates at HARDENED
+- [ ] CLI `nemo ship spec.md` triggers implementation loop and auto-merges on convergence
+- [ ] `nemo ship --harden spec.md` runs full pipeline with zero human gates
+- [ ] Ship: rounds > `max_rounds_for_auto_merge` falls back to PR creation
+- [ ] Ship: CI failure falls back to PR creation with NEEDS_HUMAN_REVIEW
+- [ ] Ship: merge conflict falls back to PR creation with NEEDS_HUMAN_REVIEW
+- [ ] `[ship] allowed = false` blocks `nemo ship` with a clear error
+- [ ] SHIPPED and HARDENED terminal states visible in `nemo status`
+- [ ] Auto-merge event logged to Postgres (loop_id, merge_sha, merge_strategy, ci_status)
+- [ ] `[harden] merge_strategy` controls spec PR merge behavior
+- [ ] `nemo harden` merges spec PR on convergence (when `auto_merge_spec_pr = true`)
 - [ ] Branch names follow `agent/{engineer}/{spec-slug}-{short-hash}` convention
 - [ ] Session continuation works across rounds (agent resumes context, not cold start)
 

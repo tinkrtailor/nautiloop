@@ -156,13 +156,17 @@ case $ACTION in
     # These are identical across worktrees (same lockfile, same submodule refs).
     # Use --fresh to skip this and do a real install (e.g. when branch changes deps).
     if [ "$USE_FRESH" = true ]; then
-      echo "Fresh mode: running bun install and submodule init..."
-      (cd "$WORKTREE_DIR" && bun install --frozen-lockfile)
+      echo "Fresh mode: running dependency install and submodule init..."
+      if [ -f "$WORKTREE_DIR/package.json" ]; then
+        (cd "$WORKTREE_DIR" && bun install --frozen-lockfile)
+      fi
       (cd "$WORKTREE_DIR" && git submodule update --init)
     elif [ "$USE_SANDBOX" = true ]; then
-      # Docker can't follow symlinks outside the mounted dir — use bun install
-      echo "Sandbox mode: running bun install (Docker can't follow host symlinks)..."
-      (cd "$WORKTREE_DIR" && bun install --frozen-lockfile)
+      # Install deps if applicable (skip for projects without package.json)
+      if [ -f "$WORKTREE_DIR/package.json" ]; then
+        echo "Sandbox mode: running bun install (Docker can't follow host symlinks)..."
+        (cd "$WORKTREE_DIR" && bun install --frozen-lockfile)
+      fi
       # Submodules: copy instead of symlink for Docker compatibility
       if [ -d "$REPO_ROOT/packages/contracts/lib" ]; then
         mkdir -p "$WORKTREE_DIR/packages/contracts"
