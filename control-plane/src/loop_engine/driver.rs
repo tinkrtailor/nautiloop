@@ -213,9 +213,35 @@ impl ConvergentLoopDriver {
     }
 
     /// Ingest output from a completed job: read verdict from git, update round record, set current_sha.
+    /// Returns Err with a Paused transition if branch has diverged since dispatch.
     async fn ingest_job_output(&self, record: &mut LoopRecord) -> Result<()> {
-        // Get the branch tip SHA and set current_sha
-        if let Some(sha) = self.git.get_branch_sha(&record.branch).await? {
+        // Get the branch tip SHA
+        let tip_sha = self.git.get_branch_sha(&record.branch).await?;
+
+        // Divergence check: if we have an expected SHA and branch tip doesn't
+        // descend from it, someone pushed between job exit and this tick.
+        // Pause instead of ingesting potentially wrong output.
+        if let (Some(expected), Some(tip)) = (&record.current_sha, &tip_sha)
+            && self.git.has_diverged(&record.branch, expected).await?
+        {
+            tracing::warn!(
+                loop_id = %record.id,
+                expected_sha = %expected,
+                tip_sha = %tip,
+                "Branch diverged after job completed, pausing to avoid ingesting wrong output"
+            );
+            let from_state = record.state;
+            record.state = LoopState::Paused;
+            record.sub_state = None;
+            record.paused_from_state = Some(from_state);
+            self.store.update_loop(record).await?;
+            return Err(crate::error::NemoError::Git(
+                "Branch diverged after job completed".to_string(),
+            ));
+        }
+
+        // Safe to ingest: update current_sha to branch tip
+        if let Some(sha) = tip_sha {
             record.current_sha = Some(sha);
         }
 
