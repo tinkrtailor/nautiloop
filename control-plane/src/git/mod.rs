@@ -32,6 +32,9 @@ pub trait GitOperations: Send + Sync + 'static {
     /// Get the PR state for a branch (OPEN, MERGED, CLOSED). Returns None if no PR exists.
     async fn get_pr_state(&self, branch: &str) -> Option<String>;
 
+    /// Remove a path from the branch (git rm) and commit. Used to clean up artifacts before PR.
+    async fn remove_path(&self, branch: &str, path: &str) -> Result<()>;
+
     /// Check if CI checks have passed on a branch/PR. Returns true if all checks pass.
     async fn ci_passed(&self, branch: &str) -> Result<bool>;
 
@@ -230,6 +233,40 @@ pub mod bare {
             if state.is_empty() { None } else { Some(state) }
         }
 
+        async fn remove_path(&self, branch: &str, path: &str) -> Result<()> {
+            let worktree_dir = format!("/tmp/nemo-wt-{}", uuid::Uuid::new_v4());
+            self.run_git(&["worktree", "add", &worktree_dir, branch])
+                .await
+                .map_err(|e| crate::error::NemoError::Git(format!(
+                    "Failed to create worktree for {branch}: {e}"
+                )))?;
+
+            // git rm -rf the path (ignore errors if path doesn't exist)
+            let rm = Command::new("git")
+                .args(["rm", "-rf", "--ignore-unmatch", path])
+                .current_dir(&worktree_dir)
+                .output()
+                .await;
+
+            if let Ok(ref output) = rm
+                && output.status.success()
+            {
+                let _ = Command::new("git")
+                    .args([
+                        "-c", "user.name=nemo-control-plane",
+                        "-c", "user.email=nemo@nemo.dev",
+                        "commit", "-m", &format!("chore(agent): remove {path} artifacts"),
+                        "--allow-empty",
+                    ])
+                    .current_dir(&worktree_dir)
+                    .output()
+                    .await;
+            }
+
+            let _ = self.run_git(&["worktree", "remove", "--force", &worktree_dir]).await;
+            Ok(())
+        }
+
         async fn ci_passed(&self, branch: &str) -> Result<bool> {
             let output = Command::new("gh")
                 .args(["pr", "checks", branch, "--required"])
@@ -394,6 +431,12 @@ pub mod mock {
 
         async fn get_pr_state(&self, _branch: &str) -> Option<String> {
             None
+        }
+
+        async fn remove_path(&self, _branch: &str, path: &str) -> Result<()> {
+            let mut files = self.files.write().await;
+            files.retain(|k, _| !k.starts_with(path));
+            Ok(())
         }
 
         async fn ci_passed(&self, _branch: &str) -> Result<bool> {

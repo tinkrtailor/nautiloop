@@ -311,6 +311,9 @@ impl ConvergentLoopDriver {
                     Some(v) if v.clean => {
                         // Audit passed
                         if record.harden_only {
+                            // Clean up .agent/ artifacts before PR creation
+                            let _ = self.git.remove_path(&record.branch, ".agent").await;
+
                             // Harden only: create spec PR, merge it, terminal HARDENED (FR-23)
                             let pr_title = format!(
                                 "chore(spec): harden {} for {}",
@@ -506,6 +509,9 @@ impl ConvergentLoopDriver {
 
         match verdict {
             Some(v) if v.clean => {
+                // Clean up .agent/ artifacts before PR creation
+                let _ = self.git.remove_path(&record.branch, ".agent").await;
+
                 // Review passed: create PR for all convergence paths
                 let pr_title = format!(
                     "feat(agent): {} for {}",
@@ -643,11 +649,12 @@ impl ConvergentLoopDriver {
     /// Handle AWAITING_APPROVAL: check for approve flag.
     async fn handle_awaiting_approval(&self, record: &LoopRecord) -> Result<LoopState> {
         if record.approve_requested {
-            // Clear the flag with a narrow update (avoids read-modify-write race)
+            // Perform transition first; only clear flag on success
+            let result = self.start_implementing(record).await?;
             self.store
                 .set_loop_flag(record.id, crate::state::LoopFlag::Approve, false)
                 .await?;
-            self.start_implementing(record).await
+            Ok(result)
         } else {
             // Still waiting
             Ok(LoopState::AwaitingApproval)
@@ -657,17 +664,16 @@ impl ConvergentLoopDriver {
     /// Handle PAUSED: check for resume flag.
     async fn handle_paused(&self, record: &LoopRecord) -> Result<LoopState> {
         if record.resume_requested {
-            // Clear the flag with a narrow update
-            self.store
-                .set_loop_flag(record.id, crate::state::LoopFlag::Resume, false)
-                .await?;
-
-            // Resume to the stage we paused from
+            // Resume to the stage we paused from; clear flag only on success
             if let Some(paused_from) = record.paused_from_state {
                 let mut updated = record.clone();
                 updated.state = paused_from;
                 updated.paused_from_state = None;
-                self.redispatch_current_stage(&updated).await
+                let result = self.redispatch_current_stage(&updated).await?;
+                self.store
+                    .set_loop_flag(record.id, crate::state::LoopFlag::Resume, false)
+                    .await?;
+                Ok(result)
             } else {
                 // No paused_from_state: shouldn't happen, re-evaluate
                 Ok(LoopState::Paused)
@@ -680,16 +686,16 @@ impl ConvergentLoopDriver {
     /// Handle AWAITING_REAUTH: check for resume flag (after creds re-pushed).
     async fn handle_awaiting_reauth(&self, record: &LoopRecord) -> Result<LoopState> {
         if record.resume_requested {
-            // Clear the flag with a narrow update
-            self.store
-                .set_loop_flag(record.id, crate::state::LoopFlag::Resume, false)
-                .await?;
-
+            // Perform transition first; clear flag only on success
             if let Some(reauth_from) = record.reauth_from_state {
                 let mut updated = record.clone();
                 updated.state = reauth_from;
                 updated.reauth_from_state = None;
-                self.redispatch_current_stage(&updated).await
+                let result = self.redispatch_current_stage(&updated).await?;
+                self.store
+                    .set_loop_flag(record.id, crate::state::LoopFlag::Resume, false)
+                    .await?;
+                Ok(result)
             } else {
                 Ok(LoopState::AwaitingReauth)
             }
@@ -708,17 +714,17 @@ impl ConvergentLoopDriver {
                 .await;
         }
 
-        // Clear the cancel flag with a narrow update
-        self.store
-            .set_loop_flag(record.id, crate::state::LoopFlag::Cancel, false)
-            .await?;
-
+        // Perform transition first, then clear flag
         let mut updated = record.clone();
         updated.state = LoopState::Cancelled;
         updated.sub_state = None;
         updated.failure_reason = Some("Cancelled by user".to_string());
         updated.active_job_name = None;
         self.store.update_loop(&updated).await?;
+
+        self.store
+            .set_loop_flag(record.id, crate::state::LoopFlag::Cancel, false)
+            .await?;
 
         tracing::info!(loop_id = %record.id, "Loop CANCELLED by user");
         Ok(LoopState::Cancelled)
