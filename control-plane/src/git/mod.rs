@@ -314,8 +314,9 @@ pub mod bare {
             } else if stdout.contains("pending") || stdout.contains("queued") || stdout.contains("in_progress") {
                 Ok(None) // Explicitly pending
             } else if stdout.trim().is_empty() {
-                // No output + non-zero: likely no checks = treat as pass
-                Ok(Some(true))
+                // No output + non-zero: could be gh auth/network error, not CI info.
+                // Treat as unknown (keep polling) rather than assuming pass.
+                Ok(None)
             } else {
                 Ok(None) // Unknown state, treat as pending
             }
