@@ -1,0 +1,1078 @@
+use std::sync::Arc;
+use uuid::Uuid;
+
+use crate::config::NemoConfig;
+use crate::error::{NemoError, Result};
+use crate::git::GitOperations;
+use crate::k8s::job_builder;
+use crate::k8s::{JobDispatcher, JobStatus};
+use crate::state::StateStore;
+use crate::types::verdict::{
+    AuditVerdict, FeedbackFile, FeedbackSource, ReviewVerdict, TestOutput,
+};
+use crate::types::{
+    LoopContext, LoopKind, LoopRecord, LoopState, RoundRecord, StageConfig, SubState,
+};
+
+/// The convergent loop driver. Processes one tick per loop, advancing its state machine.
+pub struct ConvergentLoopDriver {
+    store: Arc<dyn StateStore>,
+    dispatcher: Arc<dyn JobDispatcher>,
+    git: Arc<dyn GitOperations>,
+    config: NemoConfig,
+}
+
+impl ConvergentLoopDriver {
+    pub fn new(
+        store: Arc<dyn StateStore>,
+        dispatcher: Arc<dyn JobDispatcher>,
+        git: Arc<dyn GitOperations>,
+        config: NemoConfig,
+    ) -> Self {
+        Self {
+            store,
+            dispatcher,
+            git,
+            config,
+        }
+    }
+
+    /// Run one tick of the loop state machine for the given loop.
+    /// All state writes happen within this function.
+    /// Returns the new state after the tick.
+    pub async fn tick(&self, loop_id: Uuid) -> Result<LoopState> {
+        let record = self
+            .store
+            .get_loop(loop_id)
+            .await?
+            .ok_or(NemoError::LoopNotFound { id: loop_id })?;
+
+        // Check for cancel request first (highest priority)
+        if record.cancel_requested {
+            return self.handle_cancel(&record).await;
+        }
+
+        match record.state {
+            LoopState::Pending => self.handle_pending(&record).await,
+            LoopState::Hardening => self.handle_active_stage(&record).await,
+            LoopState::AwaitingApproval => self.handle_awaiting_approval(&record).await,
+            LoopState::Implementing => self.handle_active_stage(&record).await,
+            LoopState::Testing => self.handle_active_stage(&record).await,
+            LoopState::Reviewing => self.handle_active_stage(&record).await,
+            LoopState::Paused => self.handle_paused(&record).await,
+            LoopState::AwaitingReauth => self.handle_awaiting_reauth(&record).await,
+            // Terminal states: no-op
+            LoopState::Converged | LoopState::Failed | LoopState::Cancelled => Ok(record.state),
+        }
+    }
+
+    /// Handle PENDING state: determine first stage and dispatch.
+    async fn handle_pending(&self, record: &LoopRecord) -> Result<LoopState> {
+        let mut updated = record.clone();
+
+        // Fetch latest from remote per FR-8
+        self.git.fetch().await?;
+
+        if record.harden {
+            // Start hardening loop
+            updated.state = LoopState::Hardening;
+            updated.sub_state = Some(SubState::Dispatched);
+            updated.round = 1;
+            updated.kind = LoopKind::Harden;
+
+            let stage_config = self.audit_stage_config();
+            let ctx = self.build_context(&updated);
+            let job = job_builder::build_job(
+                &ctx,
+                &stage_config,
+                &self.config.cluster.jobs_namespace,
+                &self.config.cluster.agent_image,
+                &self.config.cluster.bare_repo_pvc,
+            );
+            let job_name = self.dispatcher.create_job(&job).await?;
+            updated.active_job_name = Some(job_name.clone());
+
+            self.create_round_record(&updated, "audit", &job_name).await?;
+            self.store.update_loop(&updated).await?;
+
+            tracing::info!(loop_id = %record.id, "Transitioned PENDING -> HARDENING/DISPATCHED");
+            Ok(LoopState::Hardening)
+        } else if !record.auto_approve {
+            // Go to awaiting approval before implementing
+            updated.state = LoopState::AwaitingApproval;
+            updated.sub_state = None;
+            self.store.update_loop(&updated).await?;
+
+            tracing::info!(loop_id = %record.id, "Transitioned PENDING -> AWAITING_APPROVAL");
+            Ok(LoopState::AwaitingApproval)
+        } else {
+            // Auto-approve: go directly to implementing
+            self.start_implementing(&updated).await
+        }
+    }
+
+    /// Handle an active stage (HARDENING, IMPLEMENTING, TESTING, REVIEWING).
+    /// Checks job status and advances the state machine.
+    async fn handle_active_stage(&self, record: &LoopRecord) -> Result<LoopState> {
+        let sub_state = record.sub_state.unwrap_or(SubState::Dispatched);
+
+        match sub_state {
+            SubState::Dispatched | SubState::Running => {
+                // Check job status
+                let job_name = record.active_job_name.as_deref().unwrap_or("");
+                if job_name.is_empty() {
+                    // No active job but in dispatched/running state: re-dispatch
+                    return self.redispatch_current_stage(record).await;
+                }
+
+                let status = self
+                    .dispatcher
+                    .get_job_status(job_name, &self.config.cluster.jobs_namespace)
+                    .await?;
+
+                match status {
+                    JobStatus::Pending => {
+                        // Still pending, no action
+                        Ok(record.state)
+                    }
+                    JobStatus::Running => {
+                        // Update sub-state to RUNNING if not already
+                        if sub_state != SubState::Running {
+                            let mut updated = record.clone();
+                            updated.sub_state = Some(SubState::Running);
+                            self.store.update_loop(&updated).await?;
+                        }
+                        Ok(record.state)
+                    }
+                    JobStatus::Succeeded => {
+                        // Job completed: parse output and evaluate
+                        self.handle_job_completed(record).await
+                    }
+                    JobStatus::Failed { reason } => {
+                        // Job failed: check retry logic
+                        self.handle_job_failed(record, &reason).await
+                    }
+                    JobStatus::NotFound => {
+                        // Job disappeared: treat as failure
+                        self.handle_job_failed(record, "Job not found (deleted externally)")
+                            .await
+                    }
+                }
+            }
+            SubState::Completed => {
+                // Should have been transitioned already; re-evaluate
+                self.handle_job_completed(record).await
+            }
+        }
+    }
+
+    /// Handle a successfully completed job: evaluate and advance.
+    async fn handle_job_completed(&self, record: &LoopRecord) -> Result<LoopState> {
+        let mut updated = record.clone();
+        updated.sub_state = Some(SubState::Completed);
+
+        match record.state {
+            LoopState::Hardening => self.evaluate_harden_stage(&mut updated).await,
+            LoopState::Implementing => self.advance_to_testing(&mut updated).await,
+            LoopState::Testing => self.evaluate_test_stage(&mut updated).await,
+            LoopState::Reviewing => self.evaluate_review_stage(&mut updated).await,
+            _ => {
+                // Should not happen
+                Ok(record.state)
+            }
+        }
+    }
+
+    /// Evaluate harden stage output (audit or revise).
+    async fn evaluate_harden_stage(&self, record: &mut LoopRecord) -> Result<LoopState> {
+        // For the harden loop, we alternate between audit and revise.
+        // After audit: if clean, converge or move to approval. If not clean, revise.
+        // After revise: re-audit.
+        //
+        // We determine which sub-stage just completed by checking the round record.
+        let rounds = self.store.get_rounds(record.id).await?;
+        let last_round = rounds
+            .iter()
+            .rfind(|r| r.round == record.round);
+
+        let stage_name = last_round.map(|r| r.stage.as_str()).unwrap_or("audit");
+
+        match stage_name {
+            "audit" => {
+                // Parse audit verdict from the round output
+                let verdict: Option<AuditVerdict> = last_round
+                    .and_then(|r| r.output.as_ref())
+                    .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+                match verdict {
+                    Some(v) if v.clean => {
+                        // Audit passed
+                        if record.harden_only {
+                            // Harden only: converge
+                            record.state = LoopState::Converged;
+                            record.sub_state = None;
+                            record.active_job_name = None;
+                            self.store.update_loop(record).await?;
+                            tracing::info!(loop_id = %record.id, "Harden loop CONVERGED (harden_only)");
+                            Ok(LoopState::Converged)
+                        } else if record.auto_approve {
+                            // Auto-approve: go to implementing
+                            self.start_implementing(record).await
+                        } else {
+                            // Need approval
+                            record.state = LoopState::AwaitingApproval;
+                            record.sub_state = None;
+                            record.active_job_name = None;
+                            self.store.update_loop(record).await?;
+                            tracing::info!(loop_id = %record.id, "Harden passed -> AWAITING_APPROVAL");
+                            Ok(LoopState::AwaitingApproval)
+                        }
+                    }
+                    Some(_v) => {
+                        // Audit found issues: dispatch revise
+                        self.dispatch_revise(record).await
+                    }
+                    None => {
+                        // Verdict parse failure: retry per FR-9
+                        self.handle_verdict_parse_failure(record).await
+                    }
+                }
+            }
+            "revise" => {
+                // After revise: check max rounds, then re-audit
+                if record.round >= record.max_rounds {
+                    record.state = LoopState::Failed;
+                    record.sub_state = None;
+                    record.failure_reason =
+                        Some(format!("Max harden rounds ({}) exceeded", record.max_rounds));
+                    record.active_job_name = None;
+                    self.store.update_loop(record).await?;
+                    return Ok(LoopState::Failed);
+                }
+
+                record.round += 1;
+                self.dispatch_audit(record).await
+            }
+            _ => Ok(record.state),
+        }
+    }
+
+    /// Advance from IMPLEMENTING to TESTING.
+    async fn advance_to_testing(&self, record: &mut LoopRecord) -> Result<LoopState> {
+        record.state = LoopState::Testing;
+        record.sub_state = Some(SubState::Dispatched);
+
+        let stage_config = self.test_stage_config();
+        let ctx = self.build_context(record);
+        let job = job_builder::build_job(
+            &ctx,
+            &stage_config,
+            &self.config.cluster.jobs_namespace,
+            &self.config.cluster.agent_image,
+            &self.config.cluster.bare_repo_pvc,
+        );
+        let job_name = self.dispatcher.create_job(&job).await?;
+        record.active_job_name = Some(job_name.clone());
+
+        self.create_round_record(record, "test", &job_name).await?;
+        self.store.update_loop(record).await?;
+
+        tracing::info!(loop_id = %record.id, round = record.round, "IMPLEMENTING -> TESTING/DISPATCHED");
+        Ok(LoopState::Testing)
+    }
+
+    /// Evaluate test stage output.
+    async fn evaluate_test_stage(&self, record: &mut LoopRecord) -> Result<LoopState> {
+        let rounds = self.store.get_rounds(record.id).await?;
+        let test_round = rounds
+            .iter()
+            .rfind(|r| r.round == record.round && r.stage == "test");
+
+        let output: Option<TestOutput> = test_round
+            .and_then(|r| r.output.as_ref())
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+        match output {
+            Some(test_output) if test_output.passed => {
+                // Tests passed: advance to review
+                self.dispatch_review(record).await
+            }
+            Some(test_output) => {
+                // Tests failed: feed back to implement (no review dispatched per spec)
+                if record.round >= record.max_rounds {
+                    record.state = LoopState::Failed;
+                    record.sub_state = None;
+                    record.failure_reason = Some(format!(
+                        "Max implement rounds ({}) exceeded",
+                        record.max_rounds
+                    ));
+                    record.active_job_name = None;
+                    self.store.update_loop(record).await?;
+                    return Ok(LoopState::Failed);
+                }
+
+                // Create feedback file for next round
+                let feedback = FeedbackFile {
+                    round: record.round as u32,
+                    source: FeedbackSource::Test,
+                    issues: None,
+                    failures: Some(test_output.failures),
+                };
+
+                record.round += 1;
+                let feedback_path = format!(
+                    ".agent/test-feedback-round-{}.json",
+                    record.round - 1
+                );
+                self.dispatch_implement_with_feedback(record, &feedback, &feedback_path)
+                    .await
+            }
+            None => {
+                // No output: treat as failure, retry
+                self.handle_job_failed(record, "Test stage produced no output")
+                    .await
+            }
+        }
+    }
+
+    /// Evaluate review stage output.
+    async fn evaluate_review_stage(&self, record: &mut LoopRecord) -> Result<LoopState> {
+        let rounds = self.store.get_rounds(record.id).await?;
+        let review_round = rounds
+            .iter()
+            .rfind(|r| r.round == record.round && r.stage == "review");
+
+        let verdict: Option<ReviewVerdict> = review_round
+            .and_then(|r| r.output.as_ref())
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+        match verdict {
+            Some(v) if v.clean => {
+                // Review passed: CONVERGED
+                record.state = LoopState::Converged;
+                record.sub_state = None;
+                record.active_job_name = None;
+                self.store.update_loop(record).await?;
+                tracing::info!(loop_id = %record.id, round = record.round, "Loop CONVERGED");
+                Ok(LoopState::Converged)
+            }
+            Some(v) => {
+                // Review found issues: feed back to implement
+                if record.round >= record.max_rounds {
+                    record.state = LoopState::Failed;
+                    record.sub_state = None;
+                    record.failure_reason = Some(format!(
+                        "Max implement rounds ({}) exceeded",
+                        record.max_rounds
+                    ));
+                    record.active_job_name = None;
+                    self.store.update_loop(record).await?;
+                    return Ok(LoopState::Failed);
+                }
+
+                let feedback = FeedbackFile {
+                    round: record.round as u32,
+                    source: FeedbackSource::Review,
+                    issues: Some(v.issues),
+                    failures: None,
+                };
+
+                record.round += 1;
+                let feedback_path = format!(
+                    ".agent/review-feedback-round-{}.json",
+                    record.round - 1
+                );
+                self.dispatch_implement_with_feedback(record, &feedback, &feedback_path)
+                    .await
+            }
+            None => {
+                // Verdict parse failure: retry per FR-9
+                self.handle_verdict_parse_failure(record).await
+            }
+        }
+    }
+
+    /// Handle AWAITING_APPROVAL: check for approve flag.
+    async fn handle_awaiting_approval(&self, record: &LoopRecord) -> Result<LoopState> {
+        if record.approve_requested {
+            let mut updated = record.clone();
+            updated.approve_requested = false;
+            self.start_implementing(&updated).await
+        } else {
+            // Still waiting
+            Ok(LoopState::AwaitingApproval)
+        }
+    }
+
+    /// Handle PAUSED: check for resume flag.
+    async fn handle_paused(&self, record: &LoopRecord) -> Result<LoopState> {
+        if record.resume_requested {
+            let mut updated = record.clone();
+            updated.resume_requested = false;
+
+            // Resume to the stage we paused from
+            if let Some(paused_from) = record.paused_from_state {
+                updated.state = paused_from;
+                updated.paused_from_state = None;
+                self.redispatch_current_stage(&updated).await
+            } else {
+                // No paused_from_state: shouldn't happen, re-evaluate
+                Ok(LoopState::Paused)
+            }
+        } else {
+            Ok(LoopState::Paused)
+        }
+    }
+
+    /// Handle AWAITING_REAUTH: check for resume flag (after creds re-pushed).
+    async fn handle_awaiting_reauth(&self, record: &LoopRecord) -> Result<LoopState> {
+        if record.resume_requested {
+            let mut updated = record.clone();
+            updated.resume_requested = false;
+
+            if let Some(reauth_from) = record.reauth_from_state {
+                updated.state = reauth_from;
+                updated.reauth_from_state = None;
+                self.redispatch_current_stage(&updated).await
+            } else {
+                Ok(LoopState::AwaitingReauth)
+            }
+        } else {
+            Ok(LoopState::AwaitingReauth)
+        }
+    }
+
+    /// Handle cancel request: kill job and transition to CANCELLED.
+    async fn handle_cancel(&self, record: &LoopRecord) -> Result<LoopState> {
+        // Delete active job if any
+        if let Some(ref job_name) = record.active_job_name {
+            let _ = self
+                .dispatcher
+                .delete_job(job_name, &self.config.cluster.jobs_namespace)
+                .await;
+        }
+
+        let mut updated = record.clone();
+        updated.state = LoopState::Cancelled;
+        updated.sub_state = None;
+        updated.failure_reason = Some("Cancelled by user".to_string());
+        updated.active_job_name = None;
+        updated.cancel_requested = false;
+        self.store.update_loop(&updated).await?;
+
+        tracing::info!(loop_id = %record.id, "Loop CANCELLED by user");
+        Ok(LoopState::Cancelled)
+    }
+
+    /// Handle a failed job: retry or fail the loop.
+    async fn handle_job_failed(&self, record: &LoopRecord, reason: &str) -> Result<LoopState> {
+        let mut updated = record.clone();
+
+        if updated.retry_count < self.max_retries_for_stage(record.state) as i32 {
+            // Retry
+            updated.retry_count += 1;
+            tracing::warn!(
+                loop_id = %record.id,
+                retry = updated.retry_count,
+                reason = reason,
+                "Job failed, retrying"
+            );
+            self.redispatch_current_stage(&updated).await
+        } else {
+            // Exhausted retries: fail the loop
+            updated.state = LoopState::Failed;
+            updated.sub_state = None;
+            updated.failure_reason = Some(format!(
+                "{reason} (after {} retries)",
+                updated.retry_count
+            ));
+            updated.active_job_name = None;
+            self.store.update_loop(&updated).await?;
+
+            tracing::error!(loop_id = %record.id, reason = reason, "Loop FAILED after retries exhausted");
+            Ok(LoopState::Failed)
+        }
+    }
+
+    /// Handle malformed verdict JSON: retry per FR-9.
+    async fn handle_verdict_parse_failure(&self, record: &mut LoopRecord) -> Result<LoopState> {
+        if record.retry_count < 2 {
+            record.retry_count += 1;
+            tracing::warn!(
+                loop_id = %record.id,
+                retry = record.retry_count,
+                "Malformed verdict, retrying"
+            );
+            self.redispatch_current_stage(record).await
+        } else {
+            record.state = LoopState::Failed;
+            record.sub_state = None;
+            record.failure_reason = Some(format!(
+                "Malformed verdict after {} retries",
+                record.retry_count
+            ));
+            record.active_job_name = None;
+            self.store.update_loop(record).await?;
+
+            Ok(LoopState::Failed)
+        }
+    }
+
+    /// Start the implement phase.
+    async fn start_implementing(&self, record: &LoopRecord) -> Result<LoopState> {
+        let mut updated = record.clone();
+        updated.state = LoopState::Implementing;
+        updated.sub_state = Some(SubState::Dispatched);
+        updated.kind = LoopKind::Implement;
+        if updated.round == 0 {
+            updated.round = 1;
+        }
+        updated.retry_count = 0;
+
+        let stage_config = self.implement_stage_config(record);
+        let ctx = self.build_context(&updated);
+        let job = job_builder::build_job(
+            &ctx,
+            &stage_config,
+            &self.config.cluster.jobs_namespace,
+            &self.config.cluster.agent_image,
+            &self.config.cluster.bare_repo_pvc,
+        );
+        let job_name = self.dispatcher.create_job(&job).await?;
+        updated.active_job_name = Some(job_name.clone());
+
+        self.create_round_record(&updated, "implement", &job_name)
+            .await?;
+        self.store.update_loop(&updated).await?;
+
+        tracing::info!(loop_id = %record.id, round = updated.round, "Started IMPLEMENTING/DISPATCHED");
+        Ok(LoopState::Implementing)
+    }
+
+    /// Dispatch an audit job (harden loop).
+    async fn dispatch_audit(&self, record: &mut LoopRecord) -> Result<LoopState> {
+        record.state = LoopState::Hardening;
+        record.sub_state = Some(SubState::Dispatched);
+        record.retry_count = 0;
+
+        let stage_config = self.audit_stage_config();
+        let ctx = self.build_context(record);
+        let job = job_builder::build_job(
+            &ctx,
+            &stage_config,
+            &self.config.cluster.jobs_namespace,
+            &self.config.cluster.agent_image,
+            &self.config.cluster.bare_repo_pvc,
+        );
+        let job_name = self.dispatcher.create_job(&job).await?;
+        record.active_job_name = Some(job_name.clone());
+
+        self.create_round_record(record, "audit", &job_name).await?;
+        self.store.update_loop(record).await?;
+
+        Ok(LoopState::Hardening)
+    }
+
+    /// Dispatch a revise job (harden loop).
+    async fn dispatch_revise(&self, record: &mut LoopRecord) -> Result<LoopState> {
+        record.sub_state = Some(SubState::Dispatched);
+        record.retry_count = 0;
+
+        let stage_config = self.revise_stage_config(record);
+        let ctx = self.build_context(record);
+        let job = job_builder::build_job(
+            &ctx,
+            &stage_config,
+            &self.config.cluster.jobs_namespace,
+            &self.config.cluster.agent_image,
+            &self.config.cluster.bare_repo_pvc,
+        );
+        let job_name = self.dispatcher.create_job(&job).await?;
+        record.active_job_name = Some(job_name.clone());
+
+        self.create_round_record(record, "revise", &job_name).await?;
+        self.store.update_loop(record).await?;
+
+        Ok(LoopState::Hardening)
+    }
+
+    /// Dispatch a review job.
+    async fn dispatch_review(&self, record: &mut LoopRecord) -> Result<LoopState> {
+        record.state = LoopState::Reviewing;
+        record.sub_state = Some(SubState::Dispatched);
+        record.retry_count = 0;
+
+        let stage_config = self.review_stage_config(record);
+        let ctx = self.build_context(record);
+        let job = job_builder::build_job(
+            &ctx,
+            &stage_config,
+            &self.config.cluster.jobs_namespace,
+            &self.config.cluster.agent_image,
+            &self.config.cluster.bare_repo_pvc,
+        );
+        let job_name = self.dispatcher.create_job(&job).await?;
+        record.active_job_name = Some(job_name.clone());
+
+        self.create_round_record(record, "review", &job_name).await?;
+        self.store.update_loop(record).await?;
+
+        tracing::info!(loop_id = %record.id, round = record.round, "TESTING -> REVIEWING/DISPATCHED");
+        Ok(LoopState::Reviewing)
+    }
+
+    /// Dispatch implement with feedback from previous round.
+    async fn dispatch_implement_with_feedback(
+        &self,
+        record: &mut LoopRecord,
+        _feedback: &FeedbackFile,
+        feedback_path: &str,
+    ) -> Result<LoopState> {
+        record.state = LoopState::Implementing;
+        record.sub_state = Some(SubState::Dispatched);
+        record.retry_count = 0;
+
+        let stage_config = self.implement_stage_config(record);
+        let mut ctx = self.build_context(record);
+        ctx.feedback_path = Some(feedback_path.to_string());
+
+        let job = job_builder::build_job(
+            &ctx,
+            &stage_config,
+            &self.config.cluster.jobs_namespace,
+            &self.config.cluster.agent_image,
+            &self.config.cluster.bare_repo_pvc,
+        );
+        let job_name = self.dispatcher.create_job(&job).await?;
+        record.active_job_name = Some(job_name.clone());
+
+        self.create_round_record(record, "implement", &job_name)
+            .await?;
+        self.store.update_loop(record).await?;
+
+        tracing::info!(
+            loop_id = %record.id,
+            round = record.round,
+            feedback = feedback_path,
+            "Re-dispatching IMPLEMENTING with feedback"
+        );
+        Ok(LoopState::Implementing)
+    }
+
+    /// Re-dispatch the current stage (after retry or resume).
+    async fn redispatch_current_stage(&self, record: &LoopRecord) -> Result<LoopState> {
+        let mut updated = record.clone();
+        updated.sub_state = Some(SubState::Dispatched);
+
+        let stage_config = match record.state {
+            LoopState::Hardening => self.audit_stage_config(), // simplified: could be revise
+            LoopState::Implementing => self.implement_stage_config(record),
+            LoopState::Testing => self.test_stage_config(),
+            LoopState::Reviewing => self.review_stage_config(record),
+            _ => return Ok(record.state),
+        };
+
+        let ctx = self.build_context(&updated);
+        let job = job_builder::build_job(
+            &ctx,
+            &stage_config,
+            &self.config.cluster.jobs_namespace,
+            &self.config.cluster.agent_image,
+            &self.config.cluster.bare_repo_pvc,
+        );
+        let job_name = self.dispatcher.create_job(&job).await?;
+        updated.active_job_name = Some(job_name);
+        self.store.update_loop(&updated).await?;
+
+        Ok(record.state)
+    }
+
+    // --- Stage config helpers ---
+
+    fn audit_stage_config(&self) -> StageConfig {
+        StageConfig {
+            name: "audit".to_string(),
+            model: Some(self.config.models.reviewer.clone()),
+            prompt_template: Some(".nemo/prompts/audit.md".to_string()),
+            timeout: self.config.timeouts.audit_duration(),
+            max_retries: 2,
+        }
+    }
+
+    fn revise_stage_config(&self, record: &LoopRecord) -> StageConfig {
+        StageConfig {
+            name: "revise".to_string(),
+            model: Some(
+                record
+                    .model_implementor
+                    .clone()
+                    .unwrap_or_else(|| self.config.models.implementor.clone()),
+            ),
+            prompt_template: Some(".nemo/prompts/revise.md".to_string()),
+            timeout: self.config.timeouts.revise_duration(),
+            max_retries: 2,
+        }
+    }
+
+    fn implement_stage_config(&self, record: &LoopRecord) -> StageConfig {
+        StageConfig {
+            name: "implement".to_string(),
+            model: Some(
+                record
+                    .model_implementor
+                    .clone()
+                    .unwrap_or_else(|| self.config.models.implementor.clone()),
+            ),
+            prompt_template: Some(".nemo/prompts/implement.md".to_string()),
+            timeout: self.config.timeouts.implement_duration(),
+            max_retries: 2,
+        }
+    }
+
+    fn test_stage_config(&self) -> StageConfig {
+        StageConfig {
+            name: "test".to_string(),
+            model: None,
+            prompt_template: None,
+            timeout: self.config.timeouts.test_duration(),
+            max_retries: 2,
+        }
+    }
+
+    fn review_stage_config(&self, record: &LoopRecord) -> StageConfig {
+        StageConfig {
+            name: "review".to_string(),
+            model: Some(
+                record
+                    .model_reviewer
+                    .clone()
+                    .unwrap_or_else(|| self.config.models.reviewer.clone()),
+            ),
+            prompt_template: Some(".nemo/prompts/review.md".to_string()),
+            timeout: self.config.timeouts.review_duration(),
+            max_retries: 2,
+        }
+    }
+
+    fn max_retries_for_stage(&self, _state: LoopState) -> u32 {
+        2 // All stages default to 2 retries
+    }
+
+    fn build_context(&self, record: &LoopRecord) -> LoopContext {
+        LoopContext {
+            loop_id: record.id,
+            engineer: record.engineer.clone(),
+            spec_path: record.spec_path.clone(),
+            branch: record.branch.clone(),
+            current_sha: record.current_sha.clone().unwrap_or_default(),
+            round: record.round as u32,
+            max_rounds: record.max_rounds as u32,
+            session_id: record.session_id.clone(),
+            feedback_path: None,
+        }
+    }
+
+    async fn create_round_record(
+        &self,
+        record: &LoopRecord,
+        stage: &str,
+        job_name: &str,
+    ) -> Result<()> {
+        let round_record = RoundRecord {
+            id: Uuid::new_v4(),
+            loop_id: record.id,
+            round: record.round,
+            stage: stage.to_string(),
+            input: None,
+            output: None,
+            started_at: Some(chrono::Utc::now()),
+            completed_at: None,
+            duration_secs: None,
+            job_name: Some(job_name.to_string()),
+        };
+        self.store.create_round(&round_record).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::mock::MockGitOperations;
+    use crate::k8s::mock::MockJobDispatcher;
+    use crate::state::memory::MemoryStateStore;
+
+    fn make_driver(
+        store: Arc<MemoryStateStore>,
+        dispatcher: Arc<MockJobDispatcher>,
+    ) -> ConvergentLoopDriver {
+        let git = Arc::new(MockGitOperations::new());
+        ConvergentLoopDriver::new(store, dispatcher, git, NemoConfig::default())
+    }
+
+    fn make_pending_loop(auto_approve: bool) -> LoopRecord {
+        LoopRecord {
+            id: Uuid::new_v4(),
+            engineer: "alice".to_string(),
+            spec_path: "specs/test.md".to_string(),
+            spec_content_hash: "abc12345".to_string(),
+            branch: "agent/alice/test-abc12345".to_string(),
+            kind: LoopKind::Implement,
+            state: LoopState::Pending,
+            sub_state: None,
+            round: 0,
+            max_rounds: 15,
+            harden: false,
+            harden_only: false,
+            auto_approve,
+            cancel_requested: false,
+            approve_requested: false,
+            resume_requested: false,
+            paused_from_state: None,
+            reauth_from_state: None,
+            failure_reason: None,
+            current_sha: None,
+            session_id: None,
+            active_job_name: None,
+            retry_count: 0,
+            model_implementor: None,
+            model_reviewer: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pending_auto_approve_transitions_to_implementing() {
+        let store = Arc::new(MemoryStateStore::new());
+        let dispatcher = Arc::new(MockJobDispatcher::new());
+        let driver = make_driver(store.clone(), dispatcher.clone());
+
+        let record = make_pending_loop(true);
+        store.create_loop(&record).await.unwrap();
+
+        let new_state = driver.tick(record.id).await.unwrap();
+        assert_eq!(new_state, LoopState::Implementing);
+
+        let updated = store.get_loop(record.id).await.unwrap().unwrap();
+        assert_eq!(updated.state, LoopState::Implementing);
+        assert_eq!(updated.sub_state, Some(SubState::Dispatched));
+        assert_eq!(updated.round, 1);
+        assert!(updated.active_job_name.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_pending_no_auto_approve_transitions_to_awaiting_approval() {
+        let store = Arc::new(MemoryStateStore::new());
+        let dispatcher = Arc::new(MockJobDispatcher::new());
+        let driver = make_driver(store.clone(), dispatcher.clone());
+
+        let record = make_pending_loop(false);
+        store.create_loop(&record).await.unwrap();
+
+        let new_state = driver.tick(record.id).await.unwrap();
+        assert_eq!(new_state, LoopState::AwaitingApproval);
+    }
+
+    #[tokio::test]
+    async fn test_awaiting_approval_approve_transitions_to_implementing() {
+        let store = Arc::new(MemoryStateStore::new());
+        let dispatcher = Arc::new(MockJobDispatcher::new());
+        let driver = make_driver(store.clone(), dispatcher.clone());
+
+        let mut record = make_pending_loop(false);
+        record.state = LoopState::AwaitingApproval;
+        record.approve_requested = true;
+        store.create_loop(&record).await.unwrap();
+
+        let new_state = driver.tick(record.id).await.unwrap();
+        assert_eq!(new_state, LoopState::Implementing);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_from_any_state() {
+        let store = Arc::new(MemoryStateStore::new());
+        let dispatcher = Arc::new(MockJobDispatcher::new());
+        let driver = make_driver(store.clone(), dispatcher.clone());
+
+        let mut record = make_pending_loop(true);
+        record.state = LoopState::Implementing;
+        record.sub_state = Some(SubState::Running);
+        record.cancel_requested = true;
+        record.active_job_name = Some("nemo-test-job".to_string());
+        store.create_loop(&record).await.unwrap();
+
+        let new_state = driver.tick(record.id).await.unwrap();
+        assert_eq!(new_state, LoopState::Cancelled);
+
+        let updated = store.get_loop(record.id).await.unwrap().unwrap();
+        assert_eq!(updated.state, LoopState::Cancelled);
+        assert_eq!(
+            updated.failure_reason,
+            Some("Cancelled by user".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pending_harden_transitions_to_hardening() {
+        let store = Arc::new(MemoryStateStore::new());
+        let dispatcher = Arc::new(MockJobDispatcher::new());
+        let driver = make_driver(store.clone(), dispatcher.clone());
+
+        let mut record = make_pending_loop(false);
+        record.harden = true;
+        store.create_loop(&record).await.unwrap();
+
+        let new_state = driver.tick(record.id).await.unwrap();
+        assert_eq!(new_state, LoopState::Hardening);
+
+        let updated = store.get_loop(record.id).await.unwrap().unwrap();
+        assert_eq!(updated.sub_state, Some(SubState::Dispatched));
+        assert_eq!(updated.round, 1);
+    }
+
+    #[tokio::test]
+    async fn test_implementing_job_running_updates_substate() {
+        let store = Arc::new(MemoryStateStore::new());
+        let dispatcher = Arc::new(MockJobDispatcher::new());
+        let driver = make_driver(store.clone(), dispatcher.clone());
+
+        let mut record = make_pending_loop(true);
+        record.state = LoopState::Implementing;
+        record.sub_state = Some(SubState::Dispatched);
+        record.round = 1;
+        record.active_job_name = Some("test-job".to_string());
+        store.create_loop(&record).await.unwrap();
+
+        // Set job to running
+        dispatcher
+            .set_job_status("test-job", JobStatus::Running)
+            .await;
+        // Create the job in dispatcher first
+        let job = k8s_openapi::api::batch::v1::Job {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                name: Some("test-job".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        dispatcher.create_job(&job).await.unwrap();
+        dispatcher
+            .set_job_status("test-job", JobStatus::Running)
+            .await;
+
+        let new_state = driver.tick(record.id).await.unwrap();
+        assert_eq!(new_state, LoopState::Implementing);
+
+        let updated = store.get_loop(record.id).await.unwrap().unwrap();
+        assert_eq!(updated.sub_state, Some(SubState::Running));
+    }
+
+    #[tokio::test]
+    async fn test_terminal_state_noop() {
+        let store = Arc::new(MemoryStateStore::new());
+        let dispatcher = Arc::new(MockJobDispatcher::new());
+        let driver = make_driver(store.clone(), dispatcher.clone());
+
+        let mut record = make_pending_loop(true);
+        record.state = LoopState::Converged;
+        store.create_loop(&record).await.unwrap();
+
+        let new_state = driver.tick(record.id).await.unwrap();
+        assert_eq!(new_state, LoopState::Converged);
+    }
+
+    #[tokio::test]
+    async fn test_paused_resume_redispatches() {
+        let store = Arc::new(MemoryStateStore::new());
+        let dispatcher = Arc::new(MockJobDispatcher::new());
+        let driver = make_driver(store.clone(), dispatcher.clone());
+
+        let mut record = make_pending_loop(true);
+        record.state = LoopState::Paused;
+        record.paused_from_state = Some(LoopState::Implementing);
+        record.resume_requested = true;
+        record.round = 2;
+        store.create_loop(&record).await.unwrap();
+
+        let new_state = driver.tick(record.id).await.unwrap();
+        assert_eq!(new_state, LoopState::Implementing);
+    }
+
+    #[tokio::test]
+    async fn test_job_failed_retries() {
+        let store = Arc::new(MemoryStateStore::new());
+        let dispatcher = Arc::new(MockJobDispatcher::new());
+        let driver = make_driver(store.clone(), dispatcher.clone());
+
+        let mut record = make_pending_loop(true);
+        record.state = LoopState::Implementing;
+        record.sub_state = Some(SubState::Dispatched);
+        record.round = 1;
+        record.retry_count = 0;
+        record.active_job_name = Some("test-job".to_string());
+        store.create_loop(&record).await.unwrap();
+
+        // Create job in dispatcher and set to failed
+        let job = k8s_openapi::api::batch::v1::Job {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                name: Some("test-job".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        dispatcher.create_job(&job).await.unwrap();
+        dispatcher
+            .set_job_status(
+                "test-job",
+                JobStatus::Failed {
+                    reason: "OOM".to_string(),
+                },
+            )
+            .await;
+
+        // First failure: should retry
+        let new_state = driver.tick(record.id).await.unwrap();
+        assert_eq!(new_state, LoopState::Implementing);
+
+        let updated = store.get_loop(record.id).await.unwrap().unwrap();
+        assert_eq!(updated.retry_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_job_failed_exhausts_retries() {
+        let store = Arc::new(MemoryStateStore::new());
+        let dispatcher = Arc::new(MockJobDispatcher::new());
+        let driver = make_driver(store.clone(), dispatcher.clone());
+
+        let mut record = make_pending_loop(true);
+        record.state = LoopState::Implementing;
+        record.sub_state = Some(SubState::Dispatched);
+        record.round = 1;
+        record.retry_count = 2; // Already exhausted
+        record.active_job_name = Some("test-job".to_string());
+        store.create_loop(&record).await.unwrap();
+
+        let job = k8s_openapi::api::batch::v1::Job {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                name: Some("test-job".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        dispatcher.create_job(&job).await.unwrap();
+        dispatcher
+            .set_job_status(
+                "test-job",
+                JobStatus::Failed {
+                    reason: "OOM".to_string(),
+                },
+            )
+            .await;
+
+        let new_state = driver.tick(record.id).await.unwrap();
+        assert_eq!(new_state, LoopState::Failed);
+
+        let updated = store.get_loop(record.id).await.unwrap().unwrap();
+        assert!(updated.failure_reason.unwrap().contains("OOM"));
+    }
+}
