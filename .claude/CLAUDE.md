@@ -1,0 +1,70 @@
+## Commit behavior (high priority)
+
+- **Branch before work**: Always create and push a branch before starting any feature/task/spec implementation (see `.claude/rules/branch-before-work.md`).
+- **NEVER push to main**: All changes go through branches and PRs. Never commit or push directly to main, even for single-line changes.
+- **Auto-commit on success**: After completing a task (tests pass, build succeeds), commit automatically without waiting to be asked (see `.claude/rules/auto-commit-on-success.md`).
+- **Conventional commits required**: All commits must follow conventional commits format - enforced by hook (see `.claude/rules/conventional-commits.md`).
+
+## Rust development (high priority)
+
+- **Workspace layout**: Cargo workspace with two crates: `control-plane/` (library + binary) and `cli/` (binary).
+- **Clippy before commit**: Run `cargo clippy --workspace -- -D warnings` before every commit. Fix all warnings.
+- **Tests must pass**: Run `cargo test --workspace` before every commit. Never commit with failing tests.
+- **Error types**: Use `thiserror` for all error enums. No `unwrap()` in library code.
+- **Serialization**: Use `serde` + `serde_json` for all data structures that cross boundaries (API, config, state).
+- **Database**: `sqlx` with Postgres. Compile-time query checking where possible.
+- **Kubernetes**: `kube-rs` for all k8s API interaction. Job templates defined in YAML, applied via `kube-rs` client.
+
+## Project structure
+
+```
+control-plane/src/
+  api/          # REST API (axum): job submission, status, logs
+  loop/         # Convergent loop engine: dispatch -> wait -> evaluate -> loop/exit
+  state/        # Postgres state machine (sqlx): PENDING -> IMPLEMENTING -> REVIEWING -> CONVERGED | FAILED
+  git/          # Git operations: bare repo, worktree management, identity
+  config/       # Config loading: nemo.toml (repo) + ~/.nemo/config.toml (engineer) + cluster
+cli/src/        # nemo CLI: submit, status, logs, cancel, init, auth
+terraform/      # Hetzner + k3s provisioning
+images/         # Dockerfiles for agent job images (base + per-monorepo extension)
+.nemo/prompts/  # Agent prompt templates for implement/review/harden stages
+```
+
+## Architecture decisions
+
+- **Split control plane**: API server (axum, handles CLI requests) + loop engine (background task, drives convergent loops). Same binary, two async tasks.
+- **Postgres not SQLite**: Multi-pod future, concurrent access from API + loop engine. Use sqlx with migrations in `control-plane/migrations/`.
+- **Auth sidecar per job pod**: Agent containers get open internet but NO secrets. Model API auth + git push proxy through a localhost sidecar. Secrets never touch agent filesystem.
+- **Headless agent execution**: `claude --print --output-format stream-json` for Claude. `opencode run --format json` for OpenAI. No interactive terminals.
+- **Job output**: Branch tip SHA (not patches). Agent commits directly to worktree branch.
+
+## Testing
+
+- **Unit tests**: `cargo test --workspace`. Inline `#[cfg(test)]` modules.
+- **Trait-based mocking**: Define traits for external boundaries (e.g., `JobDispatcher`, `GitOperations`, `ModelClient`). Implement mock versions in tests. No mocking frameworks.
+- **Integration tests**: `tests/` directory in each crate. Use testcontainers for Postgres. Use `k8s-openapi` fixtures for kube-rs tests.
+
+## Implementation behavior (high priority)
+
+- **Search before implementing**: NEVER implement functionality without first searching the codebase thoroughly. Use multiple search strategies and subagents. Do NOT assume something is not implemented.
+- **No placeholders**: Every implementation must be complete and production-ready. No TODOs, no stubs, no "implement later".
+- **Subagent strategy**: Use subagents for expensive operations (search, read) to preserve main context. Limit build/test to single subagent to avoid backpressure.
+- **Capture learnings**: Document general discoveries in `.claude/learnings.md` (persists across all work). Document spec-specific findings in impl-plan.md.
+
+## Adding new enforced rules
+
+We use a two-layer pattern:
+
+1. **Guidance**: add/adjust a rule in `.claude/rules/*.md` (use `paths:` to scope it).
+2. **Enforcement**: update `.claude/hooks/deny_misplaced_rules.sh` and (if needed) `.claude/settings.json` to deny tool calls with a clear reason that links to the relevant rule doc.
+
+When denying, the hook must:
+
+- Return `permissionDecision: "deny"` and a `permissionDecisionReason`
+- Include the rule path (e.g., `.claude/rules/<rule>.md`) and an exact corrective action
+
+Prefer:
+
+- Lightweight global reminder in `.claude/CLAUDE.md`
+- Detailed behavior in scoped `.claude/rules/...`
+- Hooks only for hard constraints (locations, forbidden files/tools, required checks)

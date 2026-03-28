@@ -1,0 +1,29 @@
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Rust
+target/
+**/*.rs.bk
+
+# Node (opencode deps)
+node_modules/
+
+# Tool session data
+.gstack/
+
+# Claude local settings (contains permission grants, not shared)
+.claude/settings.local.json
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key

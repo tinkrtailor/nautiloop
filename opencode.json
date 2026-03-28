@@ -1,0 +1,26 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": [
+    ".claude/CLAUDE.md",
+    ".claude/learnings.md",
+    ".claude/rules/*.md",
+    "spec-template.md"
+  ],
+  "permission": {
+    "skill": {
+      "*": "allow"
+    },
+    "bash": {
+      "git push --force*": "deny",
+      "git reset --hard*": "deny",
+      "git checkout --*": "deny"
+    }
+  },
+  "mcp": {
+    "Sentry": {
+      "type": "remote",
+      "url": "https://mcp.sentry.dev/mcp/groa-online/cleared-frontend",
+      "oauth": {}
+    }
+  }
+}
