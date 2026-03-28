@@ -97,11 +97,7 @@ impl ConvergentLoopDriver {
                 &self.config.cluster.agent_image,
                 &self.config.cluster.bare_repo_pvc,
             );
-            let job_name = self.dispatcher.create_job(&job).await?;
-            updated.active_job_name = Some(job_name.clone());
-
-            self.create_round_record(&updated, "audit", &job_name).await?;
-            self.store.update_loop(&updated).await?;
+            self.persist_then_dispatch(&mut updated, "audit", &job).await?;
 
             tracing::info!(loop_id = %record.id, "Transitioned PENDING -> HARDENING/DISPATCHED");
             Ok(LoopState::Hardening)
@@ -316,7 +312,9 @@ impl ConvergentLoopDriver {
                         // Audit passed
                         if record.harden_only {
                             // Clean up .agent/ artifacts before PR creation
-                            let _ = self.git.remove_path(&record.branch, ".agent").await;
+                            if let Err(e) = self.git.remove_path(&record.branch, ".agent").await {
+                    tracing::warn!(loop_id = %record.id, error = %e, "Failed to clean up .agent/ artifacts, proceeding with PR");
+                }
 
                             // Harden only: create spec PR, merge it, terminal HARDENED (FR-23)
                             let pr_title = format!(
@@ -353,15 +351,16 @@ impl ConvergentLoopDriver {
                                 tracing::info!(loop_id = %record.id, "Harden loop HARDENED (spec PR merged)");
                                 Ok(LoopState::Hardened)
                             } else {
-                                // PR created but not auto-merged: needs human merge
-                                record.state = LoopState::Converged;
+                                // PR created but not auto-merged: still HARDENED
+                                // (hardening converged, PR is the deliverable)
+                                record.state = LoopState::Hardened;
                                 record.sub_state = None;
                                 record.active_job_name = None;
                                 record.hardened_spec_path =
                                     Some(record.spec_path.clone());
                                 self.store.update_loop(record).await?;
-                                tracing::info!(loop_id = %record.id, "Harden loop CONVERGED (spec PR needs human merge)");
-                                Ok(LoopState::Converged)
+                                tracing::info!(loop_id = %record.id, "Harden loop HARDENED (spec PR created, human merge required)");
+                                Ok(LoopState::Hardened)
                             }
                         } else if record.auto_approve {
                             // Auto-approve: go to implementing
@@ -436,11 +435,7 @@ impl ConvergentLoopDriver {
             &self.config.cluster.agent_image,
             &self.config.cluster.bare_repo_pvc,
         );
-        let job_name = self.dispatcher.create_job(&job).await?;
-        record.active_job_name = Some(job_name.clone());
-
-        self.create_round_record(record, "test", &job_name).await?;
-        self.store.update_loop(record).await?;
+        self.persist_then_dispatch(record, "test", &job).await?;
 
         tracing::info!(loop_id = %record.id, round = record.round, "IMPLEMENTING -> TESTING/DISPATCHED");
         Ok(LoopState::Testing)
@@ -514,7 +509,9 @@ impl ConvergentLoopDriver {
         match verdict {
             Some(v) if v.clean => {
                 // Clean up .agent/ artifacts before PR creation
-                let _ = self.git.remove_path(&record.branch, ".agent").await;
+                if let Err(e) = self.git.remove_path(&record.branch, ".agent").await {
+                    tracing::warn!(loop_id = %record.id, error = %e, "Failed to clean up .agent/ artifacts, proceeding with PR");
+                }
 
                 // Review passed: create PR for all convergence paths
                 let pr_title = format!(
@@ -673,6 +670,7 @@ impl ConvergentLoopDriver {
                 let mut updated = record.clone();
                 updated.state = paused_from;
                 updated.paused_from_state = None;
+                updated.retry_count += 1; // Bump to generate unique job name
                 // Refresh current_sha to current branch tip so divergence check
                 // doesn't immediately re-pause after resume
                 if let Ok(Some(sha)) = self.git.get_branch_sha(&record.branch).await {
@@ -700,6 +698,7 @@ impl ConvergentLoopDriver {
                 let mut updated = record.clone();
                 updated.state = reauth_from;
                 updated.reauth_from_state = None;
+                updated.retry_count += 1; // Bump to generate unique job name
                 let result = self.redispatch_current_stage(&updated).await?;
                 self.store
                     .set_loop_flag(record.id, crate::state::LoopFlag::Resume, false)
@@ -836,12 +835,7 @@ impl ConvergentLoopDriver {
             &self.config.cluster.agent_image,
             &self.config.cluster.bare_repo_pvc,
         );
-        let job_name = self.dispatcher.create_job(&job).await?;
-        updated.active_job_name = Some(job_name.clone());
-
-        self.create_round_record(&updated, "implement", &job_name)
-            .await?;
-        self.store.update_loop(&updated).await?;
+        self.persist_then_dispatch(&mut updated, "implement", &job).await?;
 
         tracing::info!(loop_id = %record.id, round = updated.round, "Started IMPLEMENTING/DISPATCHED");
         Ok(LoopState::Implementing)
@@ -862,11 +856,7 @@ impl ConvergentLoopDriver {
             &self.config.cluster.agent_image,
             &self.config.cluster.bare_repo_pvc,
         );
-        let job_name = self.dispatcher.create_job(&job).await?;
-        record.active_job_name = Some(job_name.clone());
-
-        self.create_round_record(record, "audit", &job_name).await?;
-        self.store.update_loop(record).await?;
+        self.persist_then_dispatch(record, "audit", &job).await?;
 
         Ok(LoopState::Hardening)
     }
@@ -885,11 +875,7 @@ impl ConvergentLoopDriver {
             &self.config.cluster.agent_image,
             &self.config.cluster.bare_repo_pvc,
         );
-        let job_name = self.dispatcher.create_job(&job).await?;
-        record.active_job_name = Some(job_name.clone());
-
-        self.create_round_record(record, "revise", &job_name).await?;
-        self.store.update_loop(record).await?;
+        self.persist_then_dispatch(record, "revise", &job).await?;
 
         Ok(LoopState::Hardening)
     }
@@ -909,11 +895,7 @@ impl ConvergentLoopDriver {
             &self.config.cluster.agent_image,
             &self.config.cluster.bare_repo_pvc,
         );
-        let job_name = self.dispatcher.create_job(&job).await?;
-        record.active_job_name = Some(job_name.clone());
-
-        self.create_round_record(record, "review", &job_name).await?;
-        self.store.update_loop(record).await?;
+        self.persist_then_dispatch(record, "review", &job).await?;
 
         tracing::info!(loop_id = %record.id, round = record.round, "TESTING -> REVIEWING/DISPATCHED");
         Ok(LoopState::Reviewing)
@@ -954,12 +936,7 @@ impl ConvergentLoopDriver {
             &self.config.cluster.agent_image,
             &self.config.cluster.bare_repo_pvc,
         );
-        let job_name = self.dispatcher.create_job(&job).await?;
-        record.active_job_name = Some(job_name.clone());
-
-        self.create_round_record(record, "implement", &job_name)
-            .await?;
-        self.store.update_loop(record).await?;
+        self.persist_then_dispatch(record, "implement", &job).await?;
 
         tracing::info!(
             loop_id = %record.id,
@@ -1028,9 +1005,21 @@ impl ConvergentLoopDriver {
             &self.config.cluster.agent_image,
             &self.config.cluster.bare_repo_pvc,
         );
-        let job_name = self.dispatcher.create_job(&job).await?;
+
+        // Persist state FIRST, then create K8s Job
+        let job_name = job
+            .metadata
+            .name
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
         updated.active_job_name = Some(job_name);
         self.store.update_loop(&updated).await?;
+
+        if let Err(e) = self.dispatcher.create_job(&job).await {
+            updated.active_job_name = None;
+            let _ = self.store.update_loop(&updated).await;
+            return Err(e);
+        }
 
         Ok(record.state)
     }
@@ -1104,18 +1093,22 @@ impl ConvergentLoopDriver {
 
     /// Poll CI status with exponential backoff. Returns true if checks pass
     /// within the timeout window (30 min max, 30s initial interval doubling to 4 min).
+    /// Stops early on definitive failure (not just timeout).
     async fn poll_ci(&self, branch: &str) -> bool {
-        let max_wait = std::time::Duration::from_secs(30 * 60); // 30 min
+        let max_wait = std::time::Duration::from_secs(30 * 60);
         let mut interval = std::time::Duration::from_secs(30);
         let max_interval = std::time::Duration::from_secs(4 * 60);
         let start = std::time::Instant::now();
 
         loop {
-            match self.git.ci_passed(branch).await {
-                Ok(true) => return true,
-                Ok(false) => {
-                    // CI explicitly failed (not pending) — gh pr checks exits non-zero
-                    // for both "failed" and "pending", so we keep polling until timeout
+            match self.git.ci_status(branch).await {
+                Ok(Some(true)) => return true,
+                Ok(Some(false)) => {
+                    tracing::warn!(branch, "CI checks definitively failed");
+                    return false;
+                }
+                Ok(None) => {
+                    // Still pending, keep polling
                 }
                 Err(e) => {
                     tracing::warn!(branch, error = %e, "CI check error, retrying");
@@ -1165,6 +1158,38 @@ impl ConvergentLoopDriver {
             feedback_path,
             credentials,
         })
+    }
+
+    /// Persist state FIRST, then create K8s Job. If K8s creation fails,
+    /// clear active_job_name so the loop can retry on next tick.
+    /// This prevents orphan jobs from DB write failures after job creation.
+    async fn persist_then_dispatch(
+        &self,
+        record: &mut LoopRecord,
+        stage: &str,
+        job: &k8s_openapi::api::batch::v1::Job,
+    ) -> Result<String> {
+        let job_name = job
+            .metadata
+            .name
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // Persist state to DB first
+        record.active_job_name = Some(job_name.clone());
+        self.create_round_record(record, stage, &job_name).await?;
+        self.store.update_loop(record).await?;
+
+        // Now create the K8s Job
+        match self.dispatcher.create_job(job).await {
+            Ok(name) => Ok(name),
+            Err(e) => {
+                // K8s creation failed: clear job name so next tick can retry
+                record.active_job_name = None;
+                let _ = self.store.update_loop(record).await;
+                Err(e)
+            }
+        }
     }
 
     async fn create_round_record(

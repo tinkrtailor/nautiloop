@@ -35,8 +35,9 @@ pub trait GitOperations: Send + Sync + 'static {
     /// Remove a path from the branch (git rm) and commit. Used to clean up artifacts before PR.
     async fn remove_path(&self, branch: &str, path: &str) -> Result<()>;
 
-    /// Check if CI checks have passed on a branch/PR. Returns true if all checks pass.
-    async fn ci_passed(&self, branch: &str) -> Result<bool>;
+    /// Check CI status. Returns Ok(Some(true)) if passed, Ok(Some(false)) if failed,
+    /// Ok(None) if still pending.
+    async fn ci_status(&self, branch: &str) -> Result<Option<bool>>;
 
     /// Create a pull request. Returns the PR URL.
     async fn create_pr(&self, branch: &str, title: &str, body: &str) -> Result<String>;
@@ -252,28 +253,37 @@ pub mod bare {
                 .args(["rm", "-rf", path])
                 .current_dir(&worktree_dir)
                 .output()
-                .await;
+                .await
+                .map_err(|e| crate::error::NemoError::Git(format!("git rm spawn failed: {e}")))?;
 
-            if let Ok(ref output) = rm
-                && output.status.success()
-            {
-                // Only commit if git rm actually staged changes
-                let _ = Command::new("git")
-                    .args([
-                        "-c", "user.name=nemo-control-plane",
-                        "-c", "user.email=nemo@nemo.dev",
-                        "commit", "-m", &format!("chore(agent): remove {path} artifacts"),
-                    ])
-                    .current_dir(&worktree_dir)
-                    .output()
-                    .await;
+            if !rm.status.success() {
+                let stderr = String::from_utf8_lossy(&rm.stderr).trim().to_string();
+                let _ = self.run_git(&["worktree", "remove", "--force", &worktree_dir]).await;
+                return Err(crate::error::NemoError::Git(format!("git rm {path} failed: {stderr}")));
+            }
+
+            // Commit the removal
+            let commit = Command::new("git")
+                .args([
+                    "-c", "user.name=nemo-control-plane",
+                    "-c", "user.email=nemo@nemo.dev",
+                    "commit", "-m", &format!("chore(agent): remove {path} artifacts"),
+                ])
+                .current_dir(&worktree_dir)
+                .output()
+                .await
+                .map_err(|e| crate::error::NemoError::Git(format!("git commit spawn failed: {e}")))?;
+            if !commit.status.success() {
+                let stderr = String::from_utf8_lossy(&commit.stderr).trim().to_string();
+                let _ = self.run_git(&["worktree", "remove", "--force", &worktree_dir]).await;
+                return Err(crate::error::NemoError::Git(format!("git commit failed: {stderr}")));
             }
 
             let _ = self.run_git(&["worktree", "remove", "--force", &worktree_dir]).await;
             Ok(())
         }
 
-        async fn ci_passed(&self, branch: &str) -> Result<bool> {
+        async fn ci_status(&self, branch: &str) -> Result<Option<bool>> {
             let output = Command::new("gh")
                 .args(["pr", "checks", branch, "--required"])
                 .current_dir(&self.repo_path)
@@ -281,8 +291,17 @@ pub mod bare {
                 .await
                 .map_err(|e| crate::error::NemoError::Git(format!("Failed to run gh: {e}")))?;
 
-            // Exit code 0 means all required checks passed
-            Ok(output.status.success())
+            if output.status.success() {
+                return Ok(Some(true)); // All checks passed
+            }
+
+            // Non-zero: parse output to distinguish "fail" from "pending"
+            let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+            if stdout.contains("fail") || stdout.contains("error") || stdout.contains("cancelled") {
+                Ok(Some(false)) // Definitively failed
+            } else {
+                Ok(None) // Still pending
+            }
         }
 
         async fn create_pr(&self, branch: &str, title: &str, body: &str) -> Result<String> {
@@ -460,8 +479,8 @@ pub mod mock {
             Ok(())
         }
 
-        async fn ci_passed(&self, _branch: &str) -> Result<bool> {
-            Ok(true)
+        async fn ci_status(&self, _branch: &str) -> Result<Option<bool>> {
+            Ok(Some(true))
         }
 
         async fn create_pr(&self, branch: &str, _title: &str, _body: &str) -> Result<String> {
