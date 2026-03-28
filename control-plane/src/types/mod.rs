@@ -116,6 +116,10 @@ pub struct LoopContext {
     pub retry_count: u32,
     pub session_id: Option<String>,
     pub feedback_path: Option<String>,
+    /// Credential references keyed by provider (e.g., "claude" -> credential JSON).
+    /// Injected into job pods so agents can authenticate with model APIs.
+    #[serde(default)]
+    pub credentials: Vec<(String, String)>,
 }
 
 /// Configuration for a single stage.
@@ -241,9 +245,11 @@ pub fn generate_branch_name(engineer: &str, spec_path: &str, spec_content: &str)
         .unwrap_or("unknown");
     let safe_slug = slugify(raw_slug);
 
-    // Hash includes both spec content AND full path to avoid collisions
-    // between same-name specs in different directories
+    // Hash includes raw engineer name, full spec path, and content to avoid
+    // collisions between same-name specs in different dirs and between
+    // engineers whose names normalize to the same slug (e.g., "Alice" vs "alice")
     let mut hasher = Sha256::new();
+    hasher.update(engineer.as_bytes());
     hasher.update(spec_path.as_bytes());
     hasher.update(spec_content.as_bytes());
     let hash = hasher.finalize();

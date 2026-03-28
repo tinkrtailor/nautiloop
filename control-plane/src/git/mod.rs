@@ -293,6 +293,21 @@ pub mod bare {
                     "Failed to push {branch} to origin: {e}"
                 )))?;
 
+            // Check if a PR already exists for this branch (idempotent on retry)
+            let existing = Command::new("gh")
+                .args(["pr", "view", branch, "--json", "url", "--jq", ".url"])
+                .current_dir(&self.repo_path)
+                .output()
+                .await;
+            if let Ok(ref out) = existing
+                && out.status.success()
+            {
+                let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !url.is_empty() {
+                    return Ok(url);
+                }
+            }
+
             let output = Command::new("gh")
                 .args(["pr", "create", "--head", branch, "--title", title, "--body", body])
                 .current_dir(&self.repo_path)

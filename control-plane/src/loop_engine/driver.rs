@@ -85,7 +85,7 @@ impl ConvergentLoopDriver {
             updated.kind = LoopKind::Harden;
 
             let stage_config = self.audit_stage_config();
-            let ctx = self.build_context(&updated);
+            let ctx = self.build_context(&updated).await;
             let job = job_builder::build_job(
                 &ctx,
                 &stage_config,
@@ -424,7 +424,7 @@ impl ConvergentLoopDriver {
         record.retry_count = 0; // Reset per-stage retry budget
 
         let stage_config = self.test_stage_config();
-        let ctx = self.build_context(record);
+        let ctx = self.build_context(record).await;
         let job = job_builder::build_job(
             &ctx,
             &stage_config,
@@ -819,7 +819,7 @@ impl ConvergentLoopDriver {
         updated.retry_count = 0;
 
         let stage_config = self.implement_stage_config(record);
-        let ctx = self.build_context(&updated);
+        let ctx = self.build_context(&updated).await;
         let job = job_builder::build_job(
             &ctx,
             &stage_config,
@@ -845,7 +845,7 @@ impl ConvergentLoopDriver {
         record.retry_count = 0;
 
         let stage_config = self.audit_stage_config();
-        let ctx = self.build_context(record);
+        let ctx = self.build_context(record).await;
         let job = job_builder::build_job(
             &ctx,
             &stage_config,
@@ -868,7 +868,7 @@ impl ConvergentLoopDriver {
         record.retry_count = 0;
 
         let stage_config = self.revise_stage_config(record);
-        let ctx = self.build_context(record);
+        let ctx = self.build_context(record).await;
         let job = job_builder::build_job(
             &ctx,
             &stage_config,
@@ -892,7 +892,7 @@ impl ConvergentLoopDriver {
         record.retry_count = 0;
 
         let stage_config = self.review_stage_config(record);
-        let ctx = self.build_context(record);
+        let ctx = self.build_context(record).await;
         let job = job_builder::build_job(
             &ctx,
             &stage_config,
@@ -935,7 +935,7 @@ impl ConvergentLoopDriver {
         record.retry_count = 0;
 
         let stage_config = self.implement_stage_config(record);
-        let mut ctx = self.build_context(record);
+        let mut ctx = self.build_context(record).await;
         ctx.feedback_path = Some(feedback_path.to_string());
 
         let job = job_builder::build_job(
@@ -994,7 +994,7 @@ impl ConvergentLoopDriver {
             _ => return Ok(record.state),
         };
 
-        let mut ctx = self.build_context(&updated);
+        let mut ctx = self.build_context(&updated).await;
 
         // Restore feedback_path for implementing redispatch (N30):
         // look at the prior round's stage to determine review vs test feedback
@@ -1127,11 +1127,22 @@ impl ConvergentLoopDriver {
         2 // All stages default to 2 retries
     }
 
-    fn build_context(&self, record: &LoopRecord) -> LoopContext {
+    /// Build context with credentials loaded from the store.
+    async fn build_context(&self, record: &LoopRecord) -> LoopContext {
         // feedback_path is set explicitly by dispatch_implement_with_feedback;
         // for redispatch/resume, it's restored by redispatch_current_stage.
-        // Default to None here — callers override via ctx.feedback_path = ... when needed.
         let feedback_path = None;
+
+        // Load engineer credentials for injection into job pods
+        let credentials = self
+            .store
+            .get_credentials(&record.engineer)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| c.valid)
+            .map(|c| (c.provider, c.credential_ref))
+            .collect();
 
         LoopContext {
             loop_id: record.id,
@@ -1144,6 +1155,7 @@ impl ConvergentLoopDriver {
             retry_count: record.retry_count as u32,
             session_id: record.session_id.clone(),
             feedback_path,
+            credentials,
         }
     }
 

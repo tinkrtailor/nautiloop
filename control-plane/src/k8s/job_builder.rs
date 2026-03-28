@@ -101,6 +101,16 @@ pub fn build_job(
         });
     }
 
+    // Inject credentials into the pod so agents can authenticate with model APIs
+    for (provider, cred_ref) in &ctx.credentials {
+        let env_name = format!("NEMO_CRED_{}", provider.to_uppercase());
+        env_vars.push(EnvVar {
+            name: env_name,
+            value: Some(cred_ref.clone()),
+            ..Default::default()
+        });
+    }
+
     if let Some(ref prompt) = stage.prompt_template {
         env_vars.push(EnvVar {
             name: "NEMO_PROMPT_TEMPLATE".to_string(),
@@ -185,6 +195,7 @@ mod tests {
             retry_count: 0,
             session_id: Some("session-123".to_string()),
             feedback_path: Some(".agent/review-feedback-round-1.json".to_string()),
+            credentials: vec![],
         }
     }
 
