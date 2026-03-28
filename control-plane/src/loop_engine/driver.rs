@@ -499,21 +499,21 @@ impl ConvergentLoopDriver {
                     // Ship mode: check if rounds <= max_rounds_for_auto_merge
                     let threshold = self.config.ship.max_rounds_for_auto_merge as i32;
                     if record.round <= threshold {
-                        // Check CI if required before merging
+                        // Check CI if required before merging — poll with backoff
                         if self.config.ship.require_passing_ci {
-                            let ci_ok = self.git.ci_passed(&record.branch).await?;
+                            let ci_ok = self.poll_ci(&record.branch).await;
                             if !ci_ok {
-                                // CI failed: converge without merge, leave PR for review
+                                // CI failed or timed out: converge without merge
                                 record.state = LoopState::Converged;
                                 record.sub_state = None;
                                 record.active_job_name = None;
                                 record.failure_reason = Some(
-                                    "CI checks failed. PR created but not merged.".to_string(),
+                                    "CI checks failed or timed out. PR created but not merged.".to_string(),
                                 );
                                 self.store.update_loop(record).await?;
                                 tracing::warn!(
                                     loop_id = %record.id,
-                                    "Ship mode: CI failed, converging without merge"
+                                    "Ship mode: CI not passing, converging without merge"
                                 );
                                 return Ok(LoopState::Converged);
                             }
@@ -1035,6 +1035,36 @@ impl ConvergentLoopDriver {
             prompt_template: Some(".nemo/prompts/review.md".to_string()),
             timeout: self.config.timeouts.review_duration(),
             max_retries: 2,
+        }
+    }
+
+    /// Poll CI status with exponential backoff. Returns true if checks pass
+    /// within the timeout window (30 min max, 30s initial interval doubling to 4 min).
+    async fn poll_ci(&self, branch: &str) -> bool {
+        let max_wait = std::time::Duration::from_secs(30 * 60); // 30 min
+        let mut interval = std::time::Duration::from_secs(30);
+        let max_interval = std::time::Duration::from_secs(4 * 60);
+        let start = std::time::Instant::now();
+
+        loop {
+            match self.git.ci_passed(branch).await {
+                Ok(true) => return true,
+                Ok(false) => {
+                    // CI explicitly failed (not pending) — gh pr checks exits non-zero
+                    // for both "failed" and "pending", so we keep polling until timeout
+                }
+                Err(e) => {
+                    tracing::warn!(branch, error = %e, "CI check error, retrying");
+                }
+            }
+
+            if start.elapsed() >= max_wait {
+                tracing::warn!(branch, "CI poll timed out after 30 minutes");
+                return false;
+            }
+
+            tokio::time::sleep(interval).await;
+            interval = (interval * 2).min(max_interval);
         }
     }
 

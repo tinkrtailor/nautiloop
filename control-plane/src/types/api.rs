@@ -68,6 +68,9 @@ pub struct StatusQuery {
     pub engineer: Option<String>,
     #[serde(default)]
     pub team: Option<bool>,
+    /// Include terminal (completed/failed/shipped) loops. Default: false (active only).
+    #[serde(default)]
+    pub all: Option<bool>,
 }
 
 /// GET /logs/:id query parameters.

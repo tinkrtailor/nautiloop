@@ -23,6 +23,9 @@ pub async fn start(
         return Err(NemoError::ShipNotEnabled);
     }
 
+    // Fetch latest from remote so spec validation and branch creation use current state
+    state.git.fetch().await?;
+
     // Validate spec exists in repo
     if !state.git.spec_exists(&req.spec_path).await? {
         return Err(NemoError::SpecNotFound {
@@ -151,10 +154,18 @@ pub async fn status(
     State(state): State<AppState>,
     Query(query): Query<StatusQuery>,
 ) -> Result<Json<StatusResponse>, NemoError> {
-    let loops = state
+    let all_loops = state
         .store
         .get_loops_for_engineer(query.engineer.as_deref(), query.team.unwrap_or(false))
         .await?;
+
+    // Default to active-only; pass ?all=true to include terminal loops
+    let show_all = query.all.unwrap_or(false);
+    let loops: Vec<_> = if show_all {
+        all_loops
+    } else {
+        all_loops.into_iter().filter(|l| !l.state.is_terminal()).collect()
+    };
 
     let summaries = loops
         .into_iter()
