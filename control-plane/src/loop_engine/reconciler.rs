@@ -77,6 +77,18 @@ impl Reconciler {
         tracing::debug!(count = active_loops.len(), "Reconciling active loops");
 
         for loop_record in &active_loops {
+            // Try to acquire a per-loop advisory lock so multiple control-plane
+            // instances don't tick the same loop concurrently.
+            if !self
+                .store
+                .try_advisory_lock(loop_record.id)
+                .await
+                .unwrap_or(false)
+            {
+                tracing::debug!(loop_id = %loop_record.id, "Skipping loop (advisory lock held by another instance)");
+                continue;
+            }
+
             match self.driver.tick(loop_record.id).await {
                 Ok(new_state) => {
                     tracing::trace!(
@@ -115,6 +127,9 @@ impl Reconciler {
                     }
                 }
             }
+
+            // Release advisory lock
+            let _ = self.store.advisory_unlock(loop_record.id).await;
         }
     }
 }

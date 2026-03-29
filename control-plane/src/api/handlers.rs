@@ -451,7 +451,10 @@ pub async fn upsert_credentials(
 
     // Write K8s Secret FIRST, then Postgres metadata.
     // This ensures jobs never mount stale secrets when Postgres says creds are valid.
-    if let Some(ref kube_client) = state.kube_client {
+    let kube_client = state.kube_client.as_ref().ok_or_else(|| {
+        NemoError::Internal("K8s client not available — cannot store credentials".to_string())
+    })?;
+    {
         // Normalize engineer name for K8s: lowercase, replace _ with -
         let safe_engineer: String = req.engineer.to_lowercase().replace('_', "-");
         let secret_name = format!("nemo-creds-{safe_engineer}");

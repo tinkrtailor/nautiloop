@@ -2,6 +2,10 @@ use anyhow::Result;
 
 /// Edit ~/.nemo/config.toml.
 pub fn run(set: Option<String>, get: Option<String>) -> Result<()> {
+    if set.is_some() && get.is_some() {
+        anyhow::bail!("Cannot use --set and --get together");
+    }
+
     // Try loading existing config. For --set, fall back to defaults with a
     // warning if the file is malformed, so users can repair with --set.
     // For --get and display, propagate the error.

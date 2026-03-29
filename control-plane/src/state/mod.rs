@@ -95,6 +95,13 @@ pub trait StateStore: Send + Sync + 'static {
 
     /// Create a merge event record (NFR-8).
     async fn create_merge_event(&self, event: &MergeEvent) -> Result<()>;
+
+    /// Try to acquire a per-loop advisory lock (for reconciler coordination).
+    /// Returns true if the lock was acquired, false if held by another session.
+    async fn try_advisory_lock(&self, loop_id: Uuid) -> Result<bool>;
+
+    /// Release a per-loop advisory lock.
+    async fn advisory_unlock(&self, loop_id: Uuid) -> Result<()>;
 }
 
 /// Flags that can be set on a loop by the API server.
@@ -383,6 +390,15 @@ pub mod memory {
         async fn create_merge_event(&self, event: &MergeEvent) -> Result<()> {
             let mut events = self.merge_events.write().await;
             events.push(event.clone());
+            Ok(())
+        }
+
+        async fn try_advisory_lock(&self, _loop_id: Uuid) -> Result<bool> {
+            // In-memory store: always succeeds (single instance)
+            Ok(true)
+        }
+
+        async fn advisory_unlock(&self, _loop_id: Uuid) -> Result<()> {
             Ok(())
         }
     }

@@ -587,4 +587,23 @@ impl StateStore for PgStateStore {
         .await?;
         Ok(())
     }
+
+    async fn try_advisory_lock(&self, loop_id: uuid::Uuid) -> Result<bool> {
+        // Use the first 8 bytes of the UUID as the advisory lock key
+        let key = i64::from_be_bytes(loop_id.as_bytes()[..8].try_into().unwrap());
+        let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+            .bind(key)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.0)
+    }
+
+    async fn advisory_unlock(&self, loop_id: uuid::Uuid) -> Result<()> {
+        let key = i64::from_be_bytes(loop_id.as_bytes()[..8].try_into().unwrap());
+        sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }

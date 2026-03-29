@@ -174,14 +174,34 @@ pub mod bare {
                 .await
             {
                 Ok(_) => Ok(true),
-                Err(_) => Ok(false),
+                Err(e) => {
+                    let msg = e.to_string();
+                    // "fatal: Not a valid object name" / empty stderr = not found
+                    if msg.contains("Not a valid object")
+                        || msg.is_empty()
+                        || msg.contains("does not exist")
+                    {
+                        Ok(false)
+                    } else {
+                        // Real git error (corruption, permission, etc.)
+                        Err(e)
+                    }
+                }
             }
         }
 
         async fn get_branch_sha(&self, branch: &str) -> Result<Option<String>> {
             match self.run_git(&["rev-parse", branch]).await {
                 Ok(sha) => Ok(Some(sha)),
-                Err(_) => Ok(None),
+                Err(e) => {
+                    let msg = e.to_string();
+                    // "unknown revision" = branch doesn't exist
+                    if msg.contains("unknown revision") || msg.contains("bad revision") {
+                        Ok(None)
+                    } else {
+                        Err(e)
+                    }
+                }
             }
         }
 

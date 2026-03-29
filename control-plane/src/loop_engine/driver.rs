@@ -231,9 +231,10 @@ impl ConvergentLoopDriver {
         // Get the branch tip SHA
         let tip_sha = self.git.get_branch_sha(&record.branch).await?;
 
-        // Divergence check: if we have an expected SHA and branch tip doesn't
-        // descend from it, someone pushed between job exit and this tick.
-        // Pause instead of ingesting potentially wrong output.
+        // Divergence check: if expected SHA is NOT an ancestor of the branch tip,
+        // someone force-pushed or rebased between job exit and this tick.
+        // Normal fast-forwards (agent commits) are fine — the expected SHA will
+        // be an ancestor of the new tip. We accept those and advance current_sha.
         if let (Some(expected), Some(tip)) = (&record.current_sha, &tip_sha)
             && self.git.has_diverged(&record.branch, expected).await?
         {

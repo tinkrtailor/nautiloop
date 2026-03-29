@@ -237,10 +237,13 @@ fn build_agent_env_vars(ctx: &LoopContext, stage: &StageConfig, is_test: bool) -
     env.push(env_var("GIT_COMMITTER_NAME", &ctx.engineer));
     env.push(env_var("GIT_COMMITTER_EMAIL", &ctx.engineer_email));
 
-    // FR-11: GIT_SSH_COMMAND to route through sidecar SSH proxy
+    // FR-11: GIT_SSH_COMMAND to route through sidecar SSH proxy on localhost.
+    // StrictHostKeyChecking=no is safe here: the connection is pod-local (loopback)
+    // to the sidecar, which uses an ephemeral host key per pod. The sidecar itself
+    // performs strict host key verification against known_hosts for the real remote.
     env.push(env_var(
         "GIT_SSH_COMMAND",
-        "ssh -o StrictHostKeyChecking=no -p 9091 localhost",
+        "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 9091 localhost",
     ));
 
     // FR-7: Session ID for round > 1

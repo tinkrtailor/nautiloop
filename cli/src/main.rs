@@ -181,6 +181,14 @@ async fn main() -> anyhow::Result<()> {
 
     let insecure =
         cli.insecure || matches!(std::env::var("NEMO_INSECURE").as_deref(), Ok("true" | "1"));
+    // Warn early if api_key is missing — commands that hit the server will fail
+    if eng_config.api_key.is_none() {
+        // Init and Config don't need an API key
+        if !matches!(cli.command, Commands::Init { .. }) {
+            anyhow::bail!("API key not configured. Run: nemo config --set api_key=<your-key>");
+        }
+    }
+
     let http_client =
         client::NemoClient::new(&server_url, eng_config.api_key.as_deref(), insecure)?;
 

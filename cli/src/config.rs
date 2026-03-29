@@ -32,7 +32,9 @@ pub fn config_path() -> PathBuf {
 }
 
 fn dirs_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE")) // Windows fallback
+        .unwrap_or_else(|_| "/tmp".to_string()); // Safe fallback, never cwd
     PathBuf::from(home).join(".nemo")
 }
 

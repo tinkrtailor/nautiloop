@@ -16,7 +16,18 @@ pub async fn run(
         params.push(format!("round={r}"));
     }
     if let Some(ref s) = stage {
-        params.push(format!("stage={s}"));
+        // URL-encode the stage value to handle reserved characters
+        let encoded: String = s
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                    c.to_string()
+                } else {
+                    format!("%{:02X}", c as u32)
+                }
+            })
+            .collect();
+        params.push(format!("stage={encoded}"));
     }
     if !params.is_empty() {
         path = format!("{path}?{}", params.join("&"));
