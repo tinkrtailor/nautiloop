@@ -44,6 +44,11 @@ pub trait GitOperations: Send + Sync + 'static {
 
     /// Merge a pull request by branch name using the given strategy. Returns merge SHA.
     async fn merge_pr(&self, branch: &str, strategy: &str) -> Result<String>;
+
+    /// Ensure a persistent worktree exists for a branch at the given sub-path.
+    /// Creates the worktree if it doesn't exist. Used before job dispatch so the
+    /// agent pod can mount the worktree via subPath.
+    async fn ensure_worktree(&self, branch: &str, worktree_path: &str) -> Result<()>;
 }
 
 /// Real git operations on a bare repository.
@@ -198,15 +203,12 @@ pub mod bare {
                                 })?;
                         }
                         _ => {
-                            // No PR — safe to force-reset local and delete stale remote
-                            let _ = self.run_git(&["push", "origin", "--delete", branch]).await;
-                            self.run_git(&["branch", "-f", branch, &base_ref])
-                                .await
-                                .map_err(|e| {
-                                    crate::error::NemoError::Git(format!(
-                                        "Failed to reset existing branch {branch}: {e}"
-                                    ))
-                                })?;
+                            // PR state unknown (could be transient gh failure) — don't
+                            // force-reset. Just reuse the existing branch as-is.
+                            tracing::info!(
+                                branch = branch,
+                                "Branch exists with unknown PR state, reusing as-is"
+                            );
                         }
                     }
                 }
@@ -269,6 +271,17 @@ pub mod bare {
                 .ok()?;
 
             if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                // Only treat "no pull requests found" as "no PR exists".
+                // Any other failure (network, auth, rate limit) is transient — return None
+                // but log a warning so the caller doesn't assume no PR exists.
+                if !stderr.contains("no pull requests found") {
+                    tracing::warn!(
+                        branch = branch,
+                        stderr = stderr.trim(),
+                        "gh pr view failed (transient?), treating as unknown PR state"
+                    );
+                }
                 return None;
             }
 
@@ -464,6 +477,30 @@ pub mod bare {
             };
             Ok(sha)
         }
+
+        async fn ensure_worktree(&self, branch: &str, worktree_path: &str) -> Result<()> {
+            let full_path = self.repo_path.join(worktree_path);
+            if full_path.exists() {
+                // Worktree already exists
+                return Ok(());
+            }
+            // Create parent directories
+            if let Some(parent) = full_path.parent() {
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                    crate::error::NemoError::Git(format!(
+                        "Failed to create worktree parent dir: {e}"
+                    ))
+                })?;
+            }
+            self.run_git(&["worktree", "add", &full_path.to_string_lossy(), branch])
+                .await
+                .map_err(|e| {
+                    crate::error::NemoError::Git(format!(
+                        "Failed to create worktree for {branch} at {worktree_path}: {e}"
+                    ))
+                })?;
+            Ok(())
+        }
     }
 }
 
@@ -584,6 +621,10 @@ pub mod mock {
                 .get(branch)
                 .cloned()
                 .unwrap_or_else(|| "merge-sha-mock".to_string()))
+        }
+
+        async fn ensure_worktree(&self, _branch: &str, _worktree_path: &str) -> Result<()> {
+            Ok(())
         }
     }
 }

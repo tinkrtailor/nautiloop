@@ -18,6 +18,9 @@ pub struct AppState {
     pub store: Arc<dyn StateStore>,
     pub git: Arc<dyn GitOperations>,
     pub config: Arc<NemoConfig>,
+    /// Optional kube client for creating K8s Secrets during credential registration.
+    /// None in test environments.
+    pub kube_client: Option<kube::Client>,
 }
 
 /// Build the axum router with all endpoints and auth middleware.

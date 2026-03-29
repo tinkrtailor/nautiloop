@@ -59,15 +59,9 @@ Field definitions:
 
 ## Output
 
-When finished, write your result as a single JSON line to stdout prefixed with `NEMO_RESULT:`:
-
-```
-NEMO_RESULT:{"stage":"audit","data":{"verdict":<your-verdict-json>,"token_usage":{"input":<n>,"output":<n>},"exit_code":0,"session_id":"<session-id>"}}
-```
+Output ONLY the verdict JSON object as your final message. No markdown wrapping, no commentary, no prefix — just the raw JSON object matching the schema above. The entrypoint will wrap it in the NEMO_RESULT envelope automatically.
 
 ## Important
 
-- Output ONLY the `NEMO_RESULT:` line as your final message. No markdown, no commentary.
-- The verdict JSON goes inside the `data.verdict` field of the result envelope.
 - Be thorough but constructive. Flag real issues, not style preferences.
 - `clean: true` means the spec is ready for implementation as-is.

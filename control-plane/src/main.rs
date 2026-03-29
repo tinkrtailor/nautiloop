@@ -47,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
     let kube_client = kube::Client::try_default().await?;
     tracing::info!("Connected to Kubernetes cluster");
     let dispatcher: Arc<dyn JobDispatcher> = Arc::new(KubeJobDispatcher::new(
-        kube_client,
+        kube_client.clone(),
         config.cluster.jobs_namespace.clone(),
     ));
 
@@ -71,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
         store: store.clone(),
         git: git.clone(),
         config: config_arc,
+        kube_client: Some(kube_client),
     };
     let router = api::build_router(app_state);
 

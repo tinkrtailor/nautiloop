@@ -32,8 +32,4 @@ You are an expert software implementer. Your job is to implement the specificati
 
 ## Output
 
-When finished, write your result as a single JSON line to stdout prefixed with `NEMO_RESULT:`:
-
-```
-NEMO_RESULT:{"stage":"implement","data":{"new_sha":"<commit-sha>","token_usage":{"input":<n>,"output":<n>},"exit_code":0,"session_id":"<session-id>"}}
-```
+When finished, commit your changes and output nothing special — the entrypoint captures your output and wraps it in the NEMO_RESULT envelope automatically.

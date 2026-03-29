@@ -64,7 +64,7 @@ resource "null_resource" "kubeconfig" {
 
   provisioner "local-exec" {
     command = <<-EOT
-      ssh -o StrictHostKeyChecking=no root@${hcloud_server.nemo.ipv4_address} \
+      ssh -o StrictHostKeyChecking=accept-new root@${hcloud_server.nemo.ipv4_address} \
         'cat /etc/rancher/k3s/k3s.yaml' | \
         sed "s/127.0.0.1/${hcloud_server.nemo.ipv4_address}/" > ${path.module}/kubeconfig.yaml
     EOT

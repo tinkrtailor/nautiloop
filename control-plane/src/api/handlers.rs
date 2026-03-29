@@ -389,8 +389,8 @@ pub async fn inspect(
 
 /// POST /credentials - Register or update engineer credentials.
 ///
-/// V1 limitation: credential content is stored as plaintext in Postgres (credential_ref column).
-/// V2 should migrate to K8s Secrets or a KMS-backed store.
+/// Stores credential metadata in Postgres and creates/updates a K8s Secret
+/// `nemo-creds-{engineer}` in the jobs namespace so job pods can mount it.
 pub async fn upsert_credentials(
     State(state): State<AppState>,
     Json(req): Json<CredentialRequest>,
@@ -401,16 +401,73 @@ pub async fn upsert_credentials(
         ));
     }
 
+    // Store metadata in Postgres (provider + validity, not raw secret content)
     let cred = crate::types::EngineerCredential {
         id: Uuid::new_v4(),
-        engineer: req.engineer,
-        provider: req.provider,
-        credential_ref: req.credential_ref,
+        engineer: req.engineer.clone(),
+        provider: req.provider.clone(),
+        credential_ref: "k8s-secret".to_string(), // Reference, not content
         valid: req.valid,
         updated_at: chrono::Utc::now(),
     };
-
     state.store.upsert_credential(&cred).await?;
+
+    // Create/update K8s Secret with credential content (never stored in Postgres)
+    if let Some(ref kube_client) = state.kube_client {
+        let secret_name = format!("nemo-creds-{}", req.engineer);
+        let namespace = &state.config.cluster.jobs_namespace;
+        let secrets_api: kube::Api<k8s_openapi::api::core::v1::Secret> =
+            kube::Api::namespaced(kube_client.clone(), namespace);
+
+        // Map provider name to K8s Secret key
+        let secret_key = match req.provider.as_str() {
+            "claude" | "anthropic" => "anthropic",
+            "openai" => "openai",
+            "ssh" => "ssh",
+            other => other,
+        };
+
+        // Try to get existing secret to merge keys
+        let mut data = std::collections::BTreeMap::new();
+        if let Ok(existing) = secrets_api.get(&secret_name).await
+            && let Some(existing_data) = existing.data
+        {
+            for (k, v) in existing_data {
+                data.insert(k, v);
+            }
+        }
+        data.insert(
+            secret_key.to_string(),
+            k8s_openapi::ByteString(req.credential_ref.into_bytes()),
+        );
+
+        let secret = k8s_openapi::api::core::v1::Secret {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                name: Some(secret_name.clone()),
+                namespace: Some(namespace.clone()),
+                ..Default::default()
+            },
+            data: Some(data),
+            ..Default::default()
+        };
+
+        // Use server-side apply for idempotent create-or-update
+        match secrets_api
+            .create(&kube::api::PostParams::default(), &secret)
+            .await
+        {
+            Ok(_) => {}
+            Err(kube::Error::Api(err)) if err.code == 409 => {
+                // Already exists — replace
+                let _ = secrets_api
+                    .replace(&secret_name, &kube::api::PostParams::default(), &secret)
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to create K8s Secret for credentials");
+            }
+        }
+    }
 
     Ok((StatusCode::OK, Json(serde_json::json!({"status": "ok"}))))
 }
@@ -447,6 +504,7 @@ mod tests {
             store: store.clone(),
             git: git.clone(),
             config: Arc::new(config),
+            kube_client: None,
         };
         let router = crate::api::build_router_no_auth(state);
         (router, store, git)
@@ -697,6 +755,7 @@ mod tests {
             store: store.clone(),
             git: git.clone(),
             config: Arc::new(config),
+            kube_client: None,
         };
         let app = crate::api::build_router_no_auth(state);
 

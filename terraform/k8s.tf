@@ -22,16 +22,43 @@ resource "kubernetes_namespace" "jobs" {
   }
 }
 
-# FR-47: 100Gi PVC for shared bare repo (in nemo-system, used by loop engine + repo-init)
+# FR-47: Shared bare repo storage — single hostPath PV with PVCs in both namespaces.
+# V1 is single-node k3s, so hostPath is safe. Both control plane and agent jobs
+# see the same directory on disk.
+
+resource "kubernetes_persistent_volume" "bare_repo" {
+  depends_on = [null_resource.kubeconfig]
+
+  metadata {
+    name = "nemo-bare-repo"
+  }
+  spec {
+    capacity = {
+      storage = "100Gi"
+    }
+    access_modes = ["ReadWriteMany"]
+    persistent_volume_reclaim_policy = "Retain"
+    storage_class_name               = "manual"
+    persistent_volume_source {
+      host_path {
+        path = "/data/nemo-bare-repo"
+        type = "DirectoryOrCreate"
+      }
+    }
+  }
+}
+
 resource "kubernetes_persistent_volume_claim" "bare_repo" {
-  depends_on = [kubernetes_namespace.system]
+  depends_on = [kubernetes_namespace.system, kubernetes_persistent_volume.bare_repo]
 
   metadata {
     name      = "nemo-bare-repo"
     namespace = "nemo-system"
   }
   spec {
-    access_modes = ["ReadWriteOnce"]
+    access_modes       = ["ReadWriteMany"]
+    storage_class_name = "manual"
+    volume_name        = kubernetes_persistent_volume.bare_repo.metadata[0].name
     resources {
       requests = {
         storage = "100Gi"
@@ -40,18 +67,17 @@ resource "kubernetes_persistent_volume_claim" "bare_repo" {
   }
 }
 
-# Finding 4: Separate PVC for agent jobs in nemo-jobs namespace.
-# PVCs are namespaced — jobs in nemo-jobs cannot mount PVCs from nemo-system.
-# The loop engine creates worktrees in nemo-system and the job reads/writes via this PVC.
 resource "kubernetes_persistent_volume_claim" "bare_repo_jobs" {
-  depends_on = [kubernetes_namespace.jobs]
+  depends_on = [kubernetes_namespace.jobs, kubernetes_persistent_volume.bare_repo]
 
   metadata {
     name      = "nemo-bare-repo"
     namespace = "nemo-jobs"
   }
   spec {
-    access_modes = ["ReadWriteMany"]
+    access_modes       = ["ReadWriteMany"]
+    storage_class_name = "manual"
+    volume_name        = kubernetes_persistent_volume.bare_repo.metadata[0].name
     resources {
       requests = {
         storage = "100Gi"

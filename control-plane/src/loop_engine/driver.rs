@@ -224,7 +224,7 @@ impl ConvergentLoopDriver {
         }
     }
 
-    /// Ingest output from a completed job: read verdict from git, update round record, set current_sha.
+    /// Ingest output from a completed job: read NEMO_RESULT from pod logs, update round record, set current_sha.
     /// Returns Err with a Paused transition if branch has diverged since dispatch.
     async fn ingest_job_output(&self, record: &mut LoopRecord) -> Result<()> {
         // Get the branch tip SHA
@@ -257,33 +257,24 @@ impl ConvergentLoopDriver {
             record.current_sha = Some(sha);
         }
 
-        // Determine verdict file path based on current stage
-        let verdict_path = self.verdict_path_for_stage(record).await;
+        // Read NEMO_RESULT from pod logs instead of git verdict files.
+        // The entrypoint wraps all stage output with NEMO_RESULT: prefix.
+        let job_name = record.active_job_name.as_deref().unwrap_or("unknown");
+        let namespace = &self.config.cluster.jobs_namespace;
+        let logs = self
+            .dispatcher
+            .get_job_logs(job_name, namespace)
+            .await
+            .unwrap_or_default();
 
-        // Read verdict JSON from git
-        let git_ref = record.current_sha.as_deref().unwrap_or(&record.branch);
-        let verdict_json = match self.git.read_file(&verdict_path, git_ref).await {
-            Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    tracing::warn!(
-                        loop_id = %record.id,
-                        path = verdict_path,
-                        error = %e,
-                        "Failed to parse verdict JSON"
-                    );
-                    None
-                }
-            },
-            Err(_) => {
-                tracing::debug!(
-                    loop_id = %record.id,
-                    path = verdict_path,
-                    "No verdict file found"
-                );
-                None
-            }
-        };
+        let verdict_json = Self::extract_nemo_result(&logs);
+        if verdict_json.is_none() {
+            tracing::warn!(
+                loop_id = %record.id,
+                job_name = job_name,
+                "No NEMO_RESULT line found in pod logs"
+            );
+        }
 
         // Update the round record with output + completion time
         let rounds = self.store.get_rounds(record.id).await?;
@@ -304,25 +295,20 @@ impl ConvergentLoopDriver {
         Ok(())
     }
 
-    /// Determine the verdict file path based on current stage and sub-stage.
-    async fn verdict_path_for_stage(&self, record: &LoopRecord) -> String {
-        match record.state {
-            LoopState::Implementing => ".agent/implement-output.json".to_string(),
-            LoopState::Testing => ".agent/test-output.json".to_string(),
-            LoopState::Reviewing => ".agent/review-verdict.json".to_string(),
-            LoopState::Hardening => {
-                // Determine if this was an audit or revise job
-                if let Ok(rounds) = self.store.get_rounds(record.id).await {
-                    let last = rounds.iter().rfind(|r| r.round == record.round);
-                    match last.map(|r| r.stage.as_str()) {
-                        Some("revise") => return ".agent/revise-output.json".to_string(),
-                        _ => return ".agent/audit-verdict.json".to_string(),
-                    }
-                }
-                ".agent/audit-verdict.json".to_string()
+    /// Extract the NEMO_RESULT data from pod log output.
+    /// Scans for the last line starting with "NEMO_RESULT:" and returns the `data` field
+    /// from the envelope `{"stage":"...", "data": {...}}`.
+    fn extract_nemo_result(logs: &str) -> Option<serde_json::Value> {
+        logs.lines().rev().find_map(|line| {
+            let trimmed = line.trim();
+            if let Some(json_str) = trimmed.strip_prefix("NEMO_RESULT:") {
+                let envelope: serde_json::Value = serde_json::from_str(json_str).ok()?;
+                // Return the data field from the envelope, falling back to the whole thing
+                envelope.get("data").cloned().or(Some(envelope))
+            } else {
+                None
             }
-            _ => ".agent/verdict.json".to_string(),
-        }
+        })
     }
 
     /// Evaluate harden stage output (audit or revise).
@@ -1161,6 +1147,11 @@ impl ConvergentLoopDriver {
         let worktree_dir = record.branch.replace('/', "-");
         let worktree_path = format!("worktrees/{worktree_dir}");
 
+        // Ensure the worktree exists on disk before any job tries to mount it.
+        self.git
+            .ensure_worktree(&record.branch, &worktree_path)
+            .await?;
+
         Ok(LoopContext {
             loop_id: record.id,
             engineer: record.engineer.clone(),
@@ -1775,14 +1766,13 @@ mod tests {
             NemoConfig::default(),
         );
 
-        // Set up branch SHA and verdict file in git
+        // Set up branch SHA in git and NEMO_RESULT in mock pod logs
         git.set_branch_sha("agent/alice/test-abc12345", "aabbccdd11223344")
             .await;
-        git.add_file(
-            ".agent/review-verdict.json",
-            r#"{"clean": true, "confidence": 0.95, "issues": [], "summary": "LGTM", "token_usage": {"input": 1000, "output": 200}}"#,
-        )
-        .await;
+        dispatcher.set_job_logs(
+            "review-job",
+            "some other output\nNEMO_RESULT:{\"stage\":\"review\",\"data\":{\"clean\":true,\"confidence\":0.95,\"issues\":[],\"summary\":\"LGTM\",\"token_usage\":{\"input\":1000,\"output\":200}}}\n",
+        ).await;
 
         // Create a loop in REVIEWING/DISPATCHED state
         let mut record = make_pending_loop(true);

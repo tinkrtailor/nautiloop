@@ -232,6 +232,8 @@ fn build_agent_env_vars(ctx: &LoopContext, stage: &StageConfig, is_test: bool) -
         env_var("no_proxy", "localhost,127.0.0.1,::1"),
         // FR-9: OpenAI API through sidecar model proxy
         env_var("OPENAI_BASE_URL", "http://localhost:9090/openai"),
+        // Claude/Anthropic API through sidecar model proxy
+        env_var("ANTHROPIC_BASE_URL", "http://localhost:9090/anthropic"),
     ];
 
     // FR-10, FR-27: Git identity from engineers table (populated by nemo auth)
@@ -272,19 +274,8 @@ fn build_agent_env_vars(ctx: &LoopContext, stage: &StageConfig, is_test: bool) -
         }
     }
 
-    // Legacy: credential env vars for backward compat
-    for (provider, cred_ref) in &ctx.credentials {
-        if provider == "affected_services" {
-            continue; // Already handled above
-        }
-        let safe_provider: String = provider
-            .to_uppercase()
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .collect();
-        let env_name = format!("NEMO_CRED_{safe_provider}");
-        env.push(env_var(&env_name, cred_ref));
-    }
+    // Credentials are NOT injected as env vars — they go through the sidecar only.
+    // This prevents untrusted agent code from reading secrets directly.
 
     env
 }
@@ -344,11 +335,19 @@ fn build_volumes(
             name: "model-credentials".to_string(),
             secret: Some(SecretVolumeSource {
                 secret_name: Some(format!("nemo-creds-{engineer}")),
-                items: Some(vec![KeyToPath {
-                    key: "openai".to_string(),
-                    path: "openai".to_string(),
-                    ..Default::default()
-                }]),
+                items: Some(vec![
+                    KeyToPath {
+                        key: "openai".to_string(),
+                        path: "openai".to_string(),
+                        ..Default::default()
+                    },
+                    KeyToPath {
+                        key: "anthropic".to_string(),
+                        path: "anthropic".to_string(),
+                        ..Default::default()
+                    },
+                ]),
+                optional: Some(true), // Not all engineers have both providers
                 ..Default::default()
             }),
             ..Default::default()

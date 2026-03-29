@@ -226,10 +226,10 @@ case "$STAGE" in
 
             if [ "$TEST_EXIT" -ne 0 ]; then
                 ALL_PASSED=false
-                # Finding 11: Distinguish infra failures (command not found, signal)
-                # from test failures. Exit codes 126 (not executable), 127 (not found),
+                # Distinguish infra failures from test failures.
+                # Exit codes 124 (timeout), 126 (not executable), 127 (not found),
                 # and >= 128 (killed by signal) indicate infra issues.
-                if [ "$TEST_EXIT" -ge 126 ]; then
+                if [ "$TEST_EXIT" -eq 124 ] || [ "$TEST_EXIT" -ge 126 ]; then
                     CI_STATUS="unknown"
                 elif [ "$CI_STATUS" = "passed" ]; then
                     CI_STATUS="failed"

@@ -108,6 +108,36 @@ impl JobDispatcher for KubeJobDispatcher {
             Err(e) => Err(e.into()),
         }
     }
+
+    async fn get_job_logs(&self, name: &str, namespace: &str) -> Result<String> {
+        let ns = if namespace.is_empty() {
+            &self.namespace
+        } else {
+            namespace
+        };
+        // Find pods for this job, then get logs from the "agent" container
+        let pods_api: Api<Pod> = Api::namespaced(self.client.clone(), ns);
+        let lp = ListParams::default().labels(&format!("job-name={name}"));
+        let pod_list = pods_api.list(&lp).await?;
+
+        for pod in &pod_list.items {
+            if let Some(pod_name) = &pod.metadata.name {
+                let log_params = kube::api::LogParams {
+                    container: Some("agent".to_string()),
+                    tail_lines: Some(100),
+                    ..Default::default()
+                };
+                match pods_api.logs(pod_name, &log_params).await {
+                    Ok(logs) => return Ok(logs),
+                    Err(e) => {
+                        tracing::warn!(pod = %pod_name, error = %e, "Failed to get pod logs");
+                    }
+                }
+            }
+        }
+
+        Ok(String::new())
+    }
 }
 
 /// Extract the exit code from a pod's first terminated container.

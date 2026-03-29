@@ -133,13 +133,17 @@ enum Commands {
 
     /// Push local model credentials to cluster
     Auth {
-        /// Push Claude credentials only
+        /// Push Claude/Anthropic credentials only
         #[arg(long)]
         claude: bool,
 
         /// Push OpenAI credentials only
         #[arg(long)]
         openai: bool,
+
+        /// Push SSH key only
+        #[arg(long)]
+        ssh: bool,
     },
 
     /// Edit ~/.nemo/config.toml
@@ -278,8 +282,12 @@ async fn main() -> anyhow::Result<()> {
         Commands::Init { force } => {
             commands::init::run(force)?;
         }
-        Commands::Auth { claude, openai } => {
-            commands::auth::run(&http_client, &eng_config.engineer, claude, openai).await?;
+        Commands::Auth {
+            claude,
+            openai,
+            ssh,
+        } => {
+            commands::auth::run(&http_client, &eng_config.engineer, claude, openai, ssh).await?;
         }
         Commands::Config { set, get } => {
             commands::config::run(set, get)?;

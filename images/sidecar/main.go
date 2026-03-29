@@ -82,25 +82,36 @@ func readCredentialFile(path string) (string, error) {
 // --- FR-15/16: Model API Proxy on :9090 ---
 
 func modelProxyHandler(w http.ResponseWriter, r *http.Request) {
-	// Only /openai/* routes are allowed (FR-15)
-	if !strings.HasPrefix(r.URL.Path, "/openai/") && r.URL.Path != "/openai" {
-		http.Error(w, `{"error":"only /openai/* routes are supported"}`, http.StatusForbidden)
+	// Route to the correct upstream based on path prefix
+	var targetHost, credFile, authHeader string
+
+	if strings.HasPrefix(r.URL.Path, "/openai/") || r.URL.Path == "/openai" {
+		targetHost = "api.openai.com"
+		credFile = "/secrets/model-credentials/openai"
+		authHeader = "Bearer"
+		r.URL.Path = strings.TrimPrefix(r.URL.Path, "/openai")
+	} else if strings.HasPrefix(r.URL.Path, "/anthropic/") || r.URL.Path == "/anthropic" {
+		targetHost = "api.anthropic.com"
+		credFile = "/secrets/model-credentials/anthropic"
+		authHeader = "x-api-key" // Anthropic uses x-api-key header, not Bearer
+		r.URL.Path = strings.TrimPrefix(r.URL.Path, "/anthropic")
+	} else {
+		http.Error(w, `{"error":"only /openai/* and /anthropic/* routes are supported"}`, http.StatusForbidden)
 		return
 	}
 
-	// Strip /openai prefix
-	targetPath := strings.TrimPrefix(r.URL.Path, "/openai")
+	targetPath := r.URL.Path
 	if targetPath == "" {
 		targetPath = "/"
 	}
 
-	targetURL := fmt.Sprintf("https://api.openai.com%s", targetPath)
+	targetURL := fmt.Sprintf("https://%s%s", targetHost, targetPath)
 	if r.URL.RawQuery != "" {
 		targetURL += "?" + r.URL.RawQuery
 	}
 
 	// SSRF protection: resolve and check destination IP (FR-15)
-	ips, err := net.LookupIP("api.openai.com")
+	ips, err := net.LookupIP(targetHost)
 	if err == nil {
 		for _, ip := range ips {
 			if isPrivateIP(ip) {
@@ -111,9 +122,9 @@ func modelProxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// FR-21: Re-read credentials on each request
-	openaiKey, err := readCredentialFile("/secrets/model-credentials/openai")
+	apiKey, err := readCredentialFile(credFile)
 	if err != nil {
-		logJSON("NEMO_SIDECAR", "error", fmt.Sprintf("failed to read OpenAI credentials: %v", err))
+		logJSON("NEMO_SIDECAR", "error", fmt.Sprintf("failed to read credentials from %s: %v", credFile, err))
 		http.Error(w, `{"error":"credential read failed"}`, http.StatusInternalServerError)
 		return
 	}
@@ -132,8 +143,16 @@ func modelProxyHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// FR-16: Inject Authorization header for OpenAI
-	proxyReq.Header.Set("Authorization", fmt.Sprintf("Bearer %s", openaiKey))
+	// Inject auth: OpenAI uses Bearer token, Anthropic uses x-api-key header
+	if authHeader == "x-api-key" {
+		proxyReq.Header.Set("x-api-key", apiKey)
+		// Anthropic also requires anthropic-version header
+		if proxyReq.Header.Get("anthropic-version") == "" {
+			proxyReq.Header.Set("anthropic-version", "2023-06-01")
+		}
+	} else {
+		proxyReq.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiKey))
+	}
 
 	// NFR-7: Stream through without buffering
 	client := &http.Client{
@@ -181,6 +200,19 @@ func (p *egressProxy) handleConnect(w http.ResponseWriter, r *http.Request, star
 	destHost := r.Host
 	if !strings.Contains(destHost, ":") {
 		destHost += ":443"
+	}
+
+	// SSRF protection: prevent pivoting into internal services
+	hostname := strings.Split(destHost, ":")[0]
+	ips, err := net.LookupIP(hostname)
+	if err == nil {
+		for _, ip := range ips {
+			if isPrivateIP(ip) {
+				logJSON("NEMO_SIDECAR", "warn", fmt.Sprintf("blocked CONNECT to private IP: %s -> %v", destHost, ip))
+				http.Error(w, "CONNECT to private/internal addresses is blocked", http.StatusForbidden)
+				return
+			}
+		}
 	}
 
 	destConn, err := net.DialTimeout("tcp", destHost, 10*time.Second)
@@ -236,6 +268,18 @@ func (p *egressProxy) handleHTTP(w http.ResponseWriter, r *http.Request, start t
 	}
 	if r.URL.Host == "" {
 		r.URL.Host = r.Host
+	}
+
+	// SSRF protection: block requests to private/internal addresses
+	hostname := strings.Split(r.URL.Host, ":")[0]
+	if ips, err := net.LookupIP(hostname); err == nil {
+		for _, ip := range ips {
+			if isPrivateIP(ip) {
+				logJSON("NEMO_SIDECAR", "warn", fmt.Sprintf("blocked HTTP to private IP: %s -> %v", r.URL.Host, ip))
+				http.Error(w, "Requests to private/internal addresses are blocked", http.StatusForbidden)
+				return
+			}
+		}
 	}
 
 	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), r.Body)
@@ -470,8 +514,8 @@ func proxyGitCommand(channel ssh.Channel, command string, gitRemoteHost string) 
 	}
 
 	// Connect to the real git remote
-	// Finding 7: Use known_hosts file instead of InsecureIgnoreHostKey
-	hostKeyCallback := ssh.InsecureIgnoreHostKey() // fallback if no known_hosts
+	// Use known_hosts file for host key verification — no InsecureIgnoreHostKey fallback.
+	var hostKeyCallback ssh.HostKeyCallback
 	knownHostsPath := "/secrets/ssh-known-hosts/known_hosts"
 	if _, err := os.Stat(knownHostsPath); err == nil {
 		// Parse known_hosts manually for host key verification
@@ -498,7 +542,15 @@ func proxyGitCommand(channel ssh.Channel, command string, gitRemoteHost string) 
 				}
 				return fmt.Errorf("host key verification failed for %s", hostname)
 			}
+		} else {
+			logJSON("NEMO_SIDECAR", "error", "known_hosts file is empty or unreadable — refusing to connect without host key verification")
+			channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{1}))
+			return
 		}
+	} else {
+		logJSON("NEMO_SIDECAR", "error", "known_hosts file not found at /secrets/ssh-known-hosts/known_hosts — refusing to connect")
+		channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{1}))
+		return
 	}
 
 	clientConfig := &ssh.ClientConfig{
@@ -657,16 +709,22 @@ func main() {
 		}
 	}()
 
-	// FR-22: Wait until all ports are listening, then write readiness file
+	// FR-22: Wait until all ports are listening, then write readiness file.
+	// Fail hard if any port doesn't bind within timeout.
 	ports := []string{"127.0.0.1:9090", "127.0.0.1:9091", "127.0.0.1:9092", "127.0.0.1:9093"}
 	for _, addr := range ports {
+		bound := false
 		for i := 0; i < 100; i++ {
 			conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
 			if err == nil {
 				conn.Close()
+				bound = true
 				break
 			}
 			time.Sleep(20 * time.Millisecond)
+		}
+		if !bound {
+			log.Fatalf("sidecar port %s failed to bind within 2s", addr)
 		}
 	}
 
