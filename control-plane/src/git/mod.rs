@@ -92,9 +92,10 @@ pub mod bare {
     impl BareRepoGitOperations {
         /// Compute the persistent worktree directory for a branch.
         /// Matches the path derived in loop_engine/driver.rs build_context().
+        /// Uses "wt/" prefix to avoid colliding with git's internal worktrees/ metadata.
         fn persistent_worktree_dir(&self, branch: &str) -> PathBuf {
             let worktree_name = branch.replace('/', "-");
-            self.repo_path.join("worktrees").join(worktree_name)
+            self.repo_path.join("wt").join(worktree_name)
         }
 
         /// Remove a persistent worktree for a branch if it exists.

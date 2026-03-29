@@ -1244,9 +1244,10 @@ impl ConvergentLoopDriver {
         let engineer_email = format!("{}@nemo.dev", record.engineer);
 
         // Derive worktree sub-path from branch name.
-        // The git module creates worktrees under worktrees/<branch-safe-name>.
+        // Use "wt/" prefix (not "worktrees/") to avoid colliding with git's
+        // internal worktree metadata directory in the bare repo.
         let worktree_dir = record.branch.replace('/', "-");
-        let worktree_path = format!("worktrees/{worktree_dir}");
+        let worktree_path = format!("wt/{worktree_dir}");
 
         // Ensure the worktree exists on disk before any job tries to mount it.
         self.git

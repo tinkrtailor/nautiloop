@@ -57,8 +57,10 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     // Build git operations (bare repo)
-    let bare_repo_path =
-        std::env::var("NEMO_BARE_REPO_PATH").unwrap_or_else(|_| "/data/bare-repo.git".to_string());
+    // BARE_REPO_PATH is set by Terraform (control-plane.tf); fall back for local dev.
+    let bare_repo_path = std::env::var("BARE_REPO_PATH")
+        .or_else(|_| std::env::var("NEMO_BARE_REPO_PATH"))
+        .unwrap_or_else(|_| "/bare-repo".to_string());
     let git: Arc<dyn GitOperations> = Arc::new(
         nemo_control_plane::git::bare::BareRepoGitOperations::new(&bare_repo_path),
     );

@@ -541,7 +541,7 @@ mod tests {
             retry_count: 0,
             session_id: Some("session-123".to_string()),
             feedback_path: Some(".agent/review-feedback-round-1.json".to_string()),
-            worktree_path: "worktrees/agent-alice-invoice-cancel-a1b2c3d4".to_string(),
+            worktree_path: "wt/agent-alice-invoice-cancel-a1b2c3d4".to_string(),
             credentials: vec![],
         }
     }
@@ -871,7 +871,7 @@ mod tests {
         let worktree_mount = mounts.iter().find(|m| m.mount_path == "/work").unwrap();
         assert_eq!(
             worktree_mount.sub_path.as_deref(),
-            Some("worktrees/agent-alice-invoice-cancel-a1b2c3d4")
+            Some("wt/agent-alice-invoice-cancel-a1b2c3d4")
         );
     }
 
