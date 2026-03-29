@@ -90,6 +90,24 @@ pub mod bare {
     }
 
     impl BareRepoGitOperations {
+        /// Compute the persistent worktree directory for a branch.
+        /// Matches the path derived in loop_engine/driver.rs build_context().
+        fn persistent_worktree_dir(&self, branch: &str) -> PathBuf {
+            let worktree_name = branch.replace('/', "-");
+            self.repo_path.join("worktrees").join(worktree_name)
+        }
+
+        /// Remove a persistent worktree for a branch if it exists.
+        /// Must be called before `git branch -D` to avoid "branch is checked out" errors.
+        async fn cleanup_stale_worktree(&self, branch: &str) {
+            let wt_dir = self.persistent_worktree_dir(branch);
+            if wt_dir.exists() {
+                let _ = self
+                    .run_git(&["worktree", "remove", "--force", &wt_dir.to_string_lossy()])
+                    .await;
+            }
+        }
+
         /// Inner write_file logic; caller handles worktree cleanup.
         async fn write_file_in_worktree(
             &self,
@@ -190,9 +208,9 @@ pub mod bare {
                             )));
                         }
                         Some("MERGED") | Some("CLOSED") => {
-                            // Old PR is done: delete local and remote branch, recreate fresh
+                            // Old PR is done: clean up worktree + branch, recreate fresh
+                            self.cleanup_stale_worktree(branch).await;
                             let _ = self.run_git(&["branch", "-D", branch]).await;
-                            // Delete remote branch so push doesn't fail non-fast-forward
                             let _ = self.run_git(&["push", "origin", "--delete", branch]).await;
                             self.run_git(&["branch", branch, &base_ref])
                                 .await
@@ -207,7 +225,8 @@ pub mod bare {
                             tracing::info!(branch, "PR state unknown (transient), reusing branch");
                         }
                         None => {
-                            // No PR — stale leftover. Recreate from base.
+                            // No PR — stale leftover. Clean up worktree + branch, recreate.
+                            self.cleanup_stale_worktree(branch).await;
                             let _ = self.run_git(&["branch", "-D", branch]).await;
                             let _ = self.run_git(&["push", "origin", "--delete", branch]).await;
                             self.run_git(&["branch", branch, &base_ref])
@@ -254,8 +273,17 @@ pub mod bare {
         }
 
         async fn write_file(&self, branch: &str, path: &str, content: &str) -> Result<()> {
-            // Create a temporary worktree, write the file, commit, and clean up.
-            // All error paths clean up the worktree to avoid leaks.
+            // Use the persistent worktree if it exists (created by ensure_worktree).
+            // Git forbids the same branch in two worktrees, so we must not create
+            // a second temporary worktree for a branch that already has one.
+            let persistent = self.persistent_worktree_dir(branch);
+            if persistent.exists() {
+                return self
+                    .write_file_in_worktree(&persistent.to_string_lossy(), path, content)
+                    .await;
+            }
+
+            // No persistent worktree — create a temporary one
             let worktree_dir = format!("/tmp/nemo-wt-{}", uuid::Uuid::new_v4());
             self.run_git(&["worktree", "add", &worktree_dir, branch])
                 .await
@@ -269,7 +297,6 @@ pub mod bare {
                 .write_file_in_worktree(&worktree_dir, path, content)
                 .await;
 
-            // Always clean up worktree regardless of success/failure
             let _ = self
                 .run_git(&["worktree", "remove", "--force", &worktree_dir])
                 .await;
@@ -323,14 +350,21 @@ pub mod bare {
                 return Ok(());
             }
 
-            let worktree_dir = format!("/tmp/nemo-wt-{}", uuid::Uuid::new_v4());
-            self.run_git(&["worktree", "add", &worktree_dir, branch])
-                .await
-                .map_err(|e| {
-                    crate::error::NemoError::Git(format!(
-                        "Failed to create worktree for {branch}: {e}"
-                    ))
-                })?;
+            // Use persistent worktree if it exists to avoid branch conflict.
+            let persistent = self.persistent_worktree_dir(branch);
+            let (worktree_dir, is_temp) = if persistent.exists() {
+                (persistent.to_string_lossy().to_string(), false)
+            } else {
+                let tmp = format!("/tmp/nemo-wt-{}", uuid::Uuid::new_v4());
+                self.run_git(&["worktree", "add", &tmp, branch])
+                    .await
+                    .map_err(|e| {
+                        crate::error::NemoError::Git(format!(
+                            "Failed to create worktree for {branch}: {e}"
+                        ))
+                    })?;
+                (tmp, true)
+            };
 
             // git rm -rf the path
             let rm = Command::new("git")
@@ -342,9 +376,11 @@ pub mod bare {
 
             if !rm.status.success() {
                 let stderr = String::from_utf8_lossy(&rm.stderr).trim().to_string();
-                let _ = self
-                    .run_git(&["worktree", "remove", "--force", &worktree_dir])
-                    .await;
+                if is_temp {
+                    let _ = self
+                        .run_git(&["worktree", "remove", "--force", &worktree_dir])
+                        .await;
+                }
                 return Err(crate::error::NemoError::Git(format!(
                     "git rm {path} failed: {stderr}"
                 )));
@@ -369,17 +405,21 @@ pub mod bare {
                 })?;
             if !commit.status.success() {
                 let stderr = String::from_utf8_lossy(&commit.stderr).trim().to_string();
-                let _ = self
-                    .run_git(&["worktree", "remove", "--force", &worktree_dir])
-                    .await;
+                if is_temp {
+                    let _ = self
+                        .run_git(&["worktree", "remove", "--force", &worktree_dir])
+                        .await;
+                }
                 return Err(crate::error::NemoError::Git(format!(
                     "git commit failed: {stderr}"
                 )));
             }
 
-            let _ = self
-                .run_git(&["worktree", "remove", "--force", &worktree_dir])
-                .await;
+            if is_temp {
+                let _ = self
+                    .run_git(&["worktree", "remove", "--force", &worktree_dir])
+                    .await;
+            }
             Ok(())
         }
 
