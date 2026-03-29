@@ -18,36 +18,46 @@ Runtime infrastructure for Nemo agent jobs: the container image agents execute i
 - FR-1: The base image shall include git, curl, jq, build-essential, Node.js 22 LTS, and Python 3.12 runtime
 - FR-2: The base image shall install claude-code via `npm install -g @anthropic-ai/claude-code`
 - FR-3: The base image shall install opencode from `ghcr.io/anomalyco/opencode` (binary copy from their published image)
-- FR-4: The image entrypoint (`/usr/local/bin/nemo-agent-entry`) shall read `$STAGE` and dispatch to the correct CLI tool with the correct flags. The entrypoint shall use `exec` to replace the shell with the CLI tool process (or use `tini` as PID 1) to ensure correct signal handling.
-- FR-5: For IMPLEMENT and SPEC_REVISE stages, the entrypoint shall invoke `claude -p --output-format stream-json --dangerously-skip-permissions` with the prompt assembled from template + spec + feedback
-- FR-6: For REVIEW and SPEC_AUDIT stages, the entrypoint shall invoke `opencode run --format json` with the prompt assembled from template + spec + diff context
+- FR-4: The image entrypoint (`/usr/local/bin/nemo-agent-entry`) shall read `$STAGE` and dispatch to the correct CLI tool per the table below. The entrypoint shall use `exec` to replace the shell with the CLI tool process (or use `tini` as PID 1) to ensure correct signal handling.
+
+  | Stage | Command |
+  |-------|---------|
+  | IMPLEMENT | `exec claude -p "$(cat $PROMPT_FILE)" --output-format stream-json --dangerously-skip-permissions --resume "$SESSION_ID"` (omit `--resume` if round 1) |
+  | SPEC_REVISE | same as IMPLEMENT |
+  | REVIEW | `exec opencode run --format json --prompt "$(cat $PROMPT_FILE)" -s "$SESSION_ID"` (omit `-s` if round 1) |
+  | SPEC_AUDIT | same as REVIEW |
+  | TEST | `exec bash -c 'for svc in $(echo $AFFECTED_SERVICES | jq -r ".[]"); do cmd=$(jq -r ".services[\"$svc\"].test" /specs/nemo.toml); eval "$cmd"; done'` |
+
+  On error, the entrypoint shall write to stderr in the format: `NEMO_ERROR: <stage>: <message>` (one line, no stack traces).
+- FR-5: For IMPLEMENT and SPEC_REVISE stages, the entrypoint shall invoke `claude -p --output-format stream-json --dangerously-skip-permissions` with the prompt assembled from template + spec + feedback. The default implement.md template MUST include the directive: "You must implement all functionality fully. Mock implementations, placeholder functions, TODO stubs, and fake data stores are forbidden. Every code path must be real and complete."
+- FR-6: For REVIEW and SPEC_AUDIT stages, the entrypoint shall invoke `opencode run --format json` with the prompt assembled from template + spec + diff context. The review stage entrypoint shall configure opencode with permission restrictions: `{ "edit": "deny", "bash": "deny", "read": "allow" }` to ensure the reviewer is read-only. The worktree volume shall be mounted read-only for REVIEW and SPEC_AUDIT stages.
 - FR-7: For round > 1, the entrypoint shall pass `--resume $SESSION_ID` (claude) or `-s $SESSION_ID` (opencode) to continue the prior session
 - FR-8: The entrypoint shall configure proxy environment variables so all outbound traffic routes through the sidecar egress logger: `HTTP_PROXY=http://localhost:9092`, `HTTPS_PROXY=http://localhost:9092`, `http_proxy=http://localhost:9092`, `https_proxy=http://localhost:9092`, `NO_PROXY=localhost,127.0.0.1`, `no_proxy=localhost,127.0.0.1`. Both upper- and lower-case variants are required because different tools respect different conventions. `NO_PROXY` prevents double-proxying when the agent calls localhost services (model API on :9090, git proxy on :9091, egress logger on :9092).
-- FR-9: The entrypoint shall configure `ANTHROPIC_BASE_URL=http://localhost:9090/v1` and `OPENAI_BASE_URL=http://localhost:9090/v1` so model API calls route through the sidecar auth proxy
+- FR-9: The entrypoint shall configure `ANTHROPIC_BASE_URL=http://localhost:9090/anthropic` and `OPENAI_BASE_URL=http://localhost:9090/openai` so model API calls route through the sidecar auth proxy. The sidecar routes by path prefix: `/anthropic/*` → `https://api.anthropic.com/*`, `/openai/*` → `https://api.openai.com/*`. The sidecar strips the prefix before forwarding.
 - FR-10: The entrypoint shall set `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL` from environment variables
 - FR-11: The entrypoint shall set `GIT_SSH_COMMAND` to a script that connects to `localhost:9091` instead of the real remote. The sidecar runs a local SSH server on `:9091` that authenticates with the mounted SSH key and proxies the push to the actual git remote.
 - FR-12: Per-monorepo images shall extend the base via `Dockerfile.nemo` in the repo root (e.g., `FROM ghcr.io/nemo/agent-base:latest`)
-- FR-13: On exit, the entrypoint shall write structured output to both `/output/result.json` AND stdout in a common result envelope: `{ "stage": "implement|test|review|spec_audit|spec_revise", "data": { ...stage-specific fields... } }`. The control plane dispatches parsing based on the `stage` field. Stage-specific `data` fields: IMPLEMENT: `new_sha`, `token_usage`, `exit_code`, `session_id`; TEST: see FR-42d; REVIEW/SPEC_AUDIT: `verdict`, `token_usage`, `exit_code`, `session_id`; SPEC_REVISE: `revised_spec_path`, `token_usage`, `exit_code`, `session_id`. Pod logs are the durable channel for the control plane; `/output` is for the agent's own use during execution.
+- FR-13: On exit, the entrypoint shall write the result as a single JSON line prefixed with `NEMO_RESULT:` to stdout. Format: `NEMO_RESULT:{"stage":"implement","data":{...}}`. Sidecar log lines use prefix `NEMO_SIDECAR:`. Model streaming output uses prefix `NEMO_MODEL:`. The control plane parses pod logs by prefix to avoid interleaving ambiguity. The result is also written to `/output/result.json` (for the agent's own use during execution). Result envelope: `{ "stage": "implement|test|review|spec_audit|spec_revise", "data": { ...stage-specific fields... } }`. The control plane dispatches parsing based on the `stage` field. Stage-specific `data` fields: IMPLEMENT: `new_sha`, `token_usage`, `exit_code`, `session_id`; TEST: see FR-42d; REVIEW/SPEC_AUDIT: `verdict`, `token_usage`, `exit_code`, `session_id`; SPEC_REVISE: `revised_spec_path`, `token_usage`, `exit_code`, `session_id`. Pod logs are the durable channel for the control plane.
 
 #### Auth Sidecar
 
 - FR-14: The sidecar shall be a single static binary (Go, ~10 MB) listening on three localhost ports
-- FR-15: Model API proxy (`:9090`): intercept requests to `api.anthropic.com` and `api.openai.com`, inject `Authorization` / `x-api-key` headers from K8s Secret mounted at `/secrets/model-credentials`
+- FR-15: Model API proxy (`:9090`): route requests by path prefix. `/anthropic/*` → `https://api.anthropic.com/*` (strip prefix, inject `x-api-key` header). `/openai/*` → `https://api.openai.com/*` (strip prefix, inject `Authorization: Bearer` header). Credentials read from K8s Secret mounted at `/secrets/model-credentials`. The proxy shall ONLY accept requests to these two upstream domains. Requests to any other destination shall be rejected with HTTP 403. The proxy shall reject requests whose resolved destination is a private/internal IP (169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8) to prevent SSRF.
 - FR-16: Model API proxy shall support both Anthropic header format (`x-api-key: $KEY`) and OpenAI header format (`Authorization: Bearer $KEY`)
 - FR-17: Model API proxy shall pass through all other headers and body unmodified
-- FR-18: Git SSH proxy (`:9091`): run a local SSH server that accepts connections from the agent container. On receiving any git SSH operation (fetch, push, clone, ls-remote), authenticate with the SSH private key mounted at `/secrets/ssh-key`, open a connection to the actual git remote, and proxy the operation through. The agent's `GIT_SSH_COMMAND` points to a wrapper script that connects to `localhost:9091`. The agent should not need to fetch (worktrees are pre-created by the control plane), but if it does, the proxy handles it transparently.
+- FR-18: Git SSH proxy (`:9091`): run a local SSH server that accepts connections from the agent container. The proxy shall ONLY connect to the single git remote host extracted from `git_repo_url` in the environment (e.g., `github.com`). Connections to any other host shall be rejected. The proxy shall only permit the git SSH commands `git-upload-pack` and `git-receive-pack`; all other commands shall be rejected. Port forwarding (`-L`, `-R`, `-D`), remote exec, environment variable passing, and PTY allocation shall be disabled. On receiving an allowed git SSH operation, authenticate with the SSH private key mounted at `/secrets/ssh-key`, open a connection to the configured git remote, and proxy the operation through. The agent's `GIT_SSH_COMMAND` points to a wrapper script that connects to `localhost:9091`.
 - FR-19: Egress logger (`:9092`): transparent HTTP/HTTPS CONNECT proxy that logs every outbound connection (timestamp, destination host:port, method, bytes sent, bytes received) to stdout in JSON-lines format
-- FR-20: Egress logger shall NOT block or filter any traffic (agents need open internet)
-- FR-21: The sidecar shall read credentials from files mounted into its container only; no credentials shall be mounted into the agent container. The sidecar shall re-read credential files from disk on each request (not cache at startup) so that K8s Secret volume updates propagate without restart.
-- FR-22: On startup, the sidecar shall wait until all three ports are listening, then write a readiness file to `/tmp/shared/ready` (shared emptyDir volume) AND expose a K8s readiness probe on `:9093/healthz` (for kubelet). The readiness file is the mechanism the agent entrypoint polls; the HTTP probe is for K8s only.
+- FR-20: Egress logger shall NOT block or filter any traffic (agents need open internet for tool installs, documentation, etc.)
+- FR-21: The sidecar shall read credentials from files mounted into its container only; no credentials shall be mounted into the agent container. The sidecar shall re-read credential files from disk on each request (not cache at startup) so that K8s Secret volume updates propagate without restart. Secret file layout: `/secrets/model-credentials/anthropic` (contains raw API key, single line, no trailing newline), `/secrets/model-credentials/openai` (same format), `/secrets/ssh-key/id_ed25519` (PEM private key, mode 0600, mounted via `defaultMode: 0600` on the Secret volume).
+- FR-22: On startup, the sidecar shall wait until all three ports are listening, then write a readiness file to `/tmp/shared/ready` (shared emptyDir volume) AND expose a K8s readiness probe on `:9093/healthz` (for kubelet) AND expose a K8s liveness probe on `:9093/healthz` (same endpoint, different K8s probe config with `initialDelaySeconds: 5, periodSeconds: 10`). The readiness file is the mechanism the agent entrypoint polls; the HTTP probes are for K8s. If the sidecar dies mid-job, the agent will encounter connection refused on localhost proxy ports; the entrypoint shall detect this and exit with code 111 (sidecar connection failure) so the control plane can distinguish sidecar crashes from agent failures.
 - FR-23: On SIGTERM, the sidecar shall drain active connections (5s grace) then exit
 
 #### K8s Job Template
 
 - FR-24: Each agent job shall be a K8s Job with `restartPolicy: Never`, `imagePullSecrets` referencing the registry credential, and two containers: `agent` and `auth-sidecar`
-- FR-25: The agent container shall mount: worktree volume (from bare repo PVC, path `/work`), session state PVC (path `/sessions`), spec files (ConfigMap or PVC, path `/specs`), output volume (emptyDir, path `/output`), shared readiness volume (emptyDir, path `/tmp/shared`), a writable tmpdir (emptyDir, path `/tmp`), and a writable home directory (emptyDir, path `/work/home`). The agent container shall set `securityContext: { runAsNonRoot: true, runAsUser: 1000, readOnlyRootFilesystem: true }` with writable volumes for `/work`, `/work/home`, `/output`, `/sessions`, `/tmp`, and `/tmp/shared`. `/work/home` is needed because claude-code writes to `$HOME/.claude/` and opencode writes to `$HOME/.config/opencode/`.
+- FR-25: The agent container shall mount: worktree volume (from bare repo PVC, path `/work`; mounted read-only for REVIEW and SPEC_AUDIT stages), session state PVC (path `/sessions`), spec files (ConfigMap or PVC, path `/specs`), output volume (emptyDir, path `/output`), shared readiness volume (emptyDir, path `/tmp/shared`), a writable tmpdir (emptyDir, path `/tmp`), and a writable home directory (emptyDir, path `/work/home`). The agent container shall set `securityContext: { runAsNonRoot: true, runAsUser: 1000, readOnlyRootFilesystem: true }`. Writable paths (all emptyDir or PVC mounts): `/work`, `/work/home`, `/output`, `/sessions`, `/tmp`, `/tmp/shared`. Environment variables for writable paths: `HOME=/work/home`, `XDG_CONFIG_HOME=/work/home/.config`, `XDG_CACHE_HOME=/work/home/.cache`, `TMPDIR=/tmp`. `/work/home` is needed because claude-code writes to `$HOME/.claude/` and opencode writes to `$HOME/.config/opencode/`.
 - FR-26: The sidecar container shall mount: model credentials Secret (path `/secrets/model-credentials`), SSH key Secret (path `/secrets/ssh-key`), shared readiness volume (emptyDir, path `/tmp/shared`). The Secret volumes shall NOT be mounted in the agent container.
-- FR-27: The Job shall set these environment variables on the agent container: `STAGE`, `SPEC_PATH`, `FEEDBACK_PATH`, `SESSION_ID`, `BRANCH`, `SHA`, `MODEL`, `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `ROUND`, `MAX_ROUNDS`, `LOOP_ID`, `HOME=/work/home`
+- FR-27: The Job shall set these environment variables on the agent container: `STAGE`, `SPEC_PATH`, `FEEDBACK_PATH`, `SESSION_ID`, `BRANCH`, `SHA`, `MODEL`, `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `ROUND`, `MAX_ROUNDS`, `LOOP_ID`, `HOME=/work/home`, `XDG_CONFIG_HOME=/work/home/.config`, `XDG_CACHE_HOME=/work/home/.cache`, `TMPDIR=/tmp`
 - FR-28: Resource limits per job type:
 
 | Container / Job type | CPU request | CPU limit | RAM request | RAM limit |
@@ -69,40 +79,150 @@ Runtime infrastructure for Nemo agent jobs: the container image agents execute i
 
 - FR-33: Default prompt templates shall ship as files embedded in the control plane binary and written to a ConfigMap on deploy
 - FR-34: Repo-side overrides shall live in `.nemo/prompts/` and take precedence over defaults when present
-- FR-35: `implement.md` template shall include: role definition (implementer), spec contents (injected), branch/SHA context, instruction to commit changes with meaningful messages, and (if round > 1) prior review feedback
+- FR-35: `implement.md` template shall include: role definition (implementer), spec contents (injected), branch/SHA context, instruction to commit changes with descriptive messages (format: `nemo: <what changed and why>`), explicit prohibition of mock/placeholder implementations ("You must implement all functionality fully. Mock implementations, placeholder functions, TODO stubs, and fake data stores are forbidden. Every code path must be real and complete."), and (if round > 1) prior review feedback in the feedback file format (see FR-40b)
 - FR-36: `review.md` template shall include: role definition (adversarial reviewer), spec contents (injected), diff context (`git diff $BASE...$SHA`), the verdict JSON schema (inline), instruction to output valid JSON matching the schema, and instruction to check for: correctness vs spec, edge cases, error handling, test coverage gaps
 - FR-37: `spec-audit.md` template shall include: role definition (spec auditor), spec contents (injected), instruction to check for: ambiguity, missing edge cases, untestable requirements, unresolved dependencies, feasibility concerns, contradiction with existing codebase patterns
 - FR-38: `spec-revise.md` template shall include: role definition (spec author/reviser), spec contents (injected), audit findings (injected), instruction to revise the spec addressing each finding without removing existing valid requirements
 - FR-39: Templates shall use `{{PLACEHOLDER}}` syntax for variable injection: `{{SPEC}}`, `{{DIFF}}`, `{{FEEDBACK}}`, `{{BRANCH}}`, `{{SHA}}`, `{{VERDICT_SCHEMA}}`, `{{AFFECTED_SERVICES}}`
 - FR-40: The review verdict JSON schema (embedded in `review.md` and `spec-audit.md`) shall match the schema defined in the design doc: `{ clean: bool, confidence: float, issues: [{ severity, file, line, description, suggestion }], summary: string, token_usage: { input, output } }`
+- FR-40b: The feedback file is a first-class contract between stages. The control plane SHALL validate feedback files before dispatching the next stage. Feedback file JSON schema:
+
+  ```json
+  {
+    "type": "object",
+    "required": ["source_stage", "loop_id", "round", "content"],
+    "properties": {
+      "source_stage": { "type": "string", "enum": ["review", "spec_audit", "test"] },
+      "loop_id": { "type": "string" },
+      "round": { "type": "integer" },
+      "content": {
+        "oneOf": [
+          { "$ref": "#/definitions/review_feedback" },
+          { "$ref": "#/definitions/test_feedback" }
+        ]
+      }
+    },
+    "definitions": {
+      "review_feedback": {
+        "type": "object",
+        "required": ["verdict", "issues"],
+        "properties": {
+          "verdict": { "type": "object", "description": "Full verdict per FR-40" },
+          "issues": { "type": "array", "items": { "type": "object" } }
+        }
+      },
+      "test_feedback": {
+        "type": "object",
+        "required": ["services", "all_passed"],
+        "properties": {
+          "services": { "type": "array" },
+          "all_passed": { "type": "boolean" }
+        }
+      }
+    }
+  }
+  ```
+
+  The feedback file is written by the control plane (not the agent) to `$FEEDBACK_PATH` before dispatching the next round.
 
 #### Network Egress Enforcement
 
-- FR-41a: A K8s NetworkPolicy shall be applied to all agent pods in the `nemo-jobs` namespace that blocks all egress from the agent container EXCEPT to `localhost` (127.0.0.1/32). This forces all outbound traffic (model API, HTTP, git push) through the sidecar proxies. Without this policy, the sidecar is bypassable and credential isolation is not enforced.
-- FR-41b: The NetworkPolicy shall allow DNS resolution to the cluster DNS service (kube-dns on port 53) for the whole pod. K8s NetworkPolicy operates at pod level and cannot distinguish between containers in the same pod. Both containers need DNS (sidecar for proxying, agent for resolving localhost service names). DNS resolution without the ability to connect (blocked by the egress-to-localhost-only rule in FR-41a) is harmless.
+- FR-41a: K8s NetworkPolicy cannot distinguish between containers in the same pod (it operates at pod level). Therefore, egress enforcement uses an init container with iptables rules instead. The Job template shall include an init container (`init-iptables`) that runs with `securityContext: { capabilities: { add: ["NET_ADMIN"] } }` and configures iptables rules to redirect all egress from the agent container (UID 1000) through the sidecar. The init container runs, sets up rules, then exits. The agent container inherits the network namespace with the rules applied. The exact iptables commands:
+
+  ```
+  # Allow loopback (agent -> sidecar on localhost)
+  iptables -t nat -A OUTPUT -o lo -j RETURN
+  # Allow established connections
+  iptables -t nat -A OUTPUT -m state --state ESTABLISHED,RELATED -j RETURN
+  # Redirect all TCP from UID 1000 (agent) to sidecar egress logger on localhost:9092
+  iptables -t nat -A OUTPUT -p tcp -m owner --uid-owner 1000 -j REDIRECT --to-ports 9092
+  # Drop all non-TCP egress from UID 1000 (no UDP/ICMP exfiltration)
+  iptables -A OUTPUT -p udp -m owner --uid-owner 1000 -j DROP
+  iptables -A OUTPUT -p icmp -m owner --uid-owner 1000 -j DROP
+  ```
+
+  The sidecar runs as a different UID (UID 65534/nobody) so its own egress is not redirected.
+
+- FR-41b: DNS resolution: the agent container's DNS queries (UDP 53) are dropped by the iptables rules above. All DNS resolution happens through the sidecar's HTTP CONNECT proxy (the agent uses `HTTPS_PROXY` for all outbound). The sidecar itself can resolve DNS normally (different UID, not subject to the redirect rules).
 
 #### TEST Stage
 
-- FR-42a: For the TEST stage, the control plane shall compute the affected services by running `git diff --name-only $BASE...$SHA` and mapping changed file paths against `[services.*.path]` in `nemo.toml`. The control plane passes the result as the `AFFECTED_SERVICES` environment variable (JSON array of service names) on the Job. The agent does NOT self-report affected services.
+- FR-42a: For the TEST stage, the control plane is the sole source of truth for affected services. The control plane computes affected services by running `git diff --name-only $BASE...$SHA` and mapping changed file paths against `[services.*.path]` in `nemo.toml`. The control plane passes the result as the `AFFECTED_SERVICES` environment variable (JSON array of service names) on the Job. The agent does NOT self-report affected services; there are no agent-reported service fields anywhere in the system.
 - FR-42b: The entrypoint shall look up the test command for each affected service from `nemo.toml` (mounted as a ConfigMap at `/specs/nemo.toml`), under the `[services.<name>.test]` section
 - FR-42c: The entrypoint shall run each test command, capture exit code, stdout, and stderr per service
-- FR-42d: The entrypoint shall write structured test results to `/output/result.json` and stdout using the common result envelope (FR-13) with stage `"test"` and data: `{ services: [{ name, test_command, exit_code, stdout, stderr }], all_passed: bool, token_usage }`
+- FR-42d: The entrypoint shall write structured test results to `/output/result.json` and stdout (with `NEMO_RESULT:` prefix per FR-13) using the common result envelope with stage `"test"` and data: `{ services: [{ name, test_command, exit_code, stdout, stderr }], all_passed: bool, ci_status: "passed|failed|unknown", token_usage }`. The `ci_status` field uses a three-state model: `passed` (all tests exit 0), `failed` (at least one test exit non-zero with test output), `unknown` (test harness itself failed, e.g., command not found, timeout, OOM — cannot determine test results). The control plane uses this to distinguish "code is broken" from "test infrastructure is broken".
 
 #### Terraform Module
 
 - FR-43: The module shall provision a Hetzner Cloud server (default type: `ccx43`, configurable via `server_type` variable)
-- FR-44: The module shall install k3s (latest stable) on the provisioned server with `--disable traefik` (use nginx-ingress instead for TLS support)
-- FR-45: The module shall deploy Postgres 16 as a k3s pod with a 20Gi PVC (hostPath on single-node)
-- FR-46: The module shall deploy the Nemo control plane (API server + loop engine) as a k3s Deployment with 2 replicas
-- FR-47: The module shall create a 100Gi PVC for the shared bare repo and deploy a CronJob that runs `git fetch --all` every 60 seconds
-- FR-48: The module shall configure nginx-ingress with Let's Encrypt TLS via cert-manager
+- FR-44: The module shall install k3s v1.30+ (pinned in Terraform variable `k3s_version`, default `v1.30.4+k3s1`) on the provisioned server with `--disable traefik` (use nginx-ingress instead for TLS support). Pinned component versions (all configurable via Terraform variables with these defaults): nginx-ingress v1.10+, cert-manager v1.14+, postgres:16-alpine.
+- FR-45: The module shall deploy Postgres (image: `postgres:16-alpine`) as a k3s pod with a 20Gi PVC (hostPath on single-node)
+- FR-46: The module shall deploy the Nemo control plane (API server + loop engine) as a k3s Deployment with 1 replica. V1 is single-replica; K8s restarts on crash. V2: add leader election via K8s Lease API for HA with 2+ replicas.
+- FR-47: The module shall create a 100Gi PVC for the shared bare repo. An init Job (`nemo-repo-init`) shall run before the fetch CronJob is enabled. The init Job:
+
+  ```yaml
+  apiVersion: batch/v1
+  kind: Job
+  metadata:
+    name: nemo-repo-init
+    namespace: nemo-system
+  spec:
+    template:
+      spec:
+        containers:
+        - name: repo-init
+          image: alpine/git:latest
+          command: ["/bin/sh", "-c"]
+          args:
+          - |
+            set -e
+            if [ ! -d /bare-repo/HEAD ]; then
+              git init --bare /bare-repo
+            fi
+            git -C /bare-repo remote remove origin 2>/dev/null || true
+            git -C /bare-repo remote add origin "$GIT_REPO_URL"
+            mkdir -p /root/.ssh
+            cp /secrets/ssh-key/id_ed25519 /root/.ssh/id_ed25519
+            chmod 600 /root/.ssh/id_ed25519
+            cp /secrets/ssh-known-hosts/known_hosts /root/.ssh/known_hosts
+            git -C /bare-repo fetch --all
+          env:
+          - name: GIT_REPO_URL
+            value: "$(git_repo_url)"
+          volumeMounts:
+          - name: bare-repo
+            mountPath: /bare-repo
+          - name: ssh-key
+            mountPath: /secrets/ssh-key
+            readOnly: true
+          - name: ssh-known-hosts
+            mountPath: /secrets/ssh-known-hosts
+            readOnly: true
+        volumes:
+        - name: bare-repo
+          persistentVolumeClaim:
+            claimName: nemo-bare-repo
+        - name: ssh-key
+          secret:
+            secretName: nemo-repo-ssh-key
+            defaultMode: 0600
+        - name: ssh-known-hosts
+          secret:
+            secretName: nemo-ssh-known-hosts
+        restartPolicy: OnFailure
+    backoffLimit: 3
+  ```
+
+  The fetch CronJob (`git fetch --all` every 60 seconds) is deployed alongside but only runs after the init Job succeeds (the CronJob `suspend: true` until init completes; Terraform uses `depends_on`). The CronJob is OPTIONAL background freshness only. The control plane's `prepare_worktree()` does the authoritative fetch per-job before creating the worktree.
+
+- FR-48: The module shall configure nginx-ingress with Let's Encrypt TLS via cert-manager. Prerequisites: the user must pre-create a DNS A record pointing `domain` to the server IP. Terraform inputs for TLS: `acme_email` (required), `ingress_class` (default `nginx`). cert-manager uses HTTP-01 challenge by default (requires port 80 open). The ClusterIssuer resource is created by Terraform.
 - FR-49: The module shall create a K8s Namespace `nemo-system` for control plane components and `nemo-jobs` for agent jobs
-- FR-50: The module shall create K8s Secrets for each team member (SSH key + model credentials), scoped to the `nemo-jobs` namespace
-- FR-51: Required input variables: `hetzner_api_token`, `domain`, `git_repo_url`, `ssh_public_keys` (for server access)
-- FR-52: Optional input variables: `server_type` (default `ccx43`), `server_location` (default `fsn1`), `node_count` (default `1`, for future multi-node support), `team_members` (list of `{ name, email }`), `postgres_password`, `control_plane_image`, `agent_base_image`
+- FR-50: The module shall create the `nemo-jobs` namespace and RBAC (Role + RoleBinding) that allows the control plane ServiceAccount to create/read/delete Secrets in `nemo-jobs`. Per-engineer secrets (SSH key + model credentials) are NOT created by Terraform; they are created by `nemo auth` via the control plane API at runtime. Secret naming convention: `nemo-creds-{engineer-name}`.
+- FR-51: Required input variables: `hetzner_api_token`, `domain`, `git_repo_url`, `ssh_public_keys` (for server access), `acme_email` (for Let's Encrypt)
+- FR-52: Optional input variables: `server_type` (default `ccx43`), `server_location` (default `fsn1`), `node_count` (default `1`, for future multi-node support), `postgres_password`, `control_plane_image`, `agent_base_image`, `k3s_version` (default `v1.30.4+k3s1`), `nginx_ingress_version` (default `v1.10.0`), `cert_manager_version` (default `v1.14.0`), `ingress_class` (default `nginx`)
 - FR-53: Outputs: `control_plane_url`, `kubeconfig` (sensitive), `server_ip`, `namespace_jobs`, `namespace_system`
 - FR-54: The module shall configure k3s container log rotation: 50MB max per container, 5 files retained
-- FR-55: The module shall deploy a CronJob that runs `pg_dump` daily to a separate directory on the host for Postgres backup
+- FR-55: The module shall deploy a CronJob that runs `pg_dump` daily, writing backups to `/data/backups/` on the host (hostPath volume). Backups are retained for 7 days; the CronJob deletes files older than 7 days before writing the new backup.
 - FR-56: The module shall create a K8s Service named `nemo-postgres` on port 5432 exposing the Postgres pod. Control plane deployments shall receive `DATABASE_URL` env var set to `postgres://nemo:$PASSWORD@nemo-postgres:5432/nemo`. The Postgres password shall be stored as a K8s Secret and injected into both the Postgres pod and the control plane Deployment via `envFrom` / `secretKeyRef`.
 
 ### Non-Functional Requirements
@@ -133,7 +253,7 @@ The control plane owns the full lifecycle of git worktrees. Before creating a K8
 5. Entrypoint injects variables into template (spec content, feedback, branch, SHA, etc.)
 6. Entrypoint invokes the CLI tool (claude or opencode) with the assembled prompt
 7. CLI tool streams model API calls through :9090 (auth injection), makes outbound HTTP calls through :9092 (egress logging), performs git operations through :9091 (SSH proxy)
-8. CLI tool completes. Entrypoint parses output, writes result JSON (in the common envelope per FR-13) to both `/output/result.json` AND stdout
+8. CLI tool completes. Entrypoint parses output, writes result JSON to `/output/result.json` AND emits a single line `NEMO_RESULT:{...}` to stdout (per FR-13)
 9. Agent container exits 0. Sidecar receives SIGTERM, drains, exits.
 10. Control plane watches for Job completion, reads result from pod logs (the durable channel) BEFORE deleting the Job. Pod logs are authoritative; `/output/result.json` is for the agent's own use during execution.
 11. Control plane deletes the Job and associated resources, then deletes the worktree (see Worktree Lifecycle above)
@@ -141,7 +261,7 @@ The control plane owns the full lifecycle of git worktrees. Before creating a K8
 ### Session Continuation Flow (Round > 1)
 
 1. Control plane sets `SESSION_ID` to the session ID from the previous round's `result.json`
-2. Control plane sets `FEEDBACK_PATH` to the path of the review feedback file (written to the session PVC)
+2. Control plane writes the feedback file (validated against FR-40b schema) to the session PVC and sets `FEEDBACK_PATH` to its path
 3. Entrypoint detects `$SESSION_ID` is set, passes `--resume $SESSION_ID` (claude) or `-s $SESSION_ID` (opencode)
 4. The session PVC persists session state across Job instances for the same loop
 
@@ -177,7 +297,7 @@ The control plane owns the full lifecycle of git worktrees. Before creating a K8
 
 | Error | Detection | Response | Recovery |
 |-------|-----------|----------|----------|
-| Sidecar crash mid-job | Agent gets connection refused on proxy ports | Agent CLI fails, job exits non-zero | Control plane retries job (new pod, fresh sidecar) |
+| Sidecar crash mid-job | Agent gets connection refused on proxy ports; liveness probe fails | Agent entrypoint detects localhost connection failures and exits with code 111 (sidecar failure) | Control plane sees exit code 111, retries job (new pod, fresh sidecar) |
 | Malformed result.json | Control plane JSON parse fails | Log raw output, mark job ERRORED | Control plane retries once. If still malformed, loop FAILED. |
 | Terraform apply partial failure | Terraform exits non-zero with state file | Resources may be partially created | `terraform apply` is idempotent; re-run. `terraform destroy` to clean up. |
 | k3s API unreachable from control plane | Job creation fails with connection error | Control plane retries with 10s backoff, max 3 attempts | If persistent, alert (k3s down or network issue) |
@@ -218,12 +338,23 @@ The control plane owns the full lifecycle of git worktrees. Before creating a K8
 - [ ] `terraform destroy` cleanly removes all resources
 - [ ] Job resource limits match the table in FR-28 for each job type
 - [ ] Jobs exceeding activeDeadlineSeconds are terminated by K8s
-- [ ] NetworkPolicy blocks agent container egress to all destinations except localhost; direct curl from agent container to external host fails
+- [ ] iptables init container configures egress rules; direct curl from agent container (UID 1000) to external host fails; sidecar (UID 65534) can reach external hosts
 - [ ] Agent container runs as non-root (UID 1000) with read-only root filesystem
 - [ ] TEST stage reads AFFECTED_SERVICES, runs test commands from nemo.toml, and writes structured results
 - [ ] Sidecar re-reads credential files on each request (credential rotation without pod restart)
 - [ ] pg_dump CronJob runs daily and writes backup to host directory
 - [ ] k3s log rotation configured at 50MB/5 files per container
+- [ ] Review stage mounts worktree read-only and opencode runs with `{ "edit": "deny", "bash": "deny", "read": "allow" }`
+- [ ] Sidecar model API proxy rejects requests to internal/private IPs (SSRF protection)
+- [ ] Sidecar git SSH proxy only allows `git-upload-pack` and `git-receive-pack` to the configured remote host
+- [ ] Sidecar liveness probe on :9093/healthz causes K8s to restart sidecar on failure
+- [ ] Agent exits with code 111 when sidecar proxy connection fails
+- [ ] Feedback file validates against the JSON schema (FR-40b) before the control plane dispatches next stage
+- [ ] `NEMO_RESULT:` prefix on stdout result line is correctly parsed by control plane
+- [ ] Init Job (`nemo-repo-init`) creates bare repo, configures remote, fetches, before CronJob runs
+- [ ] Integration tests for git module: branch create from correct ref, push before PR, worktree cleanup, concurrent worktree operations against a real git repo
+- [ ] Default implement.md template contains the mock/placeholder prohibition directive
+- [ ] Postgres backup written to /data/backups/ on host, files older than 7 days cleaned up
 
 ## Open Questions
 

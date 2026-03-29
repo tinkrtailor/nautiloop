@@ -5,6 +5,8 @@
 Postgres schema, git operations, and config loading for the Nemo control plane. These are the foundational modules that every other component depends on: the loop engine writes state to Postgres, dispatches jobs against git worktrees, and reads merged configuration to determine model preferences and limits.
 
 > **Eng review (2026-03-27) decided Postgres over SQLite. Design doc updated.**
+>
+> **Schema design principle (from Lane A convergence learnings): Persist-then-dispatch.** All DB state must be written before K8s Job creation. If job creation fails, the DB row exists and can be retried. If the control plane crashes after creating a job but before persisting, the job is orphaned. Always persist first.
 
 ## Dependencies
 
@@ -17,8 +19,8 @@ Postgres schema, git operations, and config loading for the Nemo control plane. 
 
 #### Postgres Schema
 
-- FR-1: The `loops` table shall store all loop state including phase (HARDEN/IMPLEMENT), stage, sub-state, round counter, current SHA, `harden_only` flag, and the engineer who owns it. When harden converges: if `harden_only`, status transitions to `converged` and phase stays `harden`; if not `harden_only`, status stays `running` and phase transitions to `implement` (after engineer approval).
-- FR-2: The `jobs` table shall store every K8s job dispatched, linked to its parent loop, with status, timing, verdict JSON, and token usage.
+- FR-1: The `loops` table shall store all loop state including phase (HARDEN/IMPLEMENT), stage, `state` (full lifecycle: pending through shipped/cancelled), `sub_state` (dispatched/running/completed), round counter, current SHA, `harden_only` flag, `paused_from_state`, `reauth_from_state`, `failure_reason`, ship mode fields, and the engineer who owns it. When harden converges: if `harden_only`, state transitions to `hardened` and phase stays `harden`; if not `harden_only`, state transitions to `awaiting_approval` until engineer approves, then phase transitions to `implement`.
+- FR-2: The `jobs` table shall store every K8s job dispatched, linked to its parent loop, with status, timing, verdict JSON, `output_json` (stage output including affected_services, test results, new SHA), `attempt` (retry tracking), `feedback_path`, and token usage.
 - FR-3: The `engineers` table shall store registered engineers with their git identity, model preferences, and concurrency limits.
 - FR-4: The `egress_logs` table shall store all outbound network traffic logged by the auth sidecar, linked to the originating job.
 - FR-5: All schema changes shall be managed via `sqlx migrate` with sequential, timestamped migration files checked into the repo.
@@ -26,20 +28,20 @@ Postgres schema, git operations, and config loading for the Nemo control plane. 
 
 #### Git Operations
 
-- FR-7: `BareRepo::fetch_and_resolve()` shall acquire the worktree mutex, run `git fetch --prune`, resolve the target ref to a SHA, and hold the mutex until the worktree is created. This serializes fetch WITH worktree creation to prevent race conditions where a ref moves between fetch and worktree creation.
-- FR-8: `BareRepo::create_worktree()` shall create a worktree from the bare repo at a specified SHA (not a branch ref), returning the worktree path. The caller must resolve the SHA before calling this (via `fetch_and_resolve`).
+- FR-7: `BareRepo::prepare_worktree(branch, base_ref) -> WorktreeLease` shall atomically acquire the worktree mutex, run `git fetch --prune`, resolve the target ref to a SHA, create a worktree at that SHA in detached HEAD mode, then `git checkout -b agent/{branch}` inside the worktree. The mutex is released when the `WorktreeLease` is dropped. This replaces the old two-step `fetch_and_resolve()` + `create_worktree()` API.
+- FR-8: (Subsumed by FR-7.) The agent commits to the named branch `agent/{branch}` inside the worktree, not detached HEAD.
 - FR-9: `BareRepo::delete_worktree()` shall remove a worktree and run `git worktree prune`.
-- FR-10: All `fetch_and_resolve` + `create_worktree` and `delete_worktree` calls shall be serialized through a `tokio::sync::Mutex` to prevent concurrent `git worktree` lock contention and fetch/worktree race conditions.
+- FR-10: All `prepare_worktree` and `delete_worktree` calls shall be serialized through a `tokio::sync::Mutex` (held inside `prepare_worktree` via `WorktreeLease` RAII, and explicitly acquired in `delete_worktree`) to prevent concurrent `git worktree` lock contention and fetch/worktree race conditions. There is no separate fetch CronJob; all fetches are per-job via `prepare_worktree()`.
 - FR-11: Branch creation shall follow the pattern `agent/{engineer}/{spec-slug}-{short-hash}` where `short-hash` is the first 8 hex chars of SHA-256 of the ORIGINAL spec file content at submission time, making branch names immutable across harden rounds. (Note: design doc examples are being updated to include hash suffix.)
 - FR-12: `BareRepo::detect_divergence()` shall compare the local branch tip SHA against the remote tracking branch and classify the result into three variants: `RemoteAhead` (engineer pushed additional commits, fast-forward possible), `ForceDeviated` (histories diverged due to force push), or `LocalAhead` (normal agent operation, not a divergence).
-- FR-13: On `RemoteAhead`: pause (status becomes `paused_remote_ahead`), notify engineer. On `ForceDeviated`: pause (status becomes `paused_force_deviated`), notify engineer. On `LocalAhead`: normal operation, no action. On `RemoteGone`: treat as `ForceDeviated`, pause.
+- FR-13: On `RemoteAhead`: pause (state becomes `paused_remote_ahead`, `paused_from_state` records prior state), notify engineer. On `ForceDeviated`: pause (state becomes `paused_force_deviated`, `paused_from_state` records prior state), notify engineer. On `LocalAhead`: normal operation, no action. On `RemoteGone`: cancel only (branch is deleted on remote, work is lost, no resume possible).
 - FR-13a: `paused_remote_ahead` state machine: `nemo resume <loop-id>` fast-forwards to remote SHA (no work lost), re-dispatches current stage. `nemo cancel <loop-id>` transitions to `cancelled`. No other transitions valid.
 - FR-13b: `paused_force_deviated` state machine: `nemo resume --force <loop-id>` shows what commits will be discarded, then resets to remote SHA. Without `--force`, the command is rejected with an explanation of data loss. `nemo cancel <loop-id>` transitions to `cancelled`. No other transitions valid.
 
 #### Config Loading
 
 - FR-14: Config shall merge three layers in order: cluster (lowest priority) -> repo (`nemo.toml`) -> engineer (`~/.nemo/config.toml`, highest priority).
-- FR-15: `nemo.toml` shall be parsed from the monorepo root using the `toml` crate. On the control plane, it is loaded from the worktree at job dispatch time (the bare repo contains the file). Missing file is not an error at the cluster level (bare cluster config suffices); missing file IS an error at the repo level for `nemo submit`.
+- FR-15: `nemo.toml` shall be parsed from the monorepo root using the `toml` crate. **Config loading timing (fix #16):** The CLI validates `nemo.toml` locally before `nemo submit` (fail fast). The API revalidates on receipt. The loop engine treats a missing repo config as a terminal failure at dispatch time (loop transitions to `failed` with `failure_reason = "nemo.toml not found in worktree"`). Missing file is not an error at the cluster level (bare cluster config suffices); missing file IS an error at the repo level for `nemo submit`.
 - FR-16: Engineer config at `~/.nemo/config.toml` shall be optional. Missing file means no overrides.
 - FR-17: Cluster config shall be read from a K8s ConfigMap mounted as a file, or from environment variables prefixed with `NEMO_CLUSTER_`.
 - FR-18: Model resolution order: engineer override > repo default > cluster default. If no model is configured at any layer, fail with an explicit error naming which role (implementor/reviewer) is unconfigured.
@@ -67,12 +69,32 @@ CREATE TYPE loop_stage AS ENUM (
     'spec_audit', 'spec_revise',           -- harden phase
     'implementing', 'testing', 'reviewing' -- implement phase
 );
-CREATE TYPE loop_status AS ENUM (
-    'running', 'converged', 'failed',
-    'max_rounds_exceeded', 'paused_remote_ahead', 'paused_force_deviated', 'cancelled'
+-- Full state enum matching Lane A implementation.
+-- Replaces the old "loop_status" which lacked approval, reauth, and granular pause states.
+CREATE TYPE loop_state AS ENUM (
+    'pending',                  -- submitted, not yet dispatched
+    'hardening',                -- harden phase active
+    'awaiting_approval',        -- harden converged, waiting for engineer to approve implement
+    'implementing',             -- implement phase: code generation
+    'testing',                  -- implement phase: running tests
+    'reviewing',                -- implement phase: review verdict
+    'converged',                -- implement phase converged (clean verdict)
+    'hardened',                 -- harden_only loop completed
+    'shipped',                  -- PR merged (ship mode)
+    'failed',                   -- terminal failure
+    'paused_remote_ahead',      -- engineer pushed to branch (fast-forward possible)
+    'paused_force_deviated',    -- branch histories diverged (force push)
+    'awaiting_reauth',          -- credential expired, waiting for engineer re-auth
+    'cancelled'                 -- cancelled by engineer
+);
+CREATE TYPE loop_sub_state AS ENUM (
+    'dispatched',   -- K8s Job created, not yet running
+    'running',      -- K8s Job running
+    'completed'     -- K8s Job completed, result ingested
 );
 CREATE TYPE job_status AS ENUM (
-    'pending', 'running', 'succeeded', 'failed'
+    'pending', 'running', 'succeeded', 'failed',
+    'errored'  -- malformed results (e.g., unparseable verdict JSON)
 );
 
 CREATE TABLE engineers (
@@ -86,53 +108,99 @@ CREATE TABLE engineers (
 );
 
 CREATE TABLE loops (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    engineer_id UUID NOT NULL REFERENCES engineers(id),
-    spec_path   TEXT NOT NULL,
-    branch      TEXT NOT NULL UNIQUE,
-    phase       loop_phase NOT NULL,
-    stage       loop_stage NOT NULL,
-    status      loop_status NOT NULL DEFAULT 'running',
-    harden_only BOOLEAN NOT NULL DEFAULT false,
-    round       INTEGER NOT NULL DEFAULT 0,
-    sha         TEXT NOT NULL,  -- current branch tip; set to base branch tip at loop creation
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    engineer_id     UUID NOT NULL REFERENCES engineers(id),
+    spec_path       TEXT NOT NULL,
+    branch          TEXT NOT NULL,          -- NOT globally unique; see partial index below
+    phase           loop_phase NOT NULL,
+    stage           loop_stage NOT NULL,
+    state           loop_state NOT NULL DEFAULT 'pending',
+    sub_state       loop_sub_state,         -- NULL when no job is active
+    harden_only     BOOLEAN NOT NULL DEFAULT false,
+    round           INTEGER NOT NULL DEFAULT 0,
+    sha             TEXT NOT NULL,           -- current branch tip; set to base branch tip at loop creation
+    expected_sha    TEXT,                    -- last SHA the control plane dispatched against
+    actual_sha      TEXT,                    -- remote SHA observed on divergence detection
+    paused_from_state loop_state,           -- state before pausing (for resume)
+    reauth_from_state loop_state,           -- state before reauth pause (for resume after re-auth)
+    failure_reason  TEXT,                    -- human-readable reason when state = 'failed'
+    active_job_name TEXT,                    -- K8s job name; set BEFORE job creation, cleared on completion
+    stage_retry_count INTEGER NOT NULL DEFAULT 0, -- resets to 0 on stage transition
+    feedback_path   TEXT,                    -- path to feedback file for current stage (not reconstructed)
+    -- Ship mode fields (from Lane A learnings)
+    ship_mode       BOOLEAN NOT NULL DEFAULT false,
+    max_rounds_for_auto_merge INTEGER,      -- NULL = no auto-merge; e.g., 5 for confident results
+    merge_strategy  TEXT,                    -- 'squash', 'merge', 'rebase'; NULL = no auto-merge
+    pr_url          TEXT,                    -- GitHub PR URL once created
+    merge_sha       TEXT,                    -- SHA of the merge commit once shipped
+    ci_check_started_at TIMESTAMPTZ,        -- when CI check polling began (non-blocking)
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Phase/stage validity constraint (fix #6)
+    CONSTRAINT chk_phase_stage CHECK (
+        (phase = 'harden' AND stage IN ('spec_audit', 'spec_revise'))
+        OR (phase = 'implement' AND stage IN ('implementing', 'testing', 'reviewing'))
+    ),
+    -- Terminal state protection (from Lane A learnings): prevent overwrites of terminal states
+    -- Enforced at the application layer with a pre-update check:
+    --   UPDATE loops SET state = $new WHERE id = $id AND state NOT IN ('converged','hardened','shipped','failed','cancelled')
+    -- The CHECK constraint below is a safety net (triggers on direct SQL).
+    CONSTRAINT chk_terminal_state_immutable CHECK (
+        -- This constraint is documentation; actual enforcement is via the UPDATE WHERE clause.
+        -- Postgres CHECK constraints cannot reference OLD values, so this is application-enforced.
+        true
+    )
 );
 
+-- Fix #2: Partial unique index. Completed loops don't block branch resubmission.
+-- Replaces global UNIQUE(branch).
+CREATE UNIQUE INDEX idx_loops_active_branch ON loops(branch)
+    WHERE state NOT IN ('converged', 'hardened', 'shipped', 'failed', 'cancelled');
+
 CREATE INDEX idx_loops_engineer_id ON loops(engineer_id);
-CREATE INDEX idx_loops_status ON loops(status);
-CREATE INDEX idx_loops_branch ON loops(branch);
-CREATE INDEX idx_loops_engineer_status ON loops(engineer_id, status);
+CREATE INDEX idx_loops_state ON loops(state);
+CREATE INDEX idx_loops_active ON loops(state)
+    WHERE state NOT IN ('converged', 'hardened', 'shipped', 'failed', 'cancelled');
+CREATE INDEX idx_loops_engineer_state ON loops(engineer_id, state);
 
 CREATE TABLE jobs (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     loop_id         UUID NOT NULL REFERENCES loops(id) ON DELETE CASCADE,
     stage           loop_stage NOT NULL,
     round           INTEGER NOT NULL,
-    k8s_job_name    TEXT NOT NULL UNIQUE,
+    attempt         INTEGER NOT NULL DEFAULT 1,  -- retry tracking; increments per retry within same stage+round
+    k8s_job_name    TEXT NOT NULL,                -- format: nemo-{loop_id_short}-{stage}-r{round}-t{attempt}
     status          job_status NOT NULL DEFAULT 'pending',
     started_at      TIMESTAMPTZ,
     completed_at    TIMESTAMPTZ,
     verdict_json    JSONB,        -- review/audit verdict, NULL for non-review jobs
+    output_json     JSONB,        -- stage output: verdict, test results, affected_services, new SHA, session_id
     token_usage     JSONB,        -- {"input": N, "output": N}
     exit_code       INTEGER,
     error_message   TEXT,
+    feedback_path   TEXT,         -- path to feedback file for this job (stored, not reconstructed)
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Fix #9: k8s_job_name unique per (loop_id, stage, round, attempt), not globally unique.
+-- This prevents collision on retry while still enabling idempotent reconciliation.
+CREATE UNIQUE INDEX idx_jobs_k8s_job_name ON jobs(k8s_job_name);
+CREATE UNIQUE INDEX idx_jobs_loop_stage_round_attempt ON jobs(loop_id, stage, round, attempt);
 CREATE INDEX idx_jobs_loop_id ON jobs(loop_id);
 CREATE INDEX idx_jobs_status ON jobs(status);
-CREATE INDEX idx_jobs_k8s_job_name ON jobs(k8s_job_name);
 
 CREATE TABLE egress_logs (
-    id          BIGSERIAL PRIMARY KEY,
-    job_id      UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-    timestamp   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    destination TEXT NOT NULL,     -- hostname or IP
-    bytes       BIGINT NOT NULL,
-    method      TEXT NOT NULL      -- HTTP method or 'TCP'
+    id              BIGSERIAL PRIMARY KEY,
+    job_id          UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    timestamp       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    host            TEXT NOT NULL,          -- hostname or IP
+    port            INTEGER NOT NULL,       -- destination port
+    protocol        TEXT NOT NULL,          -- 'HTTP', 'HTTPS', 'TCP', etc.
+    status_code     INTEGER,               -- HTTP status code, NULL for raw TCP
+    bytes_sent      BIGINT NOT NULL DEFAULT 0,
+    bytes_received  BIGINT NOT NULL DEFAULT 0,
+    method          TEXT                   -- HTTP method, NULL for raw TCP
 );
 
 CREATE INDEX idx_egress_logs_job_id ON egress_logs(job_id);
@@ -162,12 +230,38 @@ CREATE TRIGGER trg_jobs_updated_at
 
 #### Column Design Rationale
 
-- `loops.branch` is `UNIQUE` because only one active loop may exist per branch (design doc: "Submitting a spec that maps to an existing active branch is rejected").
+- `loops.branch` uses a **partial unique index** on active states only (`WHERE state NOT IN ('converged', 'hardened', 'shipped', 'failed', 'cancelled')`). This replaces the old global `UNIQUE(branch)` which blocked resubmission of completed branches. Only one active loop may exist per branch; completed loops don't block new submissions.
+- `loops.state` replaces the old `loop_status`. The full enum matches Lane A's implementation: pending, hardening, awaiting_approval, implementing, testing, reviewing, converged, hardened, shipped, failed, paused_remote_ahead, paused_force_deviated, awaiting_reauth, cancelled. The `sub_state` (dispatched/running/completed) tracks K8s Job lifecycle within a state.
+- `loops.paused_from_state` and `loops.reauth_from_state` record which state the loop was in before pausing, enabling correct resume transitions.
+- `loops.expected_sha` and `loops.actual_sha` store the SHA pair for divergence tracking. `expected_sha` is the SHA the control plane last dispatched against; `actual_sha` is the remote SHA observed during divergence detection.
+- `loops.active_job_name` is set BEFORE K8s Job creation and cleared on completion. Lifecycle: (1) write job row + set active_job_name in DB, (2) create K8s Job, (3) on completion, clear active_job_name. This follows the persist-then-dispatch pattern.
+- `loops.stage_retry_count` resets to 0 on stage transition. Retry budget is per-stage, not per-loop (Lane A learning: per-loop retry counts mask stage-specific flakiness).
+- `loops.feedback_path` stores the feedback file path directly rather than reconstructing it from convention. This avoids stale-path bugs discovered in Lane A (rounds 7, 8, 13).
 - `loops.sha` is `NOT NULL`. When a loop is created, the branch is created from the base branch tip, and `sha` is set to that SHA immediately.
+- `loops.ship_mode`, `loops.max_rounds_for_auto_merge`, `loops.merge_strategy`: ship mode fields from Lane A. When `ship_mode = true` and the loop converges within `max_rounds_for_auto_merge` rounds, the control plane auto-merges using `merge_strategy`.
+- `loops.pr_url` and `loops.merge_sha`: persisted to avoid re-querying GitHub. Set when PR is created / merged respectively.
+- `loops.ci_check_started_at`: timestamp for non-blocking CI polling. Set when CI check is initiated; the reconciler polls GitHub until CI completes or times out.
+- `jobs.output_json` is JSONB containing stage output: verdict, test results, `affected_services` (computed from git diff by the control plane per Lane C decision), new SHA, session ID. This is the structured result of the job, separate from `verdict_json` (which is the review verdict specifically).
+- `jobs.attempt` tracks retry attempts within the same stage+round. Job name format: `nemo-{loop_id_short}-{stage}-r{round}-t{attempt}`. The unique index on `(loop_id, stage, round, attempt)` prevents collision on retry.
+- `jobs.feedback_path` stores the feedback file path for this specific job.
 - `jobs.verdict_json` is JSONB (not a separate table) because the verdict schema is owned by the agent image and may evolve. Structured querying of verdicts is not a V1 requirement.
 - `jobs.k8s_job_name` is `UNIQUE` to enable idempotent reconciliation: if the control plane restarts, it can match running K8s jobs back to DB rows.
 - `engineers.model_preferences` is JSONB (`{"implementor": "claude-opus-4", "reviewer": "gpt-5.4"}`) because model names are free-form strings that change frequently.
-- `egress_logs` uses `BIGSERIAL` because it is append-only, high-volume, and never updated.
+- `egress_logs` uses `BIGSERIAL` because it is append-only, high-volume, and never updated. Split into `host`, `port`, `bytes_sent`, `bytes_received`, `protocol`, `status_code` for structured querying and alerting.
+
+#### Terminal State Protection
+
+Terminal states (`converged`, `hardened`, `shipped`, `failed`, `cancelled`) must never be overwritten. Enforced at the application layer:
+
+```sql
+-- All state transitions use this pattern:
+UPDATE loops SET state = $new_state, updated_at = now()
+WHERE id = $loop_id AND state NOT IN ('converged', 'hardened', 'shipped', 'failed', 'cancelled')
+RETURNING id;
+-- If RETURNING yields no rows, the transition is rejected (loop already terminal).
+```
+
+This was a Lane A convergence learning (round 18): cancel/fail transitions could overwrite terminal states, causing ghost loops.
 
 #### Migration Strategy
 
@@ -198,14 +292,23 @@ pub struct BareRepo {
 
 **Lifecycle of a job's git operations:**
 
-1. Loop engine calls `bare_repo.fetch_and_resolve(branch)` -- acquires mutex, runs `git fetch --prune`, resolves branch ref to a SHA, holds mutex
-2. Loop engine calls `bare_repo.create_worktree(sha)` -- creates worktree at the resolved SHA (mutex still held), then releases mutex
-3. K8s job runs inside the worktree
-4. On job completion, loop engine calls `bare_repo.delete_worktree(path)` -- acquires mutex, runs `git worktree remove --force`, then `git worktree prune`, releases mutex
+1. Loop engine calls `bare_repo.prepare_worktree(branch, base_ref)` (fix #7: atomic API combining fetch_and_resolve + create_worktree):
+   - Acquires worktree mutex
+   - Runs `git fetch --prune`
+   - Resolves `base_ref` to a SHA
+   - Creates worktree at the resolved SHA in detached HEAD mode: `git worktree add --detach <path> <sha>`
+   - Inside the worktree, creates the named branch: `git checkout -b agent/{branch}` (fix #3)
+   - Returns `WorktreeLease { path, sha, branch }`. Mutex released when lease is dropped.
+2. K8s job runs inside the worktree. Agent commits to the named branch (`agent/{branch}`), not detached HEAD.
+3. On job completion, loop engine calls `bare_repo.delete_worktree(path)` -- acquires mutex, runs `git worktree remove --force`, then `git worktree prune`, releases mutex
 
-**Why fetch and worktree creation share the mutex:** Without this, a concurrent fetch could update the ref between our fetch and worktree creation, causing the worktree to check out a different SHA than intended. By holding the mutex across fetch + SHA resolution + worktree creation, we guarantee the worktree is created at the exact SHA we resolved.
+**Why `prepare_worktree` is a single atomic API (fix #7):** The old two-step `fetch_and_resolve()` + `create_worktree()` required the caller to hold the mutex correctly. `prepare_worktree(branch, base_ref) -> WorktreeLease` encapsulates the entire sequence: acquire mutex, fetch, resolve, create worktree at detached HEAD, checkout named branch. The mutex is released when the `WorktreeLease` is dropped (RAII pattern). This eliminates the class of bugs where the caller forgets to hold the mutex or drops it between steps.
+
+**Detached HEAD then named branch (fix #3):** The worktree is created at the resolved SHA in detached HEAD mode (`git worktree add --detach`), then `git checkout -b agent/{branch}` creates the named branch inside the worktree. This ensures: (1) the worktree starts at the exact resolved SHA, (2) the agent commits to a named branch (not detached HEAD), and (3) `git push origin agent/{branch}` works without extra refspec configuration.
 
 **Why mutex instead of async semaphore:** `git worktree add` takes a file lock on the bare repo (`.git/worktrees/`). Concurrent calls block at the filesystem level anyway. The mutex makes the serialization explicit and avoidable (no spawning N processes that all block on the same file lock).
+
+**Fetch strategy (fix #12):** All fetches happen per-job via `prepare_worktree()`. There is no background CronJob for fetching. Lane C's fetch CronJob design is superseded by this per-job fetch approach. This ensures the worktree always reflects the latest remote state at dispatch time.
 
 #### Branch Naming
 
@@ -233,7 +336,7 @@ pub enum DivergenceResult {
     /// Histories diverged (force push or rebase). Resuming discards local commits.
     /// Always pauses (status → paused_force_deviated). Requires `nemo resume --force`.
     ForceDeviated { local_sha: String, remote_sha: String },
-    /// Branch deleted on remote.
+    /// Branch deleted on remote. Recovery: cancel only (branch is gone, work is lost).
     RemoteGone,
 }
 
@@ -248,19 +351,19 @@ Detection method: compare `refs/heads/{branch}` against `refs/remotes/origin/{br
 - If neither is ancestor: `ForceDeviated` (histories diverged).
 - If the remote ref doesn't exist: `RemoteGone`.
 
-On `RemoteAhead`: set `loops.status = 'paused_remote_ahead'`, write the SHA mismatch to the loop record. The API exposes this so the CLI can show "Engineer pushed new commits. `nemo resume <loop-id>` to fast-forward or `nemo cancel <loop-id>`."
+On `RemoteAhead`: set `loops.state = 'paused_remote_ahead'`, `loops.paused_from_state` to the current state, write the SHA mismatch to the loop record. The API exposes this so the CLI can show "Engineer pushed new commits. `nemo resume <loop-id>` to fast-forward or `nemo cancel <loop-id>`."
 
-On `ForceDeviated`: set `loops.status = 'paused_force_deviated'`, write the SHA mismatch to the loop record. The API exposes this so the CLI can show "Branch histories diverged. `nemo resume --force <loop-id>` (discards agent work) or `nemo cancel <loop-id>`."
+On `ForceDeviated`: set `loops.state = 'paused_force_deviated'`, `loops.paused_from_state` to the current state, write the SHA mismatch to the loop record. The API exposes this so the CLI can show "Branch histories diverged. `nemo resume --force <loop-id>` (discards agent work) or `nemo cancel <loop-id>`."
 
-On `RemoteGone`: treat as `ForceDeviated` (someone deleted the branch). Same pause behavior.
+On `RemoteGone` (fix #8): the branch was deleted on the remote. The work is gone. Recovery: cancel only. `nemo cancel <loop-id>` transitions to `cancelled`. Resume is not possible because the branch no longer exists. The CLI shows: "Branch '{branch}' was deleted on the remote. Use `nemo cancel <loop-id>` to cancel this loop."
 
 **paused_remote_ahead resume flow:**
-- `nemo resume <loop-id>`: re-fetches, fast-forwards `loops.sha` to current remote branch tip (no agent work is lost), re-dispatches the current stage. Transitions to `running`.
+- `nemo resume <loop-id>`: re-fetches, fast-forwards `loops.sha` to current remote branch tip (no agent work is lost), re-dispatches the current stage. Transitions back to `paused_from_state`.
 - `nemo cancel <loop-id>`: transitions to `cancelled`.
 - No other transitions are valid from `paused_remote_ahead`.
 
 **paused_force_deviated resume flow:**
-- `nemo resume --force <loop-id>`: shows which local commits will be discarded, then re-fetches and resets `loops.sha` to current remote branch tip, re-dispatches the current stage. Transitions to `running`. Without `--force`, the command is rejected with an explanation of what will be lost.
+- `nemo resume --force <loop-id>`: shows which local commits will be discarded, then re-fetches and resets `loops.sha` to current remote branch tip, re-dispatches the current stage. Transitions back to `paused_from_state`. Without `--force`, the command is rejected with an explanation of what will be lost.
 - `nemo cancel <loop-id>`: transitions to `cancelled`.
 - No other transitions are valid from `paused_force_deviated`.
 
@@ -278,6 +381,16 @@ control-plane/src/config/
 #### Structs
 
 ```rust
+// Fix #15: Cluster config TOML has a [cluster] wrapper.
+// File format:
+//   [cluster]
+//   domain = "nemo.example.com"
+//   max_cluster_jobs = 20
+#[derive(Deserialize)]
+pub struct ClusterFile {
+    pub cluster: ClusterConfig,
+}
+
 #[derive(Deserialize)]
 pub struct ClusterConfig {
     pub node_size: Option<String>,
@@ -286,7 +399,7 @@ pub struct ClusterConfig {
     pub default_implementor: Option<String>,
     pub default_reviewer: Option<String>,
     pub max_parallel_loops_cap: Option<u32>,  // hard ceiling per engineer
-    pub max_cluster_jobs: Option<u32>,        // hard ceiling cluster-wide; enforced by loop engine via SELECT COUNT(*) FOR UPDATE within a transaction before dispatching (dispatch lock prevents TOCTOU)
+    pub max_cluster_jobs: Option<u32>,        // hard ceiling cluster-wide; enforced via pg_advisory_xact_lock (fix #11)
 }
 
 #[derive(Deserialize)]
@@ -330,7 +443,7 @@ impl MergedConfig {
 For each scalar field, take the highest-priority non-None value. For limits, apply `min(engineer_value, cluster_cap)`. If a required field (like `implementor_model`) is None at all three layers, return `ConfigError::MissingField { field, role }`.
 
 **Collection merge rules:**
-- `services` HashMap: deep merge. Repo defines services; engineer cannot override existing service configs, only add new services. If engineer defines a service with the same key as one already defined in the repo config, it is silently ignored (repo wins for services).
+- `services` HashMap: deep merge. Repo defines services; engineer cannot override existing service configs, only add new services. If engineer defines a service with the same key as one already defined in the repo config, it is ignored (repo wins for services) **with a validation warning surfaced by `nemo config` and `nemo start`** (fix #17: no longer silent).
 - `models`: last-writer-wins. Engineer overrides repo, repo overrides cluster.
 
 **Model preferences authority:** `~/.nemo/config.toml` is authoritative for model preferences. The `engineers` table stores a JSONB cache that is synced on `nemo auth`. On conflict, the config file wins.
@@ -363,6 +476,31 @@ Scan depth: configurable via `nemo init --depth N` (default 2, i.e., monorepo ro
 
 `nemo init` writes the generated `nemo.toml` to stdout and prompts the engineer to review before writing to disk. It never overwrites an existing `nemo.toml` without `--force`.
 
+### Dispatch Locking (fix #11)
+
+The `max_cluster_jobs` limit must be enforced atomically. The dispatch transaction uses a Postgres advisory lock:
+
+```sql
+BEGIN;
+SELECT pg_advisory_xact_lock(42);  -- only one dispatcher at a time
+SELECT COUNT(*) FROM jobs WHERE status IN ('pending', 'running') AS active_count;
+-- If active_count >= max_cluster_jobs, abort (ROLLBACK)
+-- Otherwise, INSERT the new job row, set loops.active_job_name, COMMIT
+-- Advisory lock released automatically on COMMIT/ROLLBACK
+```
+
+This replaces the old `SELECT COUNT(*) ... FOR UPDATE` approach which required a dedicated "dispatch lock" row. The advisory lock is simpler and prevents TOCTOU races between counting and inserting.
+
+### Persist-Then-Dispatch Pattern (Lane A learning)
+
+All dispatch operations follow this sequence:
+
+1. **Persist:** Write the job row to `jobs` table, set `loops.active_job_name` and `loops.sub_state = 'dispatched'` in a single transaction.
+2. **Create:** Create the K8s Job. If creation fails, the DB row exists and the reconciler will retry.
+3. **Never:** create a K8s Job without a corresponding DB row. Orphaned jobs are unrecoverable.
+
+This was the #1 systemic bug pattern in Lane A (round 19: 8 call sites created K8s resources before persisting state).
+
 ## Edge Cases
 
 | Scenario | Expected Behavior |
@@ -371,9 +509,13 @@ Scan depth: configurable via `nemo init --depth N` (default 2, i.e., monorepo ro
 | `git fetch` fails (network error, auth failure) | Job dispatch is retried with backoff (30s, 120s). After 3 failures, loop is marked `failed` with `error_message = "fetch failed: {reason}"`. |
 | Disk full during `create_worktree` | `git worktree add` returns non-zero. Control plane logs the error, marks the job `failed`, retries once after 60s (in case temp files were cleaned). On second failure, loop fails. |
 | Bare repo corruption (bad objects, broken refs) | Detected by non-zero exit from git commands. Control plane logs error and marks loop `failed`. Recovery: manual re-clone of bare repo (out of scope for V1 auto-recovery). |
-| Two loops submitted for the same spec by the same engineer | Second submission rejected: `loops.branch` UNIQUE constraint prevents duplicate. API returns 409 Conflict with message "Active loop already exists for branch {branch}". |
+| Two loops submitted for the same spec by the same engineer | Second submission rejected by partial unique index `idx_loops_active_branch` (active states only). API returns 409 Conflict with message "Active loop already exists for branch {branch}". Completed/failed/cancelled loops do not block resubmission (fix #2, #18). |
 | Engineer pushes to agent branch during active loop (fast-forward) | Detected as `RemoteAhead` by `detect_divergence()`. Loop paused (`paused_remote_ahead`). Engineer uses `nemo resume <loop-id>` to fast-forward (no work lost). |
 | Engineer force-pushes to agent branch during active loop | Detected as `ForceDeviated` by `detect_divergence()`. Loop paused (`paused_force_deviated`). Engineer must `nemo resume --force <loop-id>` (discards agent commits, accepts remote state) or `nemo cancel <loop-id>`. |
+| Engineer deletes agent branch on remote | Detected as `RemoteGone` by `detect_divergence()`. Loop transitions to `cancelled`. No resume possible (branch is gone, work is lost). |
+| Resubmitting a spec after previous loop completed | Allowed: partial unique index only blocks active loops. New loop created with fresh branch. |
+| K8s Job returns malformed/unparseable results | Job status set to `errored`. Loop engine treats as retryable up to `stage_retry_count` limit. |
+| Credential expires during active loop | State transitions to `awaiting_reauth`, `reauth_from_state` records prior state. Engineer re-auths via `nemo auth`, loop resumes from `reauth_from_state`. |
 | `nemo.toml` has unknown fields | `toml` deserialization with `#[serde(deny_unknown_fields)]` returns a parse error naming the unknown field. This catches typos early. |
 | `nemo.toml` references a service path that doesn't exist | Validated at config load time. Error: "Service '{name}' path '{path}' does not exist in the repo." |
 | Engineer config sets model to empty string | Treated as None (not set). The merge algorithm skips empty strings. |
@@ -389,7 +531,7 @@ Scan depth: configurable via `nemo init --depth N` (default 2, i.e., monorepo ro
 | Migration version conflict (two developers add same timestamp) | `sqlx migrate` detects duplicate | Startup fails. Developer must renumber the migration. |
 | `git worktree add` returns non-zero | Exit code check after `Command::new("git")` | Release mutex, return `GitError::WorktreeCreateFailed { stderr }` |
 | TOML parse error in any config layer | `toml::from_str` returns error | Return `ConfigError::ParseFailed { layer, path, detail }` with the exact line and column |
-| Branch name collision (two specs produce same slug-hash) | `loops.branch` UNIQUE constraint | API returns 409. Astronomically unlikely with 8-char hex hash (4 billion combinations) but handled. |
+| Branch name collision (two specs produce same slug-hash) | Partial unique index `idx_loops_active_branch` | API returns 409 for active loops only. Astronomically unlikely with 8-char hex hash (4 billion combinations) but handled. |
 | Worktree path already exists (stale from crash) | `git worktree add` fails | Delete stale path, run `git worktree prune`, retry once. If retry fails, return error. |
 
 ## Out of Scope
@@ -407,32 +549,52 @@ Scan depth: configurable via `nemo init --depth N` (default 2, i.e., monorepo ro
 
 - [ ] `sqlx migrate run` applies all migrations to a fresh Postgres 15+ database without errors
 - [ ] `cargo sqlx prepare --check` passes in CI (offline query verification)
-- [ ] `BareRepo::fetch_and_resolve()` acquires mutex, pulls new commits from remote, resolves ref to SHA, and holds mutex until worktree creation completes
-- [ ] `BareRepo::create_worktree()` returns a valid worktree path checked out at the specified SHA (not a branch ref)
+- [ ] `BareRepo::prepare_worktree(branch, base_ref)` atomically fetches, resolves SHA, creates worktree at detached HEAD, checks out named branch, and returns `WorktreeLease`
+- [ ] Worktree is created at exact resolved SHA; agent commits to `agent/{branch}` (not detached HEAD)
+- [ ] `WorktreeLease` drop releases the worktree mutex (RAII)
 - [ ] `BareRepo::delete_worktree()` removes the worktree directory and cleans up `.git/worktrees` metadata
-- [ ] Concurrent `create_worktree` calls are serialized (second call waits for first to complete, no git lock errors)
+- [ ] Concurrent `prepare_worktree` calls are serialized (second call waits for first to complete, no git lock errors)
 - [ ] Branch names match pattern `agent/{engineer}/{slug}-{hash}` for all valid inputs
-- [ ] `detect_divergence()` returns `RemoteAhead` when engineer fast-forward-pushed, `ForceDeviated` when histories diverged, and `LocalAhead` for normal agent operation
-- [ ] `RemoteAhead` sets status to `paused_remote_ahead`; `ForceDeviated` sets status to `paused_force_deviated`
+- [ ] `detect_divergence()` returns `RemoteAhead` when engineer fast-forward-pushed, `ForceDeviated` when histories diverged, `LocalAhead` for normal agent operation, and `RemoteGone` when branch is deleted
+- [ ] `RemoteAhead` sets state to `paused_remote_ahead` with `paused_from_state` recorded; `ForceDeviated` sets state to `paused_force_deviated`
+- [ ] `RemoteGone` transitions to `cancelled` (no resume possible)
 - [ ] `nemo resume <loop-id>` fast-forwards on `paused_remote_ahead` (no `--force` required)
 - [ ] `nemo resume --force <loop-id>` required for `paused_force_deviated`; without `--force`, command is rejected with explanation of data loss
 - [ ] `nemo resume` on `paused_force_deviated` without `--force` shows which commits will be discarded
+- [ ] Partial unique index `idx_loops_active_branch` allows resubmission of completed/failed/cancelled branches
+- [ ] Phase/stage CHECK constraint rejects invalid combinations (e.g., harden + implementing)
+- [ ] Terminal state protection: UPDATE with `WHERE state NOT IN (terminal states)` returns 0 rows when loop is already terminal
 - [ ] `ON DELETE CASCADE` propagates from loops to jobs and from jobs to egress_logs
 - [ ] `egress_logs` retention: records older than 30 days are pruned by scheduled task
+- [ ] `egress_logs` columns: host, port, protocol, status_code, bytes_sent, bytes_received, method
 - [ ] `updated_at` triggers fire on row updates for both loops and jobs tables
-- [ ] `max_cluster_jobs` in ClusterConfig is enforced via `SELECT COUNT(*) ... FOR UPDATE` within a transaction (dispatch lock prevents TOCTOU)
-- [ ] When `harden_only` loop converges harden phase, status transitions to `converged` (phase stays `harden`)
-- [ ] When non-`harden_only` loop converges harden phase, status stays `running` and phase transitions to `implement` (after approval)
+- [ ] `max_cluster_jobs` in ClusterConfig is enforced via `pg_advisory_xact_lock(42)` in the dispatch transaction
+- [ ] `jobs.output_json` stores stage output including `affected_services` (computed from git diff)
+- [ ] `jobs.attempt` increments on retry; job name format `nemo-{loop_id_short}-{stage}-r{round}-t{attempt}`
+- [ ] `jobs.feedback_path` stores feedback file path (not reconstructed)
+- [ ] `loops.stage_retry_count` resets to 0 on stage transition
+- [ ] `loops.active_job_name` is set BEFORE K8s Job creation, cleared on completion (persist-then-dispatch)
+- [ ] `loops.ship_mode`, `max_rounds_for_auto_merge`, `merge_strategy` control auto-merge behavior
+- [ ] `loops.pr_url` set on PR creation; `loops.merge_sha` set on merge
+- [ ] `loops.ci_check_started_at` set when CI polling begins
+- [ ] `loops.expected_sha` and `actual_sha` set on divergence detection
+- [ ] `job_status` enum includes `errored` variant for malformed results
+- [ ] Cluster config TOML parsed with `[cluster]` wrapper (`ClusterFile { cluster: ClusterConfig }`)
+- [ ] CLI validates `nemo.toml` locally before submit; API revalidates; missing repo config at dispatch is terminal failure
+- [ ] Service key collision in engineer config produces a warning in `nemo config` and `nemo start` (not silent)
+- [ ] When `harden_only` loop converges harden phase, state transitions to `hardened` (phase stays `harden`)
+- [ ] When non-`harden_only` loop converges harden phase, state transitions to `awaiting_approval` until engineer approves
 - [ ] `MergedConfig::merge()` correctly applies three-layer override: engineer > repo > cluster
-- [ ] `MergedConfig::merge()` silently ignores engineer-defined services that collide with repo-defined service keys (repo wins)
+- [ ] `MergedConfig::merge()` warns on engineer-defined services that collide with repo-defined service keys (repo wins)
 - [ ] `MergedConfig::merge()` caps engineer `max_parallel_loops` at cluster `max_parallel_loops_cap`
 - [ ] `MergedConfig::merge()` returns `ConfigError::MissingField` when no model is configured for a required role
 - [ ] `nemo init` detects at least `Cargo.toml`, `package.json`, and `go.mod` in a test monorepo and generates correct `[services.*]` TOML
 - [ ] `nemo init` refuses to overwrite existing `nemo.toml` without `--force`
 - [ ] Control plane starts successfully with only cluster config (no repo or engineer config loaded at boot)
 - [ ] Control plane refuses to start if Postgres is unreachable or migrations fail
+- [ ] No background fetch CronJob; all fetches are per-job via `prepare_worktree()`
 
 ## Open Questions
 
 - [x] Should `egress_logs` be stored in Postgres or shipped to a separate log sink (e.g., file-based, rotated)? **Decision: Postgres, with 30-day retention.** `egress_logs` rows older than 30 days are auto-pruned by a scheduled task. `ON DELETE CASCADE` from jobs ensures cleanup on loop deletion.
-- [ ] Should the `loops` table track `affected_services` (JSONB array) to enable filtering loops by service on the dashboard? Not needed for V1 loop execution but useful for `nemo status --service api`.
+- [x] Should the `loops` table track `affected_services` (JSONB array) to enable filtering loops by service on the dashboard? **Decision: `affected_services` is computed from git diff by the control plane (Lane C decision) and stored in `jobs.output_json`, not as a top-level loops column.** The control plane computes it at job completion time from the git diff.
