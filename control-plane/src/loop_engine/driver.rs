@@ -37,6 +37,18 @@ impl ConvergentLoopDriver {
         }
     }
 
+    /// Build the K8s job configuration from cluster config.
+    fn job_build_config(&self) -> job_builder::JobBuildConfig {
+        job_builder::JobBuildConfig {
+            namespace: self.config.cluster.jobs_namespace.clone(),
+            agent_image: self.config.cluster.agent_image.clone(),
+            sidecar_image: self.config.cluster.sidecar_image.clone(),
+            bare_repo_pvc: self.config.cluster.bare_repo_pvc.clone(),
+            sessions_pvc: self.config.cluster.sessions_pvc.clone(),
+            image_pull_secret: self.config.cluster.image_pull_secret.clone(),
+        }
+    }
+
     /// Run one tick of the loop state machine for the given loop.
     /// All state writes happen within this function.
     /// Returns the new state after the tick.
@@ -93,9 +105,7 @@ impl ConvergentLoopDriver {
             let job = job_builder::build_job(
                 &ctx,
                 &stage_config,
-                &self.config.cluster.jobs_namespace,
-                &self.config.cluster.agent_image,
-                &self.config.cluster.bare_repo_pvc,
+                &self.job_build_config(),
             );
             self.persist_then_dispatch(&mut updated, "audit", &job).await?;
 
@@ -461,9 +471,7 @@ impl ConvergentLoopDriver {
         let job = job_builder::build_job(
             &ctx,
             &stage_config,
-            &self.config.cluster.jobs_namespace,
-            &self.config.cluster.agent_image,
-            &self.config.cluster.bare_repo_pvc,
+            &self.job_build_config(),
         );
         self.persist_then_dispatch(record, "test", &job).await?;
 
@@ -907,9 +915,7 @@ impl ConvergentLoopDriver {
         let job = job_builder::build_job(
             &ctx,
             &stage_config,
-            &self.config.cluster.jobs_namespace,
-            &self.config.cluster.agent_image,
-            &self.config.cluster.bare_repo_pvc,
+            &self.job_build_config(),
         );
         self.persist_then_dispatch(&mut updated, "implement", &job).await?;
 
@@ -928,9 +934,7 @@ impl ConvergentLoopDriver {
         let job = job_builder::build_job(
             &ctx,
             &stage_config,
-            &self.config.cluster.jobs_namespace,
-            &self.config.cluster.agent_image,
-            &self.config.cluster.bare_repo_pvc,
+            &self.job_build_config(),
         );
         self.persist_then_dispatch(record, "audit", &job).await?;
 
@@ -947,9 +951,7 @@ impl ConvergentLoopDriver {
         let job = job_builder::build_job(
             &ctx,
             &stage_config,
-            &self.config.cluster.jobs_namespace,
-            &self.config.cluster.agent_image,
-            &self.config.cluster.bare_repo_pvc,
+            &self.job_build_config(),
         );
         self.persist_then_dispatch(record, "revise", &job).await?;
 
@@ -967,9 +969,7 @@ impl ConvergentLoopDriver {
         let job = job_builder::build_job(
             &ctx,
             &stage_config,
-            &self.config.cluster.jobs_namespace,
-            &self.config.cluster.agent_image,
-            &self.config.cluster.bare_repo_pvc,
+            &self.job_build_config(),
         );
         self.persist_then_dispatch(record, "review", &job).await?;
 
@@ -1008,9 +1008,7 @@ impl ConvergentLoopDriver {
         let job = job_builder::build_job(
             &ctx,
             &stage_config,
-            &self.config.cluster.jobs_namespace,
-            &self.config.cluster.agent_image,
-            &self.config.cluster.bare_repo_pvc,
+            &self.job_build_config(),
         );
         self.persist_then_dispatch(record, "implement", &job).await?;
 
@@ -1077,9 +1075,7 @@ impl ConvergentLoopDriver {
         let job = job_builder::build_job(
             &ctx,
             &stage_config,
-            &self.config.cluster.jobs_namespace,
-            &self.config.cluster.agent_image,
-            &self.config.cluster.bare_repo_pvc,
+            &self.job_build_config(),
         );
 
         // Persist state FIRST, then create K8s Job

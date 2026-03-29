@@ -258,6 +258,15 @@ pub struct ClusterConfig {
     /// Bare repo PVC claim name.
     #[serde(default = "default_bare_repo_pvc")]
     pub bare_repo_pvc: String,
+    /// Auth sidecar container image.
+    #[serde(default = "default_sidecar_image")]
+    pub sidecar_image: String,
+    /// Session state PVC claim name (FR-47b).
+    #[serde(default = "default_sessions_pvc")]
+    pub sessions_pvc: String,
+    /// Image pull secret name (optional, for private registries).
+    #[serde(default)]
+    pub image_pull_secret: Option<String>,
     /// API server bind address.
     #[serde(default = "default_bind_addr")]
     pub bind_addr: String,
@@ -280,6 +289,9 @@ impl Default for ClusterConfig {
             system_namespace: default_system_namespace(),
             agent_image: default_agent_image(),
             bare_repo_pvc: default_bare_repo_pvc(),
+            sidecar_image: default_sidecar_image(),
+            sessions_pvc: default_sessions_pvc(),
+            image_pull_secret: None,
             bind_addr: default_bind_addr(),
             port: default_port(),
             max_connections: default_max_connections(),
@@ -301,7 +313,13 @@ fn default_agent_image() -> String {
     "nemo-agent:latest".to_string()
 }
 fn default_bare_repo_pvc() -> String {
-    "bare-repo-pvc".to_string()
+    "nemo-bare-repo".to_string()
+}
+fn default_sidecar_image() -> String {
+    "nemo-sidecar:latest".to_string()
+}
+fn default_sessions_pvc() -> String {
+    "nemo-sessions".to_string()
 }
 fn default_bind_addr() -> String {
     "0.0.0.0".to_string()
