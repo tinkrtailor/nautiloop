@@ -24,6 +24,18 @@ pub async fn start(
     State(state): State<AppState>,
     Json(req): Json<StartRequest>,
 ) -> Result<impl IntoResponse, NemoError> {
+    // Validate engineer name: must be non-empty, alphanumeric + hyphens only
+    if req.engineer.is_empty()
+        || !req
+            .engineer
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(NemoError::Internal(
+            "engineer must be non-empty and contain only alphanumeric, hyphen, or underscore characters".to_string(),
+        ));
+    }
+
     // If ship_mode, check that ship is allowed in config
     if req.ship_mode && !state.config.ship.allowed {
         return Err(NemoError::ShipNotEnabled);

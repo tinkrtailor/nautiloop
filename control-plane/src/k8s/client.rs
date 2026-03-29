@@ -140,11 +140,14 @@ impl JobDispatcher for KubeJobDispatcher {
     }
 }
 
-/// Extract the exit code from a pod's first terminated container.
+/// Extract the exit code from the pod's `agent` container specifically.
+/// In a multi-container pod we must not mis-tag from the sidecar container.
 fn extract_exit_code(pod: &Pod) -> Option<i32> {
     let status = pod.status.as_ref()?;
     for cs in status.container_statuses.as_ref()? {
-        if let Some(ref terminated) = cs.state.as_ref()?.terminated {
+        if cs.name == "agent"
+            && let Some(ref terminated) = cs.state.as_ref()?.terminated
+        {
             return Some(terminated.exit_code);
         }
     }

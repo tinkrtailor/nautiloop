@@ -8,7 +8,8 @@ use crate::k8s::job_builder;
 use crate::k8s::{JobDispatcher, JobStatus};
 use crate::state::StateStore;
 use crate::types::verdict::{
-    AuditVerdict, FeedbackFile, FeedbackSource, ReviewVerdict, TestOutput, TestResultData,
+    AuditVerdict, FeedbackFile, FeedbackSource, ReviewResultData, ReviewVerdict, TestOutput,
+    TestResultData,
 };
 use crate::types::{
     LoopContext, LoopKind, LoopRecord, LoopState, RoundRecord, StageConfig, SubState,
@@ -332,10 +333,19 @@ impl ConvergentLoopDriver {
 
         match stage_name {
             "audit" => {
-                // Parse audit verdict from the round output
-                let verdict: Option<AuditVerdict> = last_round
-                    .and_then(|r| r.output.as_ref())
-                    .and_then(|v| serde_json::from_value(v.clone()).ok());
+                // Parse audit verdict from the round output.
+                // Try ReviewResultData envelope first (has .verdict field),
+                // then fall back to direct AuditVerdict for backward compat.
+                let verdict: Option<AuditVerdict> =
+                    last_round.and_then(|r| r.output.as_ref()).and_then(|v| {
+                        // New shape: { verdict: {...}, token_usage: {...}, ... }
+                        if let Ok(rd) = serde_json::from_value::<ReviewResultData>(v.clone()) {
+                            serde_json::from_value(rd.verdict).ok()
+                        } else {
+                            // Legacy: direct AuditVerdict at top level
+                            serde_json::from_value(v.clone()).ok()
+                        }
+                    });
 
                 match verdict {
                     Some(v) if v.clean => {
@@ -467,7 +477,30 @@ impl ConvergentLoopDriver {
         record.retry_count = 0; // Reset per-stage retry budget
 
         let stage_config = self.test_stage_config();
-        let ctx = self.build_context(record).await?;
+        let mut ctx = self.build_context(record).await?;
+
+        // Inject affected_services for the TEST stage (FR-42a).
+        // V1: test all configured services. A future version can narrow this
+        // via git diff analysis against the changed file paths.
+        let service_names: Vec<String> = self.config.services.keys().cloned().collect();
+        let services_json =
+            serde_json::to_string(&service_names).unwrap_or_else(|_| "[]".to_string());
+        ctx.credentials
+            .push(("affected_services".to_string(), services_json));
+
+        // Inject service_tags for JVM resource escalation (FR-28)
+        let all_tags: Vec<String> = self
+            .config
+            .services
+            .values()
+            .flat_map(|s| s.tags.iter().cloned())
+            .collect();
+        if !all_tags.is_empty() {
+            let tags_json = serde_json::to_string(&all_tags).unwrap_or_else(|_| "[]".to_string());
+            ctx.credentials
+                .push(("service_tags".to_string(), tags_json));
+        }
+
         let job = job_builder::build_job(&ctx, &stage_config, &self.job_build_config());
         self.persist_then_dispatch(record, "test", &job).await?;
 
@@ -567,9 +600,16 @@ impl ConvergentLoopDriver {
             .iter()
             .rfind(|r| r.round == record.round && r.stage == "review");
 
-        let verdict: Option<ReviewVerdict> = review_round
-            .and_then(|r| r.output.as_ref())
-            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        // Try ReviewResultData envelope first (has .verdict field),
+        // then fall back to direct ReviewVerdict for backward compat.
+        let verdict: Option<ReviewVerdict> =
+            review_round.and_then(|r| r.output.as_ref()).and_then(|v| {
+                if let Ok(rd) = serde_json::from_value::<ReviewResultData>(v.clone()) {
+                    serde_json::from_value(rd.verdict).ok()
+                } else {
+                    serde_json::from_value(v.clone()).ok()
+                }
+            });
 
         match verdict {
             Some(v) if v.clean => {

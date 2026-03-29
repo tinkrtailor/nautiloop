@@ -168,13 +168,21 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // Handle config command before loading config — a broken config file
+    // must not prevent `nemo config --set` from working.
+    if let Commands::Config { ref set, ref get } = cli.command {
+        return commands::config::run(set.clone(), get.clone());
+    }
+
     let eng_config = config::load_config()?;
 
     let server_url = cli.server.unwrap_or(eng_config.server_url.clone());
 
     let insecure =
         cli.insecure || matches!(std::env::var("NEMO_INSECURE").as_deref(), Ok("true" | "1"));
-    let http_client = client::NemoClient::new(&server_url, eng_config.api_key.as_deref(), insecure);
+    let http_client =
+        client::NemoClient::new(&server_url, eng_config.api_key.as_deref(), insecure)?;
 
     // Validate engineer is configured for commands that need it
     // Status --team doesn't need engineer

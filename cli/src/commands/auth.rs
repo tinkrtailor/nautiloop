@@ -98,14 +98,23 @@ pub async fn run(
             }
         };
 
-        // For claude/openai, validate JSON. For SSH, it's a PEM key.
-        if *provider != "ssh"
-            && serde_json::from_str::<serde_json::Value>(&content).is_err()
-            && content.trim().is_empty()
-        {
+        if content.trim().is_empty() {
             eprintln!("Error: {provider} credentials at {cred_path} are empty");
             any_error = true;
             continue;
+        }
+
+        // For claude/openai, validate content is either valid JSON or a raw API key string.
+        // Reject obviously malformed content (e.g. truncated JSON, binary data).
+        if *provider != "ssh" {
+            let trimmed = content.trim();
+            if trimmed.starts_with('{')
+                && serde_json::from_str::<serde_json::Value>(trimmed).is_err()
+            {
+                eprintln!("Error: {provider} credentials at {cred_path} contain malformed JSON");
+                any_error = true;
+                continue;
+            }
         }
 
         // Register credentials with the control plane

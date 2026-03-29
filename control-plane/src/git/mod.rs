@@ -202,11 +202,12 @@ pub mod bare {
                                     ))
                                 })?;
                         }
-                        _ => {
-                            // No PR found — branch is leftover from a previous terminal
-                            // run. Reset to base so we start clean. (If this was a
-                            // transient gh failure, worst case we lose uncommitted
-                            // branch state — but stale artifacts are worse.)
+                        Some("UNKNOWN") => {
+                            // Transient gh failure — don't delete, reuse as-is
+                            tracing::info!(branch, "PR state unknown (transient), reusing branch");
+                        }
+                        None => {
+                            // No PR — stale leftover. Recreate from base.
                             let _ = self.run_git(&["branch", "-D", branch]).await;
                             let _ = self.run_git(&["push", "origin", "--delete", branch]).await;
                             self.run_git(&["branch", branch, &base_ref])
@@ -217,6 +218,7 @@ pub mod bare {
                                     ))
                                 })?;
                         }
+                        _ => unreachable!(),
                     }
                 }
             }
@@ -290,17 +292,18 @@ pub mod bare {
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                // Only treat "no pull requests found" as "no PR exists".
-                // Any other failure (network, auth, rate limit) is transient — return None
-                // but log a warning so the caller doesn't assume no PR exists.
-                if !stderr.contains("no pull requests found") {
-                    tracing::warn!(
-                        branch = branch,
-                        stderr = stderr.trim(),
-                        "gh pr view failed (transient?), treating as unknown PR state"
-                    );
+                if stderr.contains("no pull requests found") {
+                    // Definitive: no PR exists for this branch
+                    return None;
                 }
-                return None;
+                // Transient failure (network, auth, rate limit) — return UNKNOWN
+                // so callers don't treat this the same as "no PR exists".
+                tracing::warn!(
+                    branch = branch,
+                    stderr = stderr.trim(),
+                    "gh pr view failed (transient?), returning UNKNOWN"
+                );
+                return Some("UNKNOWN".to_string());
             }
 
             let state = String::from_utf8_lossy(&output.stdout)

@@ -10,17 +10,16 @@ pub struct NemoClient {
 }
 
 impl NemoClient {
-    pub fn new(base_url: &str, api_key: Option<&str>, insecure: bool) -> Self {
+    pub fn new(base_url: &str, api_key: Option<&str>, insecure: bool) -> Result<Self> {
         let client = Client::builder()
             .danger_accept_invalid_certs(insecure)
-            .build()
-            .expect("Failed to create HTTP client");
+            .build()?;
 
-        Self {
+        Ok(Self {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.map(String::from),
-        }
+        })
     }
 
     fn auth_header(&self) -> Option<String> {
