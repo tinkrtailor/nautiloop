@@ -401,80 +401,102 @@ pub async fn upsert_credentials(
         ));
     }
 
-    // Store metadata in Postgres (provider + validity, not raw secret content)
-    let cred = crate::types::EngineerCredential {
-        id: Uuid::new_v4(),
-        engineer: req.engineer.clone(),
-        provider: req.provider.clone(),
-        credential_ref: "k8s-secret".to_string(), // Reference, not content
-        valid: req.valid,
-        updated_at: chrono::Utc::now(),
+    // Map provider name to K8s Secret key
+    let secret_key = match req.provider.as_str() {
+        "claude" | "anthropic" => "anthropic",
+        "openai" => "openai",
+        "ssh" => "ssh",
+        other => other,
     };
-    state.store.upsert_credential(&cred).await?;
 
-    // Create/update K8s Secret with credential content (never stored in Postgres)
+    // Extract raw API key from credential content.
+    // CLI may send JSON files (e.g. {"api_key":"sk-..."}) or raw key strings.
+    // The sidecar reads mounted files as raw API keys, so extract the key value.
+    let raw_content = req.credential_ref.trim().to_string();
+    let api_key = if raw_content.starts_with('{') {
+        // Try to extract api_key / key / apiKey from JSON
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw_content) {
+            parsed
+                .get("api_key")
+                .or_else(|| parsed.get("key"))
+                .or_else(|| parsed.get("apiKey"))
+                .or_else(|| parsed.get("ANTHROPIC_API_KEY"))
+                .or_else(|| parsed.get("OPENAI_API_KEY"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or(raw_content)
+        } else {
+            raw_content
+        }
+    } else {
+        raw_content
+    };
+
+    // Write K8s Secret FIRST, then Postgres metadata.
+    // This ensures jobs never mount stale secrets when Postgres says creds are valid.
     if let Some(ref kube_client) = state.kube_client {
         let secret_name = format!("nemo-creds-{}", req.engineer);
         let namespace = &state.config.cluster.jobs_namespace;
         let secrets_api: kube::Api<k8s_openapi::api::core::v1::Secret> =
             kube::Api::namespaced(kube_client.clone(), namespace);
 
-        // Map provider name to K8s Secret key
-        let secret_key = match req.provider.as_str() {
-            "claude" | "anthropic" => "anthropic",
-            "openai" => "openai",
-            "ssh" => "ssh",
-            other => other,
-        };
-
-        // Try to get existing secret to merge keys
-        let mut data = std::collections::BTreeMap::new();
-        if let Ok(existing) = secrets_api.get(&secret_name).await
-            && let Some(existing_data) = existing.data
-        {
-            for (k, v) in existing_data {
-                data.insert(k, v);
+        // Get existing secret to merge keys and preserve resourceVersion
+        let (mut data, resource_version) = match secrets_api.get(&secret_name).await {
+            Ok(existing) => {
+                let rv = existing.metadata.resource_version.clone();
+                let mut d = std::collections::BTreeMap::new();
+                if let Some(existing_data) = existing.data {
+                    d = existing_data;
+                }
+                (d, rv)
             }
-        }
+            Err(_) => (std::collections::BTreeMap::new(), None),
+        };
         data.insert(
             secret_key.to_string(),
-            k8s_openapi::ByteString(req.credential_ref.into_bytes()),
+            k8s_openapi::ByteString(api_key.into_bytes()),
         );
 
         let secret = k8s_openapi::api::core::v1::Secret {
             metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
                 name: Some(secret_name.clone()),
                 namespace: Some(namespace.clone()),
+                resource_version: resource_version.clone(),
                 ..Default::default()
             },
             data: Some(data),
             ..Default::default()
         };
 
-        // Create-or-update K8s Secret
-        match secrets_api
-            .create(&kube::api::PostParams::default(), &secret)
-            .await
-        {
-            Ok(_) => {}
-            Err(kube::Error::Api(err)) if err.code == 409 => {
-                // Already exists — replace. Propagate failure so caller knows creds aren't updated.
-                if let Err(e) = secrets_api
-                    .replace(&secret_name, &kube::api::PostParams::default(), &secret)
-                    .await
-                {
-                    return Err(NemoError::Internal(format!(
-                        "Failed to update K8s Secret {secret_name}: {e}"
-                    )));
-                }
-            }
-            Err(e) => {
-                return Err(NemoError::Internal(format!(
-                    "Failed to create K8s Secret {secret_name}: {e}"
-                )));
-            }
+        if resource_version.is_some() {
+            // Existing secret — replace with correct resourceVersion
+            secrets_api
+                .replace(&secret_name, &kube::api::PostParams::default(), &secret)
+                .await
+                .map_err(|e| {
+                    NemoError::Internal(format!("Failed to update K8s Secret {secret_name}: {e}"))
+                })?;
+        } else {
+            // New secret — create
+            secrets_api
+                .create(&kube::api::PostParams::default(), &secret)
+                .await
+                .map_err(|e| {
+                    NemoError::Internal(format!("Failed to create K8s Secret {secret_name}: {e}"))
+                })?;
         }
     }
+
+    // Postgres metadata written AFTER K8s Secret succeeds
+    let cred = crate::types::EngineerCredential {
+        id: Uuid::new_v4(),
+        engineer: req.engineer.clone(),
+        provider: req.provider.clone(),
+        credential_ref: "k8s-secret".to_string(),
+        valid: req.valid,
+        updated_at: chrono::Utc::now(),
+    };
+    state.store.upsert_credential(&cred).await?;
 
     Ok((StatusCode::OK, Json(serde_json::json!({"status": "ok"}))))
 }

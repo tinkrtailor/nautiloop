@@ -330,24 +330,14 @@ fn build_volumes(
             empty_dir: Some(EmptyDirVolumeSource::default()),
             ..Default::default()
         },
-        // FR-26: Model credentials Secret for sidecar only (never mounted in agent)
+        // FR-26: Model credentials Secret for sidecar only (never mounted in agent).
+        // Mount the whole secret — whichever keys exist (openai, anthropic, ssh)
+        // will be available as files. Missing keys are simply absent.
         Volume {
             name: "model-credentials".to_string(),
             secret: Some(SecretVolumeSource {
                 secret_name: Some(format!("nemo-creds-{engineer}")),
-                items: Some(vec![
-                    KeyToPath {
-                        key: "openai".to_string(),
-                        path: "openai".to_string(),
-                        ..Default::default()
-                    },
-                    KeyToPath {
-                        key: "anthropic".to_string(),
-                        path: "anthropic".to_string(),
-                        ..Default::default()
-                    },
-                ]),
-                optional: Some(true), // Not all engineers have both providers
+                optional: Some(true),
                 ..Default::default()
             }),
             ..Default::default()

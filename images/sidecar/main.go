@@ -36,6 +36,9 @@ type egressLogEntry struct {
 	Prefix      string `json:"prefix"`
 }
 
+// Track active SSH sessions for graceful shutdown.
+var sshWg sync.WaitGroup
+
 // SSRF-protected private IP ranges (FR-15).
 var privateRanges = []net.IPNet{
 	parseCIDR("10.0.0.0/8"),
@@ -398,6 +401,8 @@ func startGitProxy(ctx context.Context, gitRemoteHost string, allowedRepoPath st
 }
 
 func handleSSHConnection(nConn net.Conn, config *ssh.ServerConfig, gitRemoteHost string, allowedRepoPath string) {
+	sshWg.Add(1)
+	defer sshWg.Done()
 	defer nConn.Close()
 
 	// Perform SSH handshake with the agent
@@ -629,7 +634,7 @@ func extractGitRemote(gitURL string) gitRemoteInfo {
 		}
 	}
 
-	return gitRemoteInfo{host: "github.com"} // fallback
+	return gitRemoteInfo{} // empty — caller must validate
 }
 
 // extractGitHost returns just the host portion (backward compat).
@@ -658,7 +663,13 @@ func main() {
 
 	// Extract git remote host and repo path from environment
 	gitRepoURL := os.Getenv("GIT_REPO_URL")
+	if gitRepoURL == "" {
+		log.Fatalf("GIT_REPO_URL environment variable is required")
+	}
 	remote := extractGitRemote(gitRepoURL)
+	if remote.host == "" {
+		log.Fatalf("Failed to parse git host from GIT_REPO_URL: %s", gitRepoURL)
+	}
 	logJSON("NEMO_SIDECAR", "info", fmt.Sprintf("git remote host: %s, allowed repo: %s", remote.host, remote.repoPath))
 
 	// Start all three servers
@@ -749,6 +760,9 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 
+	// Stop accepting new git proxy connections first
+	cancel()
+
 	var wg sync.WaitGroup
 	wg.Add(3)
 
@@ -765,7 +779,10 @@ func main() {
 		healthServer.Shutdown(shutdownCtx)
 	}()
 
-	cancel() // Stop git proxy listener
+	// Wait for active SSH sessions to complete (up to grace period).
+	// The git proxy listener is closed (cancel above), so no new connections.
+	// Existing sessions will finish or be killed when shutdownCtx expires.
+	sshWg.Wait()
 
 	wg.Wait()
 	logJSON("NEMO_SIDECAR", "info", "shutdown complete")

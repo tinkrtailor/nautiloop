@@ -156,7 +156,8 @@ run_and_emit_result() {
 case "$STAGE" in
     implement|revise)
         # FR-5, FR-7: Claude Code for implement/revise
-        CLAUDE_ARGS=(-p "$(cat "$PROMPT_FILE")" --output-format stream-json --dangerously-skip-permissions)
+        # Use --prompt-file to avoid argv length limits on large specs/diffs
+        CLAUDE_ARGS=(--prompt-file "$PROMPT_FILE" --output-format stream-json --dangerously-skip-permissions)
         if [ -n "${SESSION_ID:-}" ]; then
             CLAUDE_ARGS+=(--resume "$SESSION_ID")
         fi
@@ -165,9 +166,9 @@ case "$STAGE" in
 
     review|audit)
         # FR-6, FR-7: OpenCode for review/audit (read-only)
-        # Configure opencode permissions: read-only
         export OPENCODE_PERMISSIONS='{"edit":"deny","bash":"deny","read":"allow"}'
-        OPENCODE_ARGS=(run --format json --prompt "$(cat "$PROMPT_FILE")")
+        # Use --prompt-file to avoid argv length limits on large specs/diffs
+        OPENCODE_ARGS=(run --format json --prompt-file "$PROMPT_FILE")
         if [ -n "${SESSION_ID:-}" ]; then
             OPENCODE_ARGS+=(-s "$SESSION_ID")
         fi

@@ -227,9 +227,20 @@ pub mod bare {
         }
 
         async fn has_diverged(&self, branch: &str, expected_sha: &str) -> Result<bool> {
-            match self.get_branch_sha(branch).await? {
-                Some(sha) => Ok(sha != expected_sha),
-                None => Ok(false),
+            // Check ancestry: if expected_sha is an ancestor of the branch tip,
+            // the branch advanced normally (agent committed). If not, someone
+            // force-pushed or rewrote history -> diverged.
+            let tip = match self.get_branch_sha(branch).await? {
+                Some(sha) => sha,
+                None => return Ok(false),
+            };
+            // `merge-base --is-ancestor A B` exits 0 if A is ancestor of B.
+            match self
+                .run_git(&["merge-base", "--is-ancestor", expected_sha, &tip])
+                .await
+            {
+                Ok(_) => Ok(false), // expected is ancestor of tip -> not diverged
+                Err(_) => Ok(true), // not an ancestor -> diverged
             }
         }
 
