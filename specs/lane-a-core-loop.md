@@ -539,11 +539,11 @@ Error (409) if loop is not in AWAITING_APPROVAL state.
 
 #### `POST /resume/:id`
 
-Resume a loop in `paused_remote_ahead`, `paused_force_deviated`, or AWAITING_REAUTH state. Accepts an optional `--force` query parameter. Sets `resume_requested = true` in Postgres. The loop engine reads the flag on the next reconciliation tick and re-dispatches the previously interrupted stage.
+Resume a loop in `paused_remote_ahead`, `paused_force_deviated`, or AWAITING_REAUTH state. Accepts an optional `?force=true` query parameter. Sets `resume_requested = true` in Postgres. When `?force=true` is provided, ALSO sets `force_resume = true` in Postgres (see Lane B schema). The loop engine reads both flags on the next reconciliation tick and re-dispatches the previously interrupted stage.
 
-- For `paused_remote_ahead`: fast-forwards to remote SHA (no work lost), re-dispatches current stage.
-- For `paused_force_deviated`: requires `?force=true`. Without it, returns 400 with an explanation of which commits will be discarded. With `force=true`, resets to remote SHA and re-dispatches.
-- For AWAITING_REAUTH: re-dispatches the failed job after credential refresh.
+- For `paused_remote_ahead`: fast-forwards to remote SHA (no work lost), re-dispatches current stage. `force_resume` is ignored.
+- For `paused_force_deviated`: loop engine checks `force_resume`. If `force_resume = false`, resume is rejected (loop engine resets `resume_requested` and returns the loop to `paused_force_deviated`; the API pre-validates this and returns 400 with an explanation of which commits will be discarded). If `force_resume = true`, resets to remote SHA and re-dispatches.
+- For AWAITING_REAUTH: re-dispatches the failed job after credential refresh. `force_resume` is ignored.
 
 Request: `POST /resume/:id?force=true`
 
@@ -556,6 +556,45 @@ The response returns the current state. The transition back to the active stage 
 
 Error (409) if loop is not in `paused_remote_ahead`, `paused_force_deviated`, or AWAITING_REAUTH state.
 Error (400) if loop is in `paused_force_deviated` and `force=true` is not provided.
+
+#### `POST /credentials`
+
+Push model credentials from the engineer's local machine to the cluster. The CLI reads credential files from `~/.claude/` and `~/.config/opencode/`, serializes the content, and POSTs to this endpoint. This was partially implemented in Lane A round 9 (N34); this formalizes the contract.
+
+Request:
+```json
+{
+  "engineer": "alice",
+  "provider": "claude",
+  "credential_ref": "nemo-creds-alice-claude",
+  "valid": true
+}
+```
+
+- `engineer` (string, required): engineer name. Must not be empty.
+- `provider` (string, required): credential provider (`"claude"`, `"openai"`, etc.).
+- `credential_ref` (string, required): K8s Secret name or reference where the actual credential is stored.
+- `valid` (bool, required): whether the credential is currently valid.
+
+Response (200):
+```json
+{
+  "id": "f1e2d3c4-...",
+  "engineer": "alice",
+  "provider": "claude",
+  "valid": true
+}
+```
+
+Behavior:
+- Requires valid API key (same auth as all other endpoints).
+- Upserts into `engineer_credentials` table (unique on `(engineer_id, provider)` per Lane B FR-4b).
+- Also creates/updates the corresponding K8s Secret in the `nemo-jobs` namespace via the API server's ServiceAccount (see Lane C FR-46b RBAC).
+- Returns 400 if `engineer` is empty.
+- Returns 401 if not authenticated.
+
+Error (400): `{ "error": "engineer must not be empty" }`
+Error (401): `{ "error": "Authentication failed" }`
 
 #### `GET /inspect`
 
@@ -602,7 +641,7 @@ The API server and loop engine share only Postgres. No direct RPC.
 | Start | INSERT into `loops` table | Engine's reconciliation tick picks up PENDING rows |
 | Cancel | UPDATE `loops SET cancel_requested = true` | Engine checks flag each tick; deletes Job, sets CANCELLED |
 | Approve | UPDATE `loops SET approve_requested = true` | Engine checks flag each tick; transitions to IMPLEMENTING, dispatches first impl Job |
-| Resume | UPDATE `loops SET resume_requested = true` | Engine checks flag each tick; re-dispatches interrupted stage |
+| Resume | UPDATE `loops SET resume_requested = true, force_resume = true` (force_resume only when `?force=true`) | Engine checks both flags each tick; rejects `paused_force_deviated` resume if `force_resume = false`; re-dispatches interrupted stage |
 | Re-auth | UPDATE `engineer_credentials` table | Engine checks credential validity before dispatching |
 
 Optional optimization: use Postgres `NOTIFY/LISTEN` to wake the engine immediately on writes, rather than waiting for the next 5s tick. The engine still reconciles on interval as the primary mechanism.
@@ -906,11 +945,13 @@ The implement/revise agent receives both the spec path and the feedback file pat
 - [ ] Auto-merge event logged to Postgres (loop_id, merge_sha, merge_strategy, ci_status)
 - [ ] `[harden] merge_strategy` controls spec PR merge behavior
 - [ ] `nemo harden` merges spec PR on convergence (when `auto_merge_spec_pr = true`)
+- [ ] `POST /credentials` upserts engineer credentials and returns `{ id, engineer, provider, valid }`
+- [ ] `POST /credentials` returns 400 when `engineer` is empty, 401 when not authenticated
 - [ ] Branch names follow `agent/{engineer}/{spec-slug}-{short-hash}` convention
 - [ ] Session continuation works across rounds (agent resumes context, not cold start)
 
 ## Open Questions
 
 - [x] ~~Should `GET /logs/:id` proxy raw pod logs or persist to Postgres?~~ Decision: persist structured log events to Postgres. Pod logs are ephemeral.
-- [ ] Exact Postgres schema for the `loops`, `rounds`, `log_events`, and `engineer_credentials` tables (separate impl-plan or migration spec).
-- [ ] How does `nemo auth` securely transport credentials? Options: direct K8s API (requires kubeconfig), API server relay endpoint, or SSH tunnel. Needs threat model.
+- [x] ~~Exact Postgres schema for the `loops`, `rounds`, `log_events`, and `engineer_credentials` tables.~~ Decision: defined in Lane B schema. See Lane B FR-1 through FR-4c.
+- [x] ~~How does `nemo auth` securely transport credentials?~~ Decision: API server relay endpoint. The CLI reads credential files from `~/.claude/` and `~/.config/opencode/`, serializes the content, and POSTs to `POST /credentials` (defined above). The API server upserts `engineer_credentials` and creates/updates K8s Secrets in `nemo-jobs` namespace. Transport security via HTTPS/mTLS (same as all other endpoints).

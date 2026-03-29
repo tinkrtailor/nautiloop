@@ -157,6 +157,7 @@ CREATE TABLE loops (
     cancel_requested    BOOLEAN NOT NULL DEFAULT false,
     approve_requested   BOOLEAN NOT NULL DEFAULT false,
     resume_requested    BOOLEAN NOT NULL DEFAULT false,
+    force_resume        BOOLEAN NOT NULL DEFAULT false,  -- requires --force for paused_force_deviated resume
     -- Human review flag: set when max_rounds exceeded or CI fails in ship mode.
     -- Queryable by `nemo status` to highlight loops needing attention.
     needs_human_review  BOOLEAN NOT NULL DEFAULT false,
@@ -327,7 +328,7 @@ CREATE INDEX idx_cluster_credentials_type ON cluster_credentials(type);
 - `jobs.k8s_job_name` is `UNIQUE` to enable idempotent reconciliation: if the control plane restarts, it can match running K8s jobs back to DB rows.
 - `engineers.model_preferences` is JSONB (`{"implementor": "claude-opus-4", "reviewer": "gpt-5.4"}`) because model names are free-form strings that change frequently.
 - `loops.auto_approve`: set at loop creation time from CLI flags (`nemo ship --harden` implies `auto_approve = true`; `nemo start --harden --auto-approve` sets it explicitly). When the harden phase converges and `auto_approve = true`, the loop engine skips `awaiting_approval` and transitions directly to `implementing`. When `false`, the loop enters `awaiting_approval` as normal.
-- `loops.cancel_requested`, `loops.approve_requested`, `loops.resume_requested`: boolean flags set by the API server and read by the loop engine on the next reconciliation tick. This is the communication mechanism between the two deployments (they share only Postgres, no direct RPC). Flags are reset by the loop engine after processing.
+- `loops.cancel_requested`, `loops.approve_requested`, `loops.resume_requested`, `loops.force_resume`: boolean flags set by the API server and read by the loop engine on the next reconciliation tick. This is the communication mechanism between the two deployments (they share only Postgres, no direct RPC). Flags are reset by the loop engine after processing. `force_resume` is set alongside `resume_requested` when `nemo resume --force` is used; the loop engine checks `force_resume` before allowing resume from `paused_force_deviated` (rejects if `force_resume = false`).
 - `loops.needs_human_review`: set when max_rounds exceeded or CI fails in ship mode. Queryable by `nemo status` to highlight loops that need engineer attention. Distinct from terminal state -- a loop can be `converged` (PR created) with `needs_human_review = true`.
 - `log_events`: structured log events persisted from pod logs. Pod logs are ephemeral and disappear after K8s Job deletion, so the loop engine streams them into this table in near-real-time. `GET /logs/:id` reads from here, not from pod logs. Columns: `stage` and `round` enable filtering (`?round=N&stage=implement`). `level` supports filtering by severity.
 - `engineer_credentials`: tracks per-engineer, per-provider credential references and validity. The actual secrets are K8s Secrets; this table enables the loop engine to check credential status before dispatching (avoiding wasted job starts with expired creds) and enables the `awaiting_reauth` -> resume flow when `nemo auth` updates credentials.
@@ -704,7 +705,8 @@ This was the #1 systemic bug pattern in Lane A (round 19: 8 call sites created K
 - [ ] Control plane starts successfully with only cluster config (no repo or engineer config loaded at boot)
 - [ ] Control plane refuses to start if Postgres is unreachable or migrations fail
 - [ ] No background fetch CronJob; all fetches are per-job via `prepare_worktree()`
-- [ ] `loops.cancel_requested`, `approve_requested`, `resume_requested` flags exist and default to false
+- [ ] `loops.cancel_requested`, `approve_requested`, `resume_requested`, `force_resume` flags exist and default to false
+- [ ] `force_resume` is set to true only when `nemo resume --force` is called; loop engine rejects resume from `paused_force_deviated` when `force_resume = false`
 - [ ] `loops.needs_human_review` flag set when max_rounds exceeded or CI fails in ship mode
 - [ ] `nemo status` highlights loops with `needs_human_review = true`
 - [ ] `log_events` table stores structured log events with loop_id, stage, round, level, message
