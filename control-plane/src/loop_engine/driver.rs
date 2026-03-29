@@ -192,9 +192,24 @@ impl ConvergentLoopDriver {
                         self.handle_auth_expired(record, &reason).await
                     }
                     JobStatus::NotFound => {
-                        // Job disappeared: treat as failure
-                        self.handle_job_failed(record, "Job not found (deleted externally)")
-                            .await
+                        // Job disappeared — could be TTL cleanup after completion.
+                        // Try to ingest output first; if pod logs are available, the
+                        // job succeeded and was cleaned up. Only fail if no output.
+                        tracing::warn!(
+                            loop_id = %record.id,
+                            job_name = record.active_job_name.as_deref().unwrap_or("?"),
+                            "Job not found (TTL cleanup or external deletion), attempting output recovery"
+                        );
+                        match self.handle_job_completed(record).await {
+                            Ok(state) => Ok(state),
+                            Err(_) => {
+                                self.handle_job_failed(
+                                    record,
+                                    "Job not found and output unrecoverable (TTL cleanup after >5m delay?)",
+                                )
+                                .await
+                            }
+                        }
                     }
                 }
             }

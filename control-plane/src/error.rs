@@ -74,7 +74,13 @@ impl NemoError {
                     || msg.contains("has an open PR")
             }
             // Config/serialization errors won't self-heal
-            Self::Config(_) | Self::Serialization(_) | Self::Internal(_) => true,
+            Self::Config(_) | Self::Serialization(_) => true,
+            // Internal errors may be transient (e.g., pod log retrieval hiccup)
+            Self::Internal(msg) => {
+                !msg.contains("Failed to retrieve logs")
+                    && !msg.contains("pod")
+                    && !msg.contains("log")
+            }
             // Spec not found, ship not enabled — logic errors, won't change on retry
             Self::SpecNotFound { .. } | Self::ShipNotEnabled => true,
             // Loop not found — data integrity issue
