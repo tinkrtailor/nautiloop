@@ -1,15 +1,11 @@
-Not converged. I read all Rust source under `control-plane/src` and `cli/src` and found 4 real production bugs.
+Not clean. I found 4 real production bugs after reviewing all Rust under `control-plane/src/` and `cli/src/`.
 
-- `control-plane/src/loop_engine/driver.rs:301` + `control-plane/src/loop_engine/driver.rs:327` + `control-plane/src/loop_engine/driver.rs:460` + `control-plane/src/loop_engine/driver.rs:516` + `control-plane/src/loop_engine/driver.rs:408`  
-  Completed jobs are decoded with the wrong JSON shape. `extract_nemo_result()` stores only the `data` payload, but the evaluators still parse legacy top-level structs (`AuditVerdict`, `ReviewVerdict`, `TestOutput`, `ReviseOutput`). Real impact: successful audit/review/test/revise jobs get treated as malformed/no output, so loops retry or fail instead of advancing.
+- High - Unknown engineer filter leaks all loops: `control-plane/src/api/handlers.rs:184`, `control-plane/src/state/postgres.rs:331`, `control-plane/src/state/mod.rs:321` - `GET /status?engineer=<unknown>` resolves to `None`, and both store implementations treat `None` as "no engineer filter", so the API returns everyone’s loops instead of zero results.
+- High - Force-resume safety is bypassed: `control-plane/src/loop_engine/driver.rs:189`, `control-plane/src/loop_engine/driver.rs:807`, `control-plane/src/api/handlers.rs:333`, `control-plane/src/state/postgres.rs:418` - loops paused for force-pushed divergence say they require force resume, but `/resume` only sets `resume_requested`, and `handle_paused()` resumes unconditionally; `force_resume` exists in the model/store but is never enforced here.
+- Medium - `/start` can fail after creating a real loop: `control-plane/src/api/handlers.rs:143` - the handler inserts the loop row and creates the git branch before `set_sha()`. If that last DB write fails, the request returns an error even though the branch and loop already exist, so clients can retry into conflicts or duplicate operational state.
+- High - Historical logs allow terminal escape injection: `cli/src/commands/logs.rs:118` - the SSE path sanitizes log lines with `strip_ansi()`, but the historical JSON path prints raw `line_text`, so saved job output can inject ANSI/OSC sequences into a user’s terminal when they run `nemo logs`.
+job row is created as `pending` before K8s creation in `control-plane/src/loop_engine/driver.rs:1312` and `control-plane/src/loop_engine/driver.rs:1354`, but on `create_job` failure only `active_job_name` is cleared in `control-plane/src/loop_engine/driver.rs:1320`. The job record is never marked failed, so history becomes incorrect and any future use of active-job counts like `control-plane/src/state/postgres.rs:724` will miscount stranded jobs.
+- Historical log viewing still allows terminal escape injection: live SSE output is sanitized in `cli/src/commands/logs.rs:112`, but completed-loop JSON logs print raw `line_text` in `cli/src/commands/logs.rs:129`. A malicious repo or job can inject ANSI/OSC control sequences when an operator runs `nemo logs` on a finished loop.
+- Model override flags are shipped but guaranteed to fail: the CLI exposes `--model-impl` / `--model-review` in `cli/src/main.rs:29`, `cli/src/main.rs:51`, `cli/src/main.rs:69` and sends `model_overrides` in `cli/src/commands/start.rs:33`, but the server rejects any non-empty override with `NotImplemented` in `control-plane/src/api/handlers.rs:27`. Those user-facing flags are non-functional in production.
 
-- `control-plane/src/k8s/client.rs:125`  
-  `get_job_logs()` only requests `tail_lines: Some(100)`. If the agent emits more than 100 log lines and `NEMO_RESULT:` is not in that tail window, a successful job is misclassified as having no result. Real impact: false failures on noisy runs.
-
-- `control-plane/src/api/handlers.rs:454`  
-  Credential secret updates ignore failure on the 409/replace path. The API returns 200 even if the Kubernetes Secret update fails after Postgres metadata is updated. Real impact: `nemo auth` can appear successful while resumed jobs still run with stale or expired credentials.
-
-- `control-plane/src/loop_engine/driver.rs:229` + `control-plane/src/loop_engine/driver.rs:1125` + `control-plane/src/k8s/job_builder.rs:252`  
-  Stage outputs include `session_id`, but ingestion never persists it back onto the loop record. Later rounds and resume/reauth paths therefore stop sending `SESSION_ID`. Real impact: session continuity is broken across retries/rounds, especially for multi-round review/implement flows.
-
-If you want, I can do a round 4 read-only pass after these are fixed.
+If you want, I can turn this into a ranked fix list for Round 4.

@@ -1,9 +1,10 @@
-Read all 35 Rust source files under `control-plane/src` and `cli/src`. Read-only result: not CLEAN, not converged.
+Not clean. I found 3 real production bugs after reviewing the Rust source.
 
-- High — `control-plane/src/k8s/client.rs:123` + `control-plane/src/loop_engine/driver.rs:265` + `control-plane/src/loop_engine/driver.rs:588` + `control-plane/src/loop_engine/driver.rs:765` swallow pod log retrieval errors as empty output, so a job that actually succeeded can be retried or failed as “no output”; this can duplicate implement/review/test runs and duplicate PR/commit attempts.
-- High — `control-plane/src/config/mod.rs:45` treats an explicit `NEMO_CONFIG_PATH` pointing to a missing file the same as “no config found” and silently falls back to defaults, so a bad mount/path typo can boot the control plane against wrong/default settings.
-- High — `control-plane/src/api/auth.rs:12` returns `500` on every authenticated request when `NEMO_API_KEY` is unset, instead of failing fast at startup; bad secret injection becomes total API outage with poor diagnosis.
-- Medium — `control-plane/src/api/auth.rs:22` only accepts exact `Bearer ` casing; valid lowercase `bearer` auth schemes are rejected even though the scheme is case-insensitive per HTTP auth rules.
-- Medium — `control-plane/src/api/handlers.rs:410` derives K8s secret names from `engineer` using only lowercase + `_` replacement, so names with spaces, slashes, or other DNS-invalid chars fail at runtime with server error instead of request validation.
-- Medium — `cli/src/commands/config.rs:5` uses `load_config().unwrap_or_default()` for `--set`, so a malformed existing config gets silently replaced by defaults plus the one edited key, dropping unrelated settings like `server_url` and `api_key`.
-- Medium — `cli/src/config.rs:57` writes `~/.nemo/config.toml` before chmodding it to `0600`, leaving a brief window where a newly created config containing `api_key` can be world-readable under common umasks.
+- High — `control-plane/src/api/handlers.rs:113`, `control-plane/src/loop_engine/reconciler.rs:64`, `control-plane/src/loop_engine/driver.rs:83`, `control-plane/src/loop_engine/driver.rs:1029`
+  `/start` writes a new loop as `PENDING` before the git branch exists, and the reconciler ticks all non-terminal loops including `PENDING`. That lets `handle_pending()` dispatch a job against `record.branch` in the gap before `create_branch()` succeeds, so jobs can start against a nonexistent branch and fail checkout/push.
+
+- Medium — `control-plane/src/api/handlers.rs:53`, `control-plane/src/types/mod.rs:366`
+  `generate_branch_name()` uses only `file_stem(spec_path)` plus content hash. Two distinct specs like `specs/a/foo.md` and `specs/b/foo.md` with identical contents generate the same branch, causing false `ActiveLoopConflict`s and cross-spec branch/history collisions.
+
+- Medium — `control-plane/src/api/handlers.rs:81`, `control-plane/src/api/handlers.rs:514`, `control-plane/src/types/mod.rs:396`
+  Engineer validation allows names ending in `-` (for example `alice-`), but `slugify()` strips trailing hyphens. That means `alice` and `alice-` collapse to the same branch namespace, so different accepted engineer identities can collide on the same `agent/{engineer}/...` branches.

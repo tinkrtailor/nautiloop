@@ -1,14 +1,18 @@
-Starting with repo state and any lane-specific context so I can verify whether Lane C is clean and whether there are any remaining findings.
-I found prior Lane C review rounds in `.agent/`. Next I’m checking the current branch diff against `main` and the last recorded findings to see whether anything still reproduces.
-There are later review artifacts on this branch, so I’m checking the most recent rounds too. If they already found unresolved issues, I’ll verify whether they still reproduce in code before calling this converged.
-I’ve confirmed several older findings are already fixed in the current code. I’m doing one more targeted pass over the loop driver and runtime edge cases before deciding whether this is actually clean.
-I found one suspicious path already: the runtime still derives git author email from the engineer name instead of loading the registered email from persisted credentials/engineer state. I’m verifying whether that’s just a comment drift or an actual spec/runtime mismatch.
-I found a second candidate bug: the first implement/audit dispatch appears to build the job context before `current_sha` is ever populated, which would send an empty `SHA` env var on the initial job. I’m verifying whether loop creation pre-seeds it anywhere.
-Another spec/runtime mismatch is worth checking: the API maps Claude credentials to the `anthropic` secret key. I’m verifying whether the job builder and sidecar expect `claude` or `anthropic`, because a mismatch there would break auth even though `nemo auth` reports success.
-1. High: Claude implement/revise auth is still wired incorrectly, so real Lane C agent jobs cannot authenticate as specified. `build_job()` never mounts any secret into the agent container and `build_agent_mounts()` only mounts `worktree`, `sessions`, `output`, `shared`, `tmpdir`, and `home` (`control-plane/src/k8s/job_builder.rs:62-74`, `control-plane/src/k8s/job_builder.rs:374-412`), but the entrypoint launches `claude` directly for `implement|revise` (`images/base/nemo-agent-entry:157-165`). Lane C requires the engineer’s `~/.claude/` session dir to be mounted into `/work/home/.claude/` for those stages (`specs/lane-c-agent-runtime.md:76-77`, `specs/lane-c-agent-runtime.md:55`). The current `/credentials` path also rewrites `claude` uploads to a raw `anthropic` secret key and strips JSON down to an API key (`control-plane/src/api/handlers.rs:424-447`), which is not the required Claude session-directory contract. Result: `nemo auth` can succeed while implement/revise pods still lack usable Claude auth.
+Starting with repo state and any Lane B round-tracking docs, then I’ll review the current diff in read-only mode and report only concrete findings.
+Repo is effectively clean aside from one untracked sandbox file. I’m checking what Lane B contains relative to `main` so I can do the round review against actual branch changes, not the empty worktree.
+I’ve got the branch context and prior-round history. Now I’m doing a fresh pass on the live Rust code, with extra attention to the Round 17 areas plus any regressions around loop resume, output validation, and CLI/API edge cases.
+Not clean. Not converged.
 
-2. Medium: Engineer email is not persisted or loaded from the configured identity, so job commits are attributed to a fabricated `<engineer>@nemo.dev` address instead of the real engineer identity required by the spec. The CLI config only supports `server_url`, `engineer`, and `api_key` (`cli/src/config.rs:7-13`, `cli/src/commands/config.rs:25-77`), the `/credentials` request has no email field at all (`control-plane/src/types/api.rs:141-149`), and the loop driver hardcodes `let engineer_email = format!("{}@nemo.dev", record.engineer);` (`control-plane/src/loop_engine/driver.rs:1281-1285`). That contradicts the required flow where `nemo auth` upserts name+email from `~/.nemo/config.toml` and the job builder reads the real email from the engineers table (`specs/lane-c-agent-runtime.md:79`, `specs/lane-b-infrastructure.md:617`).
+1. High — `control-plane/src/loop_engine/driver.rs:574-582`, `control-plane/src/loop_engine/driver.rs:833-845`, `control-plane/src/git/mod.rs:522-556`
+`merge_pr()` is not idempotent, but both the harden auto-merge path and ship auto-merge path call it unconditionally. If `gh pr merge` succeeds and the process dies before `record.merge_sha` / terminal state is persisted, the next tick retries the merge against an already-merged PR and gets a hard error instead of converging.
 
-Not `CLEAN`, not `CONVERGED`.
+2. Medium — `control-plane/src/loop_engine/driver.rs:995-1008` compared with `control-plane/src/loop_engine/driver.rs:962-973`
+`AWAITING_REAUTH` resume refreshes `record.sha` from the local branch only. Unlike paused resume, it does not `fetch` and prefer `origin/<branch>`. If the engineer pushed while the loop was waiting for reauth, resume can redispatch stale code and then false-pause again on the next divergence check.
 
-Assumption: ignored untracked local file `.claude/.sandbox-claude.json`.
+3. Medium — `control-plane/src/loop_engine/driver.rs:354-372`, `control-plane/src/loop_engine/driver.rs:464-497`, `control-plane/src/types/verdict.rs:54-58`
+Implement-stage success only checks that `output_json` exists, not that it parses as `ImplOutput { sha, affected_services }`. Any syntactically valid JSON can advance the loop into testing, so malformed implement output is treated as success and the stage contract is effectively unenforced.
+
+4. Low — `cli/src/commands/init.rs:57-81`
+`nemo init` sanitizes service names into TOML table keys but never deduplicates post-sanitization collisions. Distinct services like `foo.bar` and `foo-bar` both become `[services.foo-bar]`, producing duplicate/ambiguous config entries.
+
+Read-only review only; no files changed.

@@ -47,6 +47,9 @@ pub enum NemoError {
     #[error("nemo ship is not enabled for this repo. Set [ship] allowed = true in nemo.toml")]
     ShipNotEnabled,
 
+    #[error("Feature not yet implemented: {feature}")]
+    NotImplemented { feature: String },
+
     #[error("Config error: {0}")]
     Config(String),
 
@@ -99,7 +102,9 @@ impl NemoError {
                 StatusCode::CONFLICT
             }
             Self::AuthenticationFailed | Self::UnknownEngineer => StatusCode::UNAUTHORIZED,
-            Self::ShipNotEnabled | Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::ShipNotEnabled | Self::NotImplemented { .. } | Self::BadRequest(_) => {
+                StatusCode::BAD_REQUEST
+            }
             Self::Database(_) | Self::ClusterUnavailable | Self::Kube(_) => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
