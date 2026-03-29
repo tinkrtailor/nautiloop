@@ -125,19 +125,40 @@
 
 | Criterion | Status |
 |-----------|--------|
-| docker build of base agent image succeeds | Pending |
-| Auth sidecar starts in under 2s | Pending |
-| Auth sidecar injects correct headers | Pending |
-| K8s Job with both containers correct | Pending |
-| Prompt template variable injection | Pending |
-| terraform init && terraform apply works | Pending |
-| Job resource limits match FR-28 | Pending |
-| iptables init container configured | Pending |
-| Agent runs as non-root UID 1000 | Pending |
-| TEST stage reads AFFECTED_SERVICES | Pending |
+| docker build of base agent image succeeds | Code complete (Dockerfile ready, needs docker to verify) |
+| Auth sidecar starts in under 2s | Code complete (Go binary, needs runtime test) |
+| Auth sidecar injects correct headers | Code complete (OpenAI Bearer injection) |
+| K8s Job with both containers correct | Done (87 unit tests verify structure) |
+| Prompt template variable injection | Done (entrypoint handles all {{PLACEHOLDER}} vars) |
+| terraform init && terraform apply works | Code complete (needs Hetzner account to verify) |
+| Job resource limits match FR-28 | Done (including JVM tag, verified by tests) |
+| iptables init container configured | Done (verified by unit test) |
+| Agent runs as non-root UID 1000 | Done (security context + Dockerfile USER agent) |
+| TEST stage reads AFFECTED_SERVICES | Done (entrypoint handles, verified by tests) |
 
 ## Progress Log
 
 | Date | Step | Status | Notes |
 |------|------|--------|-------|
 | 2026-03-29 | -- | Started | Created branch and plan |
+| 2026-03-29 | Step 1 | Done | NEMO_RESULT types, stage mapping, 12 tests |
+| 2026-03-29 | Step 2 | Done | Job builder rewrite, 24 tests |
+| 2026-03-29 | Step 3 | Done | Services config section, 4 tests |
+| 2026-03-29 | Step 4 | Done | All 5 prompt templates |
+| 2026-03-29 | Step 5 | Done | Dockerfile + entrypoint script |
+| 2026-03-29 | Step 6 | Done | Sidecar Go binary (SSH proxy rewrite) |
+| 2026-03-29 | Step 7 | Done | Full Terraform module (8 files) |
+| 2026-03-29 | Review | Fixed | 10 must-fix gaps addressed |
+
+## Review Findings Addressed
+
+1. Issue.category made Optional per FR-40
+2. Sidecar GIT_REPO_URL fixed (was passing branch)
+3. git_repo_url added to ClusterConfig/JobBuildConfig
+4. engineer_email from LoopContext instead of hardcoded
+5. JVM tag resource limits for TEST stage (FR-28)
+6. SSH proxy rewritten with golang.org/x/crypto/ssh (FR-18)
+7. Dockerfile COPY paths fixed for repo-root build context
+8. NEMO_RESULT instructions added to review/audit templates
+9. Terraform outputs.tf added (FR-53)
+10. cloud-init.yaml template added
