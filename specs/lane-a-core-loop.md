@@ -208,8 +208,8 @@ Uses `LoopKind::Implement` with three stages per round:
 
 | Stage | Model | Input | Output |
 |-------|-------|-------|--------|
-| Implement | implementor (default: claude) | spec + feedback file (if round > 1) | `ImplOutput { sha: String, affected_services: Vec<String> }` |
-| Test | none (runs test commands) | affected_services from impl output | `TestOutput { passed: bool, failures: Vec<TestFailure> }` |
+| Implement | implementor (default: claude) | spec + feedback file (if round > 1) | `ImplOutput { sha: String }` |
+| Test | none (runs test commands) | affected_services (computed by control plane from git diff, see Lane C FR-42a) | `TestOutput { passed: bool, failures: Vec<TestFailure> }` |
 | Review | reviewer (default: openai) | spec + branch diff | `ReviewVerdict` (see schema below) |
 
 If Test fails: loop feeds `TestFailure` items back as feedback to next Implement round (no Review dispatched).
@@ -387,8 +387,8 @@ Special transitions:
 - After exhausting retries, mark loop FAILED with reason describing the failure mode.
 
 **Verdict evaluation (FR-9):**
-- After Review or Audit job completes, parse `.agent/review-verdict.json` (or `.agent/audit-verdict.json`) from the job's output PVC
-- If JSON is malformed: increment `retry_count` on the job, re-dispatch the same stage (same inputs)
+- After Review or Audit job completes, read pod logs (via kube-rs pod/log API), find the line starting with `NEMO_RESULT:`, strip the prefix, and parse the JSON. The `data.verdict` field contains the review/audit verdict (see Lane C FR-13 for the full result envelope contract).
+- If the `NEMO_RESULT:` line is missing or the JSON is malformed: increment `retry_count` on the job, re-dispatch the same stage (same inputs)
 - If `retry_count >= max_retries`: mark loop FAILED with reason "Malformed verdict after {max_retries} retries"
 
 ### API Server Binary
@@ -536,13 +536,15 @@ Response (200):
   "rounds": [
     {
       "round": 1,
-      "implement": { "sha": "abc123", "affected_services": ["api"], "duration_s": 120 },
+      "implement": { "sha": "abc123", "duration_s": 120 },
+      "affected_services": ["api"],
       "test": { "passed": false, "failures": ["api::invoice::test_cancel FAILED"] },
       "review": null
     },
     {
       "round": 2,
-      "implement": { "sha": "def456", "affected_services": ["api"], "duration_s": 95 },
+      "implement": { "sha": "def456", "duration_s": 95 },
+      "affected_services": ["api"],
       "test": { "passed": true },
       "review": { "clean": false, "issues": 2, "summary": "Missing null check..." }
     }
