@@ -1,19 +1,21 @@
-Checking the current branch state and diff for Lane C, then I’ll report only review findings.
-I found one untracked local file, `.claude/.sandbox-claude.json`; I’m ignoring it and reviewing the branch diff against `main`.
-I found three candidate issues from the branch review. I’m verifying the exact code paths and line references before I finalize.
-Not converged.
+Starting with a full inventory of Rust source, then I’ll read crate-by-crate and look for correctness, regression, and test gaps.
+API/types pass looks mostly tight so far. Moving into state, loop engine, git, k8s, config, and CLI for the remaining review surface.
+The remaining surface is mostly config/bootstrap and CLI command glue. I’m reading that now, plus the rest of the git module to check PR/merge edge cases.
+I’ve finished the first-pass read. I’m doing one independent sweep now for edge-case bugs and regressions before I call it clean.
+1. High: cancellation can lose to ship-side effects  
+`control-plane/src/loop_engine/driver.rs:62-65`, `control-plane/src/loop_engine/driver.rs:760-817`  
+A tick only checks `cancel_requested` once at entry. If the user cancels while the same tick is already evaluating a clean review result, that tick can still create/merge the PR and transition the loop to `SHIPPED` before the next tick sees the cancel.
 
-1. High - `control-plane/src/k8s/job_builder.rs:171`, `control-plane/src/k8s/job_builder.rs:362-367`, `terraform/k8s.tf:187-196`
-Agent Jobs are created in `cfg.namespace` (`nemo-jobs`), but the `ssh-known-hosts` ConfigMap is only provisioned in `nemo-system`. ConfigMaps are namespace-scoped, so pods mounting `ssh-known-hosts` in `nemo-jobs` will fail with `FailedMount` before either container starts.
+2. Medium: `force_resume` can leak across reauth resumes  
+`control-plane/src/api/handlers.rs:422-432`, `control-plane/src/loop_engine/driver.rs:962-978`  
+`POST /resume?...force=true` sets `force_resume` for any resumable state, including `AWAITING_REAUTH`. The reauth resume path clears `resume_requested` but never clears `force_resume`, so a later `PausedForceDeviated` pause can be resumed without a fresh `?force=true` acknowledgement.
 
-2. High - `control-plane/src/loop_engine/driver.rs:505-512`
-The TEST transition no longer computes affected services from `git diff`; it serializes every configured service from `self.config.services`. That contradicts `specs/lane-c-agent-runtime.md:165` / Lane C FR-42a, and it means unrelated failing services can block valid changes while also making test rounds much slower.
+3. Medium: `nemo init` can emit invalid or mis-shaped TOML for service names  
+`cli/src/commands/init.rs:47-52`, `cli/src/commands/init.rs:136-143`  
+Service names are derived from raw directory names and written directly into `[services.{name}]`. Names containing `.` create nested tables instead of a single service key, and names with spaces or other punctuation can generate invalid `nemo.toml`.
 
-3. Medium - `images/base/nemo-agent-entry:140-150`, `.nemo/prompts/implement.md:33-35`, `.nemo/prompts/spec-revise.md:29-31`, `control-plane/src/loop_engine/driver.rs:303-307`, `control-plane/src/loop_engine/driver.rs:446-463`
-The control plane now expects typed `NEMO_RESULT.data` for implement/revise (`session_id`, `revised_spec_path`, etc.), but the prompts tell Claude to “output nothing special” and the entrypoint just wraps the last assistant message blob as `data`. In practice those fields will usually be missing, so session resume is not persisted and revise-stage spec path changes are not reliably detected.
+4. Low: CLI config file is not permission-hardened on non-Unix platforms  
+`cli/src/config.rs:83-86`  
+The Unix path writes `~/.nemo/config.toml` with `0600`, but the non-Unix path uses plain `std::fs::write`, which can leave `api_key` readable under default filesystem ACLs.
 
-Assumption: I ignored the untracked local file `.claude/.sandbox-claude.json` since this was a read-only review.
-l-plane/src/api/handlers.rs:301`, `control-plane/src/api/handlers.rs:332`, `cli/src/commands/approve.rs:17`, `cli/src/commands/resume.rs:17`
-The CLI has a friendly “not applicable” success path for `approve`/`resume`, but the API never returns that shape on invalid state; it returns a conflict error instead. The fallback branch in the CLI is dead code.
-
-I read every Rust source file under `control-plane/src` and `cli/src`.
+Read all Rust source under `control-plane/src` and `cli/src`. Not clean; not converged. No other concrete Rust findings stood out beyond the items above.

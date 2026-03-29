@@ -1,3 +1,13 @@
+// Three-layer config merge modules (cluster -> repo -> engineer).
+// Currently used by nemo init (repo.rs service detection) and available for
+// the loop engine to merge configs at dispatch time. The runtime NemoConfig
+// below is the operational config loaded on startup; MergedConfig is computed
+// per-loop from the three layers.
+pub mod cluster;
+pub mod engineer;
+pub mod merged;
+pub mod repo;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -75,6 +85,11 @@ impl NemoConfig {
 
         tracing::info!(path = %path.display(), "Loaded config");
         Ok(config)
+    }
+
+    /// Returns the remote ref for the default branch (e.g., "origin/main").
+    pub fn default_remote_ref(&self) -> String {
+        format!("origin/{}", self.cluster.default_branch)
     }
 }
 
@@ -308,6 +323,9 @@ pub struct ClusterConfig {
     /// Reconciliation interval in seconds.
     #[serde(default = "default_reconcile_interval")]
     pub reconcile_interval_secs: u64,
+    /// Default branch name for the target repo (e.g., "main", "master", "trunk").
+    #[serde(default = "default_branch_name")]
+    pub default_branch: String,
 }
 
 impl Default for ClusterConfig {
@@ -327,6 +345,7 @@ impl Default for ClusterConfig {
             port: default_port(),
             max_connections: default_max_connections(),
             reconcile_interval_secs: default_reconcile_interval(),
+            default_branch: default_branch_name(),
         }
     }
 }
@@ -366,6 +385,9 @@ fn default_max_connections() -> u32 {
 }
 fn default_reconcile_interval() -> u64 {
     5
+}
+fn default_branch_name() -> String {
+    "main".to_string()
 }
 
 /// Engineer-level configuration loaded from `~/.nemo/config.toml`.
