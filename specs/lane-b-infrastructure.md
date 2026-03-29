@@ -19,7 +19,7 @@ Postgres schema, git operations, and config loading for the Nemo control plane. 
 
 #### Postgres Schema
 
-- FR-1: The `loops` table shall store all loop state including phase (HARDEN/IMPLEMENT), stage, `state` (full lifecycle: pending through shipped/cancelled), `sub_state` (dispatched/running/completed), round counter, current SHA, `harden_only` flag, `paused_from_state`, `reauth_from_state`, `failure_reason`, ship mode fields, request flags (`cancel_requested`, `approve_requested`, `resume_requested`), `needs_human_review`, and the engineer who owns it. When harden converges: if `harden_only`, state transitions to `hardened` and phase stays `harden`; if not `harden_only`, state transitions to `awaiting_approval` until engineer approves, then phase transitions to `implement`.
+- FR-1: The `loops` table shall store all loop state including phase (HARDEN/IMPLEMENT), stage, `state` (full lifecycle: pending through shipped/cancelled), `sub_state` (dispatched/running/completed), round counter, current SHA, `harden_only` flag, `auto_approve` flag, `paused_from_state`, `reauth_from_state`, `failure_reason`, ship mode fields, request flags (`cancel_requested`, `approve_requested`, `resume_requested`), `needs_human_review`, and the engineer who owns it. When harden converges: if `harden_only`, state transitions to `hardened` and phase stays `harden`; if not `harden_only` and `auto_approve = true`, skip `awaiting_approval` and transition directly to `implementing` (phase transitions to `implement`); if not `harden_only` and `auto_approve = false`, state transitions to `awaiting_approval` until engineer approves, then phase transitions to `implement`. The `auto_approve` flag is set by `nemo ship --harden` (always true) or `nemo start --harden --auto-approve` (explicit opt-in).
 - FR-2: The `jobs` table shall store every K8s job dispatched, linked to its parent loop, with status, timing, verdict JSON, `output_json` (stage output including affected_services, test results, new SHA), `attempt` (retry tracking), `feedback_path`, and token usage.
 - FR-3: The `engineers` table shall store registered engineers with their git identity, model preferences, and concurrency limits.
 - FR-4: The `egress_logs` table shall store all outbound network traffic logged by the auth sidecar, linked to the originating job.
@@ -65,9 +65,17 @@ Postgres schema, git operations, and config loading for the Nemo control plane. 
 
 ### Stage Name Mapping
 
-Job names, API query parameters, log labels, and prompt template filenames use **short stage names**: `implement`, `test`, `review`, `audit`, `revise`. The Postgres `loop_stage` enum stores **full names**: `implementing`, `testing`, `reviewing`, `spec_audit`, `spec_revise`. Mapping: `implement` <-> `implementing`, `test` <-> `testing`, `review` <-> `reviewing`. Harden stages use the same name in both contexts (`spec_audit`, `spec_revise`) since they have no short/long ambiguity.
+Job names, API query parameters, log labels, and prompt template filenames use **short stage names**: `implement`, `test`, `review`, `audit`, `revise`. The Postgres `loop_stage` enum stores **full names**: `implementing`, `testing`, `reviewing`, `spec_audit`, `spec_revise`. Full mapping:
 
-**Prompt template filenames on disk** (canonical, see Lane C FR-33-39): `implement.md`, `test.md`, `review.md`, `spec-audit.md`, `spec-revise.md`. Config references use short names; filenames use hyphenated form for harden stages.
+| Short name (jobs, API, logs) | DB enum value | Prompt template filename |
+|------------------------------|---------------|--------------------------|
+| `implement` | `implementing` | `implement.md` |
+| `test` | `testing` | `test.md` |
+| `review` | `reviewing` | `review.md` |
+| `audit` | `spec_audit` | `spec-audit.md` |
+| `revise` | `spec_revise` | `spec-revise.md` |
+
+Short names (`audit`, `revise`) are used everywhere except the DB enum. The `spec_` prefix appears ONLY in Postgres `loop_stage` enum values. Config references, job names, API parameters, and log labels always use `audit`/`revise` (no `spec_` prefix).
 
 ### Postgres Schema Detail
 
@@ -145,6 +153,7 @@ CREATE TABLE loops (
     merge_sha       TEXT,                    -- SHA of the merge commit once shipped
     ci_check_started_at TIMESTAMPTZ,        -- when CI check polling began (non-blocking)
     -- Request flags: set by API server, read by loop engine on next tick
+    auto_approve        BOOLEAN NOT NULL DEFAULT false,  -- skip AWAITING_APPROVAL gate
     cancel_requested    BOOLEAN NOT NULL DEFAULT false,
     approve_requested   BOOLEAN NOT NULL DEFAULT false,
     resume_requested    BOOLEAN NOT NULL DEFAULT false,
@@ -317,6 +326,7 @@ CREATE INDEX idx_cluster_credentials_type ON cluster_credentials(type);
 - `jobs.verdict_json` is JSONB (not a separate table) because the verdict schema is owned by the agent image and may evolve. Structured querying of verdicts is not a V1 requirement.
 - `jobs.k8s_job_name` is `UNIQUE` to enable idempotent reconciliation: if the control plane restarts, it can match running K8s jobs back to DB rows.
 - `engineers.model_preferences` is JSONB (`{"implementor": "claude-opus-4", "reviewer": "gpt-5.4"}`) because model names are free-form strings that change frequently.
+- `loops.auto_approve`: set at loop creation time from CLI flags (`nemo ship --harden` implies `auto_approve = true`; `nemo start --harden --auto-approve` sets it explicitly). When the harden phase converges and `auto_approve = true`, the loop engine skips `awaiting_approval` and transitions directly to `implementing`. When `false`, the loop enters `awaiting_approval` as normal.
 - `loops.cancel_requested`, `loops.approve_requested`, `loops.resume_requested`: boolean flags set by the API server and read by the loop engine on the next reconciliation tick. This is the communication mechanism between the two deployments (they share only Postgres, no direct RPC). Flags are reset by the loop engine after processing.
 - `loops.needs_human_review`: set when max_rounds exceeded or CI fails in ship mode. Queryable by `nemo status` to highlight loops that need engineer attention. Distinct from terminal state -- a loop can be `converged` (PR created) with `needs_human_review = true`.
 - `log_events`: structured log events persisted from pod logs. Pod logs are ephemeral and disappear after K8s Job deletion, so the loop engine streams them into this table in near-real-time. `GET /logs/:id` reads from here, not from pod logs. Columns: `stage` and `round` enable filtering (`?round=N&stage=implement`). `level` supports filtering by severity.

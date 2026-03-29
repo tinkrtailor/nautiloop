@@ -90,9 +90,17 @@ The API server and loop engine are separate k3s Deployments. They share a Postgr
 
 ### Stage Name Mapping
 
-Job names, API query parameters, log labels, and prompt template filenames use **short stage names**: `implement`, `test`, `review`, `audit`, `revise`. The Postgres `loop_stage` enum stores **full names**: `implementing`, `testing`, `reviewing`, `spec_audit`, `spec_revise`. Mapping: `implement` <-> `implementing`, `test` <-> `testing`, `review` <-> `reviewing`. Harden stages use the same name in both contexts (`spec_audit`, `spec_revise`) since they have no short/long ambiguity.
+Job names, API query parameters, log labels, and prompt template filenames use **short stage names**: `implement`, `test`, `review`, `audit`, `revise`. The Postgres `loop_stage` enum stores **full names**: `implementing`, `testing`, `reviewing`, `spec_audit`, `spec_revise`. Full mapping:
 
-**Prompt template filenames on disk** (canonical, see Lane C FR-33-39): `implement.md`, `test.md`, `review.md`, `spec-audit.md`, `spec-revise.md`. Config references use short names; filenames use hyphenated form for harden stages.
+| Short name (jobs, API, logs) | DB enum value | Prompt template filename |
+|------------------------------|---------------|--------------------------|
+| `implement` | `implementing` | `implement.md` |
+| `test` | `testing` | `test.md` |
+| `review` | `reviewing` | `review.md` |
+| `audit` | `spec_audit` | `spec-audit.md` |
+| `revise` | `spec_revise` | `spec-revise.md` |
+
+Short names (`audit`, `revise`) are used everywhere except the DB enum. The `spec_` prefix appears ONLY in Postgres `loop_stage` enum values. Config references, job names, API parameters, and log labels always use `audit`/`revise` (no `spec_` prefix).
 
 ### ConvergentLoop Trait
 
@@ -104,7 +112,7 @@ pub trait Stage: Send + Sync + 'static {
     /// The output this stage produces (written to DB as JSON).
     type Output: Serialize + DeserializeOwned;
 
-    /// Human-readable name for logging ("implement", "review", "spec_audit").
+    /// Human-readable name for logging ("implement", "review", "audit").
     fn name(&self) -> &'static str;
 
     /// Build a K8s Job spec for this stage.
@@ -748,7 +756,9 @@ Validation: same FR-9 retry logic as ReviewVerdict.
 
 ### Feedback File Schema
 
-Written by the loop engine to `$FEEDBACK_PATH` on the session PVC (not the worktree) before dispatching the next Implement job. The feedback file path is stored in `loops.feedback_path` and passed as the `FEEDBACK_PATH` environment variable to the next job.
+Written by the loop engine to `$FEEDBACK_PATH` on the session PVC (not the worktree) before dispatching the next Implement or Revise job. The feedback file path is stored in `loops.feedback_path` and passed as the `FEEDBACK_PATH` environment variable to the next job.
+
+Valid `source` values: `"review"`, `"audit"`, `"test"`. When source is `"review"` or `"audit"`, the file contains an `issues` array (from the verdict). When source is `"test"`, the file contains a `failures` array (from test results). Audit feedback has the same structure as review feedback (issues array from the audit verdict) and is used in the harden loop to feed audit findings to the revise stage.
 
 ```json
 {
@@ -762,6 +772,25 @@ Written by the loop engine to `$FEEDBACK_PATH` on the session PVC (not the workt
       "line": 42,
       "description": "Missing null check on customer_id before database lookup",
       "suggestion": "Add early return with 400 response if customer_id is null"
+    }
+  ]
+}
+```
+
+When the source is audit (harden loop -- same structure as review, categories differ per Audit Verdict Schema):
+
+```json
+{
+  "round": 2,
+  "source": "audit",
+  "issues": [
+    {
+      "severity": "high",
+      "category": "completeness",
+      "file": "specs/feature/invoice-cancel.md",
+      "line": null,
+      "description": "Missing error handling section for the cancel endpoint",
+      "suggestion": "Add a section specifying behavior when cancellation is attempted on an already-cancelled invoice"
     }
   ]
 }
@@ -786,7 +815,7 @@ When the source is test failures:
 }
 ```
 
-The implement agent receives both the spec path and the feedback file path. The agent prompt includes: "Fix the following issues found in {source}: {issues/failures}". This is prompt injection into the agent, not spec mutation (see `docs/design.md` SS Implementation Loop Logic).
+The implement/revise agent receives both the spec path and the feedback file path. The agent prompt includes: "Fix the following issues found in {source}: {issues/failures}". For the harden loop, audit feedback (source=`"audit"`) drives the revise stage. For the implement loop, review feedback (source=`"review"`) and test feedback (source=`"test"`) drive the next implement round. This is prompt injection into the agent, not spec mutation (see `docs/design.md` SS Implementation Loop Logic).
 
 ## Edge Cases
 
