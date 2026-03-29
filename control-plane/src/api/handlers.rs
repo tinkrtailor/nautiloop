@@ -13,6 +13,12 @@ use crate::types::api::{
 };
 use crate::types::{generate_branch_name, LoopKind, LoopRecord, LoopState};
 
+/// Query parameters for GET /inspect
+#[derive(Debug, serde::Deserialize)]
+pub struct InspectQuery {
+    pub branch: String,
+}
+
 /// POST /start - Submit a spec for processing.
 pub async fn start(
     State(state): State<AppState>,
@@ -315,14 +321,13 @@ pub async fn resume(
     }))
 }
 
-/// GET /inspect/*branch_path - View detailed loop state.
-/// Accepts the full branch path (e.g., agent/alice/slug-hash).
+/// GET /inspect?branch=agent/alice/slug-hash - View detailed loop state.
+/// Branch passed as query param because branch names contain slashes.
 pub async fn inspect(
     State(state): State<AppState>,
-    Path(branch_path): Path<String>,
+    Query(params): Query<InspectQuery>,
 ) -> Result<Json<InspectResponse>, NemoError> {
-    // Strip leading slash if present (axum wildcard includes it)
-    let branch = branch_path.strip_prefix('/').unwrap_or(&branch_path);
+    let branch = &params.branch;
 
     // Use get_loop_by_branch_any to include terminal loops (N5)
     let record = state

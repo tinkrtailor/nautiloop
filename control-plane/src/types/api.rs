@@ -113,7 +113,7 @@ pub struct ResumeResponse {
     pub resume_requested: bool,
 }
 
-/// GET /inspect/:user/:branch response body.
+/// GET /inspect?branch=... response body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InspectResponse {
     pub loop_id: Uuid,

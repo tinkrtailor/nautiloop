@@ -142,7 +142,7 @@ Other commands:
 - `nemo status` -- show all running loops for current user
 - `nemo status --team` -- show all loops across the team
 - `nemo logs <loop-id>` -- stream logs for a specific loop
-- `nemo inspect <user>/<branch>` -- view any teammate's in-progress work
+- `nemo inspect <branch>` -- view any teammate's in-progress work (branch passed as query param to API)
 - `nemo cancel <loop-id>` -- cancel a running loop
 - `nemo init` -- scan monorepo, detect services, generate starter `nemo.toml`. Engineer reviews and commits.
 - `nemo auth` -- pipe local model credentials (Claude Max session, OpenAI Pro tokens) to the control plane. Stored as K8s secrets scoped to the engineer. The engineer extends their own subscription into the cluster, same model as local worktrees.
@@ -501,10 +501,10 @@ The review job outputs a JSON file at `.agent/review-verdict.json`:
 
 | Review | Trigger | Why | Runs | Status | Findings |
 |--------|---------|-----|------|--------|----------|
-| CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | CLEAR | Open core strategy: Apache 2.0 + Nemo Cloud. Focused commercialization sequence. |
 | Codex Review | `/codex review` | Independent 2nd opinion | 1 | ISSUES | 16 findings, 3 substantive tensions |
 | Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | CLEAR | 12 issues (all resolved), 4 critical gaps (error handling designed) |
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
 
 **UNRESOLVED:** 0
-**VERDICT:** ENG CLEARED. Ready to implement.
+**VERDICT:** CEO + ENG CLEARED. Open core strategy decided. Ready to implement.

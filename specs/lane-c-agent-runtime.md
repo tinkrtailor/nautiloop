@@ -15,7 +15,7 @@ Runtime infrastructure for Nemo agent jobs: the container image agents execute i
 
 #### Base Agent Image
 
-- FR-1: The base image shall include git, curl, jq, build-essential, Node.js 22 LTS, and Python 3.12 runtime
+- FR-1: The base image shall include git, curl, jq, tomlq (from `pip install yq`, provides TOML-to-JSON conversion for parsing `nemo.toml`), build-essential, Node.js 22 LTS, and Python 3.12 runtime
 - FR-2: The base image shall install claude-code via `npm install -g @anthropic-ai/claude-code`
 - FR-3: The base image shall install opencode from `ghcr.io/anomalyco/opencode` (binary copy from their published image)
 - FR-4: The image entrypoint (`/usr/local/bin/nemo-agent-entry`) shall read `$STAGE` and dispatch to the correct CLI tool per the table below. The entrypoint shall use `exec` to replace the shell with the CLI tool process (or use `tini` as PID 1) to ensure correct signal handling.
@@ -26,7 +26,9 @@ Runtime infrastructure for Nemo agent jobs: the container image agents execute i
   | SPEC_REVISE | same as IMPLEMENT |
   | REVIEW | `exec opencode run --format json --prompt "$(cat $PROMPT_FILE)" -s "$SESSION_ID"` (omit `-s` if round 1) |
   | SPEC_AUDIT | same as REVIEW |
-  | TEST | `exec bash -c 'for svc in $(echo $AFFECTED_SERVICES | jq -r ".[]"); do cmd=$(jq -r ".services[\"$svc\"].test" /specs/nemo.toml); eval "$cmd"; done'` |
+  | TEST | `exec bash -c 'TOML_JSON=$(tomlq -r . /specs/nemo.toml); for svc in $(echo $AFFECTED_SERVICES | jq -r ".[]"); do cmd=$(echo "$TOML_JSON" | jq -r ".services[\"$svc\"].test"); eval "$cmd"; done'` |
+
+  Note: `nemo.toml` is TOML, not JSON. The entrypoint uses `tomlq` (included in the base image, see FR-1) to convert TOML to JSON before extracting service test commands with `jq`. `tomlq` is part of the `yq` package (`pip install yq`) which provides a `jq` wrapper for TOML files.
 
   On error, the entrypoint shall write to stderr in the format: `NEMO_ERROR: <stage>: <message>` (one line, no stack traces).
 - FR-5: For IMPLEMENT and SPEC_REVISE stages, the entrypoint shall invoke `claude -p --output-format stream-json --dangerously-skip-permissions` with the prompt assembled from template + spec + feedback. The default implement.md template MUST include the directive: "You must implement all functionality fully. Mock implementations, placeholder functions, TODO stubs, and fake data stores are forbidden. Every code path must be real and complete."
@@ -63,7 +65,7 @@ Job names, API query parameters, log labels, and prompt template filenames use *
 - FR-24: Each agent job shall be a K8s Job with `restartPolicy: Never` and two containers: `agent` and `auth-sidecar`. If the `nemo-registry-creds` Secret exists (created by Terraform when `image_pull_secret_dockerconfigjson` is provided, see FR-52), the Job template shall include `imagePullSecrets: [{ name: nemo-registry-creds }]`. Otherwise, no `imagePullSecrets` (public images or pre-pulled).
 - FR-25: The agent container shall mount: worktree volume (from bare repo PVC, path `/work`; mounted read-only for REVIEW and SPEC_AUDIT stages), session state PVC (path `/sessions`), spec files (ConfigMap or PVC, path `/specs`), output volume (emptyDir, path `/output`), shared readiness volume (emptyDir, path `/tmp/shared`), a writable tmpdir (emptyDir, path `/tmp`), and a writable home directory (emptyDir, path `/work/home`). The agent container shall set `securityContext: { runAsNonRoot: true, runAsUser: 1000, readOnlyRootFilesystem: true }`. Writable paths (all emptyDir or PVC mounts): `/work`, `/work/home`, `/output`, `/sessions`, `/tmp`, `/tmp/shared`. Environment variables for writable paths: `HOME=/work/home`, `XDG_CONFIG_HOME=/work/home/.config`, `XDG_CACHE_HOME=/work/home/.cache`, `TMPDIR=/tmp`. `/work/home` is needed because claude-code writes to `$HOME/.claude/` and opencode writes to `$HOME/.config/opencode/`.
 - FR-26: The sidecar container shall mount: model credentials Secret (path `/secrets/model-credentials`), SSH key Secret (path `/secrets/ssh-key`), shared readiness volume (emptyDir, path `/tmp/shared`). The Secret volumes shall NOT be mounted in the agent container.
-- FR-27: The Job shall set these environment variables on the agent container: `STAGE`, `SPEC_PATH`, `FEEDBACK_PATH`, `SESSION_ID`, `BRANCH`, `SHA`, `MODEL`, `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `ROUND`, `MAX_ROUNDS`, `LOOP_ID`, `HOME=/work/home`, `XDG_CONFIG_HOME=/work/home/.config`, `XDG_CACHE_HOME=/work/home/.cache`, `TMPDIR=/tmp`
+- FR-27: The Job shall set these environment variables on the agent container: `STAGE`, `SPEC_PATH`, `FEEDBACK_PATH`, `SESSION_ID`, `BRANCH`, `SHA`, `MODEL`, `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL`, `ROUND`, `MAX_ROUNDS`, `LOOP_ID`, `HOME=/work/home`, `XDG_CONFIG_HOME=/work/home/.config`, `XDG_CACHE_HOME=/work/home/.cache`, `TMPDIR=/tmp`. Note: `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL` must match `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL` (both set from the engineer's identity) to ensure commits are fully attributed to the engineer.
 - FR-28: Resource limits per job type:
 
 | Container / Job type | CPU request | CPU limit | RAM request | RAM limit |
@@ -85,10 +87,10 @@ Job names, API query parameters, log labels, and prompt template filenames use *
 
 - FR-33: Default prompt templates shall ship as files embedded in the control plane binary and written to a ConfigMap on deploy
 - FR-34: Repo-side overrides shall live in `.nemo/prompts/` and take precedence over defaults when present
-- FR-35: `implement.md` template shall include: role definition (implementer), spec contents (injected), branch/SHA context, instruction to commit changes with descriptive messages (format: `nemo: <what changed and why>`), explicit prohibition of mock/placeholder implementations ("You must implement all functionality fully. Mock implementations, placeholder functions, TODO stubs, and fake data stores are forbidden. Every code path must be real and complete."), and (if round > 1) prior review feedback in the feedback file format (see FR-40b)
+- FR-35: `implement.md` template shall include: role definition (implementer), spec contents (injected), branch/SHA context, instruction to commit changes using **conventional commit format** (`feat(scope): description` or `fix(scope): description`, where scope is the affected service or module), explicit prohibition of mock/placeholder implementations ("You must implement all functionality fully. Mock implementations, placeholder functions, TODO stubs, and fake data stores are forbidden. Every code path must be real and complete."), and (if round > 1) prior review feedback in the feedback file format (see FR-40b). The template MUST specify: "All commits must use conventional commit format: `feat(scope): description` or `fix(scope): description`. The repo enforces this via a commit hook."
 - FR-36: `review.md` template shall include: role definition (adversarial reviewer), spec contents (injected), diff context (`git diff $BASE...$SHA`), the verdict JSON schema (inline), instruction to output valid JSON matching the schema, and instruction to check for: correctness vs spec, edge cases, error handling, test coverage gaps
 - FR-37: `spec-audit.md` template shall include: role definition (spec auditor), spec contents (injected), instruction to check for: ambiguity, missing edge cases, untestable requirements, unresolved dependencies, feasibility concerns, contradiction with existing codebase patterns
-- FR-38: `spec-revise.md` template shall include: role definition (spec author/reviser), spec contents (injected), audit findings (injected), instruction to revise the spec addressing each finding without removing existing valid requirements
+- FR-38: `spec-revise.md` template shall include: role definition (spec author/reviser), spec contents (injected), audit findings (injected), instruction to revise the spec addressing each finding without removing existing valid requirements, instruction to commit changes using **conventional commit format** (`feat(scope): description` or `fix(scope): description`). The template MUST specify: "All commits must use conventional commit format."
 - FR-39: Templates shall use `{{PLACEHOLDER}}` syntax for variable injection: `{{SPEC}}`, `{{DIFF}}`, `{{FEEDBACK}}`, `{{BRANCH}}`, `{{SHA}}`, `{{VERDICT_SCHEMA}}`, `{{AFFECTED_SERVICES}}`
 - FR-40: The review verdict JSON schema (embedded in `review.md` and `spec-audit.md`) shall match the schema defined in Lane A (Review Verdict Schema / Audit Verdict Schema sections): `{ clean: bool, confidence: float, issues: [{ severity, category?, file, line, description, suggestion }], summary: string, token_usage: { input, output } }`. The `category` field on each issue is optional (not all reviewers produce categories); when present it is one of `correctness`, `security`, `performance`, `style` (for reviews) or `completeness`, `clarity`, `correctness`, `consistency` (for audits), matching Lane A's verdict schemas.
 - FR-40b: The feedback file is a first-class contract between stages. The control plane SHALL validate feedback files before dispatching the next stage. **The feedback file schema is defined in Lane A (Feedback File Schema section) and is the single source of truth.** The format is `{ round, source, issues|failures }` where `source` is `"review"`, `"spec_audit"`, or `"test"`. When source is `"review"` or `"spec_audit"`, the file contains an `issues` array (from the verdict). When source is `"test"`, the file contains a `failures` array (from test results). Example (review feedback):
@@ -150,7 +152,7 @@ Job names, API query parameters, log labels, and prompt template filenames use *
 #### TEST Stage
 
 - FR-42a: For the TEST stage, the control plane is the sole source of truth for affected services. The control plane computes affected services by running `git diff --name-only $BASE...$SHA` and mapping changed file paths against `[services.*.path]` in `nemo.toml`. The control plane passes the result as the `AFFECTED_SERVICES` environment variable (JSON array of service names) on the Job. The agent does NOT self-report affected services; there are no agent-reported service fields anywhere in the system. **Cross-reference note:** Design doc line 121-122 references agent-reported `affected_services` in implement job output. This is superseded by the control plane computing `affected_services` from git diff (Lane B/C decision from adversarial review). Lane A `ImplOutput` updated to remove `affected_services` field.
-- FR-42b: The entrypoint shall look up the test command for each affected service from `nemo.toml` (mounted as a ConfigMap at `/specs/nemo.toml`), under the `[services.<name>.test]` section
+- FR-42b: The entrypoint shall look up the test command for each affected service from `nemo.toml` (mounted as a ConfigMap at `/specs/nemo.toml`), under the `[services.<name>.test]` section. Since `nemo.toml` is TOML (not JSON), the entrypoint uses `tomlq` to convert to JSON before extracting fields with `jq`.
 - FR-42c: The entrypoint shall run each test command, capture exit code, stdout, and stderr per service
 - FR-42d: The entrypoint shall write structured test results to `/output/result.json` and stdout (with `NEMO_RESULT:` prefix per FR-13) using the common result envelope with stage `"test"` and data: `{ services: [{ name, test_command, exit_code, stdout, stderr }], all_passed: bool, ci_status: "passed|failed|unknown", token_usage }`. The `ci_status` field uses a three-state model: `passed` (all tests exit 0), `failed` (at least one test exit non-zero with test output), `unknown` (test harness itself failed, e.g., command not found, timeout, OOM — cannot determine test results). The control plane uses this to distinguish "code is broken" from "test infrastructure is broken".
 
@@ -172,7 +174,7 @@ Job names, API query parameters, log labels, and prompt template filenames use *
   | `v1/PersistentVolumeClaims` | get, list | Access bare repo and session PVCs |
 
   The API server ServiceAccount needs only Secrets (create, update, get) in `nemo-jobs` for `nemo auth` credential writes.
-- FR-47: The module shall create a 100Gi PVC for the shared bare repo. An init Job (`nemo-repo-init`) shall run before any optional fetch CronJob is enabled. The init Job:
+- FR-47: The module shall create a 100Gi PVC for the shared bare repo. An init Job (`nemo-repo-init`) shall run on first deploy to initialize the bare repo. The init Job:
 
   ```yaml
   apiVersion: batch/v1
@@ -230,16 +232,21 @@ Job names, API query parameters, log labels, and prompt template filenames use *
     backoffLimit: 3
   ```
 
-  Terraform also creates a ConfigMap `nemo-cluster-config` with keys: `git_repo_url`, `domain`. This ConfigMap is referenced by Jobs and CronJobs via `valueFrom.configMapKeyRef` instead of Terraform string interpolation in YAML values.
+  Terraform also creates a ConfigMap `nemo-cluster-config` with keys: `git_repo_url`, `domain`. This ConfigMap is referenced by Jobs via `valueFrom.configMapKeyRef` instead of Terraform string interpolation in YAML values.
 
-  OPTIONAL background fetch CronJob for cache warmth. The authoritative fetch happens per-job via control plane's `prepare_worktree()`. The CronJob is a performance optimization, not a correctness requirement. If deployed, it runs `git fetch --all` every 60 seconds alongside the init Job (CronJob `suspend: true` until init completes; Terraform uses `depends_on`).
+  **The authoritative fetch is per-job**, executed by the control plane's `prepare_worktree()` before each job dispatch (see Lane B FR-10). There is NO fetch CronJob in V1. The per-job fetch ensures the worktree always reflects the latest remote state at dispatch time without stale-cache risk.
 
 - FR-48: The module shall configure nginx-ingress with Let's Encrypt TLS via cert-manager. Prerequisites: the user must pre-create a DNS A record pointing `domain` to the server IP. Terraform inputs for TLS: `acme_email` (required), `ingress_class` (default `nginx`). cert-manager uses HTTP-01 challenge by default (requires port 80 open). The ClusterIssuer resource is created by Terraform.
 - FR-49: The module shall create a K8s Namespace `nemo-system` for control plane components and `nemo-jobs` for agent jobs
 - FR-50: The module shall create the `nemo-jobs` namespace. RBAC is defined in FR-46b. Per-engineer secrets (SSH key + model credentials) are NOT created by Terraform; they are created by `nemo auth` via the control plane API at runtime. Secret naming convention: `nemo-creds-{engineer-name}`.
-- FR-51: Required input variables: `hetzner_api_token`, `domain`, `git_repo_url`, `ssh_public_keys` (for server access), `acme_email` (for Let's Encrypt), `ssh_known_hosts` (string containing known_hosts entries for the git remote; user provides via `ssh-keyscan github.com > known_hosts` or equivalent). **Prerequisite:** User must create a DNS A record pointing `domain` to the Hetzner server IP BEFORE running `terraform apply`. Terraform does not manage DNS records (DNS providers vary). cert-manager HTTP-01 challenge will fail without the A record.
-- FR-51b: The module shall create a ConfigMap `nemo-ssh-known-hosts` from the `ssh_known_hosts` input variable. This ConfigMap is mounted into the repo-init Job (FR-47), the fetch CronJob, and agent Job sidecars (FR-18 git proxy). If `ssh_known_hosts` is not provided, Terraform shall run a `null_resource` provisioner that executes `ssh-keyscan` against the git remote host (extracted from `git_repo_url`) and populates the ConfigMap. The `null_resource` approach is a convenience fallback; providing `ssh_known_hosts` explicitly is preferred for reproducibility.
+- FR-51: Required input variables: `hetzner_api_token`, `domain`, `git_repo_url`, `ssh_public_keys` (for server access), `acme_email` (for Let's Encrypt), `ssh_known_hosts` (string containing known_hosts entries for the git remote; user provides via `ssh-keyscan github.com > known_hosts` or equivalent), `git_host_token` (GitHub PAT with repo + PR permissions for PR creation/merge in ship mode, stored in `nemo-git-host-token` K8s Secret per FR-52b). **Prerequisite:** User must create a DNS A record pointing `domain` to the Hetzner server IP BEFORE running `terraform apply`. Terraform does not manage DNS records (DNS providers vary). cert-manager HTTP-01 challenge will fail without the A record.
+- FR-51b: The module shall create a ConfigMap `nemo-ssh-known-hosts` from the `ssh_known_hosts` input variable. This ConfigMap is mounted into the repo-init Job (FR-47) and agent Job sidecars (FR-18 git proxy). If `ssh_known_hosts` is not provided, Terraform shall run a `null_resource` provisioner that executes `ssh-keyscan` against the git remote host (extracted from `git_repo_url`) and populates the ConfigMap. The `null_resource` approach is a convenience fallback; providing `ssh_known_hosts` explicitly is preferred for reproducibility.
 - FR-52: Optional input variables: `server_type` (default `ccx43`), `server_location` (default `fsn1`), `node_count` (default `1`, for future multi-node support), `postgres_password`, `control_plane_image`, `agent_base_image`, `k3s_version` (default `v1.30.4+k3s1`), `nginx_ingress_version` (default `v1.10.0`), `cert_manager_version` (default `v1.14.0`), `ingress_class` (default `nginx`), `image_pull_secret_dockerconfigjson` (default `null`; if provided, Terraform creates a `kubernetes.io/dockerconfigjson` Secret named `nemo-registry-creds` in `nemo-jobs` namespace, and Job templates reference it in `imagePullSecrets`)
+- FR-52b: The module shall provision two cluster-level K8s Secrets in the `nemo-system` namespace for control plane auth and git host integration:
+  - `nemo-api-key`: Contains a generated API key (`NEMO_API_KEY`) used by the CLI to authenticate against the control plane API. Terraform generates a random 32-byte hex token and stores it in this Secret. The API server reads this on startup.
+  - `nemo-git-host-token`: Contains a GitHub PAT (`GIT_HOST_TOKEN`) for PR creation and merge operations. Provided via Terraform input variable `git_host_token` (required). The control plane reads this on startup to interact with the git host API (create PRs, merge PRs in ship mode, check CI status).
+
+  Both Secrets are mounted into the control plane Deployments (API server and loop engine). The corresponding `cluster_credentials` rows in Postgres (see Lane B FR-4c) are seeded by a post-migration init step referencing these Secret names.
 - FR-53: Outputs: `control_plane_url`, `kubeconfig` (sensitive), `server_ip`, `namespace_jobs`, `namespace_system`
 - FR-54: The module shall configure k3s container log rotation: 50MB max per container, 5 files retained
 - FR-55: The module shall deploy a CronJob that runs `pg_dump` daily, writing backups to `/data/backups/` on the host (hostPath volume). Backups are retained for 7 days; the CronJob deletes files older than 7 days before writing the new backup.
@@ -269,7 +276,7 @@ Job names, API query parameters, log labels, and prompt template filenames use *
 - NFR-7: Model API proxy shall not buffer request/response bodies (stream through) to support streaming model responses
 - NFR-8: All sidecar logs shall be structured JSON (parseable by k3s log collection)
 - NFR-9: Terraform state shall be stored locally (no remote backend for V1). The `kubeconfig` output shall be marked sensitive.
-- NFR-10: If the optional git fetch CronJob is deployed, it shall not block worktree creation (fetch operates on the bare repo; worktree ops take the control plane mutex, not a filesystem lock on the fetch process)
+- NFR-10: _(Reserved for future use.)_ **V1 has no git fetch CronJob.** All fetches are per-job via `prepare_worktree()`. A background fetch CronJob is a potential V2+ optimization for cache warmth on high-traffic clusters, but is not required for correctness.
 
 ## Behavior
 
@@ -336,7 +343,7 @@ The control plane owns the full lifecycle of git worktrees. Before creating a K8
 | k3s API unreachable from control plane | Job creation fails with connection error | Control plane retries with 10s backoff, max 3 attempts | If persistent, alert (k3s down or network issue) |
 | Postgres PVC full | Postgres pod restarts with disk pressure | Control plane health check detects DB connection failure | Manual: expand PVC or clean old data |
 | cert-manager fails TLS | Ingress serves self-signed cert | Control plane still reachable (CLI can skip TLS verify for V1) | Check DNS, cert-manager logs. Re-run terraform apply. |
-| Agent writes to bare repo directly (bug) | Should not happen (push goes through sidecar proxy, which pushes to remote) | If detected, bare repo fetch cron self-heals by resetting to remote state | Fix the bug in entrypoint |
+| Agent writes to bare repo directly (bug) | Should not happen (push goes through sidecar proxy, which pushes to remote) | If detected, per-job fetch in `prepare_worktree()` self-heals by resetting to remote state | Fix the bug in entrypoint |
 
 ## Out of Scope
 
@@ -386,7 +393,7 @@ The control plane owns the full lifecycle of git worktrees. Before creating a K8
 - [ ] Agent exits with code 111 when sidecar proxy connection fails
 - [ ] Feedback file validates against the JSON schema (FR-40b) before the control plane dispatches next stage
 - [ ] `NEMO_RESULT:` prefix on stdout result line is correctly parsed by control plane
-- [ ] Init Job (`nemo-repo-init`) creates bare repo, configures remote, fetches. Optional CronJob (if deployed) runs only after init completes.
+- [ ] Init Job (`nemo-repo-init`) creates bare repo, configures remote, fetches. No fetch CronJob in V1; all fetches are per-job via `prepare_worktree()`.
 - [ ] Integration tests for git module: branch create from correct ref, push before PR, worktree cleanup, concurrent worktree operations against a real git repo
 - [ ] Default implement.md template contains the mock/placeholder prohibition directive
 - [ ] Postgres backup written to /data/backups/ on host, files older than 7 days cleaned up

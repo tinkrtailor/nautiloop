@@ -54,7 +54,7 @@ Greenfield implementation of Cargo workspace with two crates: `control-plane` (l
 
 ### Step 8: API Server (axum)
 **Status:** DONE
-- POST /start (renamed from /submit per spec), GET /status, GET /logs/:id, DELETE /cancel/:id, POST /approve/:id, POST /resume/:id, GET /inspect/:user/:branch
+- POST /start (renamed from /submit per spec), GET /status, GET /logs/:id, DELETE /cancel/:id, POST /approve/:id, POST /resume/:id, GET /inspect?branch=... (query param, not path segment)
 - SSE streaming for active loop logs
 - Auth middleware (API key, wired into router)
 - Ship mode validation: returns 400 when [ship] allowed = false

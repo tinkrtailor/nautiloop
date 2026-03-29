@@ -25,6 +25,7 @@ Postgres schema, git operations, and config loading for the Nemo control plane. 
 - FR-4: The `egress_logs` table shall store all outbound network traffic logged by the auth sidecar, linked to the originating job.
 - FR-4a: The `log_events` table shall store structured log events (id, loop_id, timestamp, stage, round, level, message) persisted from pod logs by the loop engine. This is the source for `GET /logs/:id`.
 - FR-4b: The `engineer_credentials` table shall store per-engineer, per-provider credential references (id, engineer_id, provider, credential_ref, valid, created_at, updated_at). Unique on `(engineer_id, provider)`.
+- FR-4c: The `cluster_credentials` table shall store cluster-level credentials used by the control plane itself (id, type [`api_key`, `mtls_cert`, `git_host_token`], credential_ref pointing to a K8s Secret, description, created_at). These are not per-engineer credentials; they are cluster-wide (e.g., `NEMO_API_KEY` for CLI authentication, `GIT_HOST_TOKEN` GitHub PAT for PR creation/merge operations). The control plane reads these on startup to configure API auth and git host integration.
 - FR-5: All schema changes shall be managed via `sqlx migrate` with sequential, timestamped migration files checked into the repo.
 - FR-5a: Migrations shall run as a separate K8s Job (`helm.sh/hook: pre-upgrade`) BEFORE either API server or loop engine Deployment starts. Both binaries verify schema version on startup but do not run migrations themselves. This ensures schema consistency across split deployments.
 - FR-6: The schema shall enforce referential integrity: jobs reference loops, loops reference engineers, egress_logs reference jobs, log_events reference loops, engineer_credentials reference engineers.
@@ -57,7 +58,7 @@ Postgres schema, git operations, and config loading for the Nemo control plane. 
 - NFR-2: `create_worktree` shall complete in < 2s for repos up to 5 GB bare size, on the target CCX43 NVMe disk with warm filesystem cache.
 - NFR-3: `git fetch` shall time out after 120s. Fetch failure shall not crash the control plane; the job is retried with backoff.
 - NFR-4: Config parsing shall fail fast on startup with clear error messages naming the exact field and layer that failed validation.
-- NFR-5: All Postgres operations shall use connection pooling (sqlx `PgPool`, max 10 connections for V1).
+- NFR-5: All Postgres operations shall use connection pooling (sqlx `PgPool`, max 20 connections shared across API server and loop engine via connection string config, matching Lane A NFR-3).
 - NFR-6: Schema migrations shall be forward-only. No down migrations. Breaking changes require a new migration that transforms data.
 
 ## Behavior
@@ -276,6 +277,21 @@ CREATE TRIGGER trg_jobs_updated_at
 CREATE TRIGGER trg_engineer_credentials_updated_at
     BEFORE UPDATE ON engineer_credentials
     FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+-- Cluster-level credentials for control plane operations (API auth, git host tokens).
+-- These are NOT per-engineer; they are cluster-wide credentials used by the control
+-- plane itself (e.g., to create/merge PRs, authenticate CLI requests).
+CREATE TYPE credential_type AS ENUM ('api_key', 'mtls_cert', 'git_host_token');
+
+CREATE TABLE cluster_credentials (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    type            credential_type NOT NULL,
+    credential_ref  TEXT NOT NULL,           -- K8s Secret name or reference
+    description     TEXT,                    -- human-readable label (e.g., "GitHub PAT for PR operations")
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_cluster_credentials_type ON cluster_credentials(type);
 
 -- Retention: egress_logs older than 30 days auto-pruned by a scheduled task.
 -- Implemented as a pg_cron job or control-plane scheduled task:
@@ -557,7 +573,7 @@ This replaces the old `SELECT COUNT(*) ... FOR UPDATE` approach which required a
 
 ### Branch Lookup for Inspect (Lane A `/inspect` endpoint)
 
-The `/inspect/:user/:branch` endpoint needs to find loops by branch name. Since branches can be resubmitted after terminal states, multiple loops may share the same branch.
+The `GET /inspect?branch=...` endpoint accepts the full branch name as a query parameter (not a path segment) because branch names contain slashes (e.g., `agent/alice/slug-hash`). Since branches can be resubmitted after terminal states, multiple loops may share the same branch.
 
 ```sql
 -- get_loop_by_branch_any(): returns the most recent loop for a branch.

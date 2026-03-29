@@ -108,6 +108,10 @@ pub trait Stage: Send + Sync + 'static {
     fn name(&self) -> &'static str;
 
     /// Build a K8s Job spec for this stage.
+    /// The Job spec MUST set both GIT_AUTHOR_NAME/EMAIL and GIT_COMMITTER_NAME/EMAIL
+    /// from the engineer's identity. Prompt templates for implement/revise stages
+    /// MUST instruct the agent to use conventional commit format:
+    /// `feat(scope): description` or `fix(scope): description`.
     fn job_spec(
         &self,
         ctx: &LoopContext,
@@ -366,7 +370,7 @@ Special transitions:
 ### Loop Engine Binary
 
 **Startup:**
-1. Connect to Postgres (sqlx pool, run migrations)
+1. Connect to Postgres (sqlx pool). Verify schema version matches expected version (do NOT run migrations; migrations are handled by a separate pre-upgrade K8s Job per Lane B FR-5a). If schema version mismatch, refuse to start with error: "Schema version mismatch: expected {expected}, found {actual}. Run migrations before starting."
 2. Initialize kube-rs client (in-cluster config)
 3. Load all loops with state not in (CONVERGED, FAILED, CANCELLED, HARDENED, SHIPPED) from DB
 4. Start reconciliation loop (tick every loop, 5s interval)
@@ -410,7 +414,7 @@ Special transitions:
 ### API Server Binary
 
 **Startup:**
-1. Connect to Postgres (shared pool)
+1. Connect to Postgres (shared pool). Verify schema version matches expected version (do NOT run migrations; migrations are handled by a separate pre-upgrade K8s Job per Lane B FR-5a). If schema version mismatch, refuse to start with error: "Schema version mismatch: expected {expected}, found {actual}. Run migrations before starting."
 2. Bind HTTP server (axum) on `:8080`
 3. Apply auth middleware (API key from `Authorization: Bearer <key>` header, or mTLS client cert)
 
@@ -545,11 +549,13 @@ The response returns the current state. The transition back to the active stage 
 Error (409) if loop is not in `paused_remote_ahead`, `paused_force_deviated`, or AWAITING_REAUTH state.
 Error (400) if loop is in `paused_force_deviated` and `force=true` is not provided.
 
-#### `GET /inspect/:user/:branch`
+#### `GET /inspect`
 
-View detailed state of a loop by engineer and branch name. Returns the **most recent** loop for that branch (active preferred, then most recent terminal by `created_at DESC`). This handles resubmitted branches where multiple loops may share the same branch name.
+View detailed state of a loop by branch name. The branch is passed as a query parameter (not a path segment) because branch names contain slashes (e.g., `agent/alice/slug-hash`).
 
-Query parameters: `?all=true` (optional) returns ALL loops for that branch, ordered by `created_at DESC`.
+Query parameters: `?branch=agent/alice/slug-hash` (required), `?all=true` (optional) returns ALL loops for that branch, ordered by `created_at DESC`.
+
+Returns the **most recent** loop for that branch (active preferred, then most recent terminal by `created_at DESC`). This handles resubmitted branches where multiple loops may share the same branch name.
 
 The underlying query uses `get_loop_by_branch_any()` (see Lane B) which orders by `created_at DESC LIMIT 1` by default, or returns all rows when `all=true`.
 
@@ -631,7 +637,8 @@ UTILITY COMMANDS:
 
   approve <loop-id>         Approve a loop awaiting approval
 
-  inspect <user>/<branch>   Show detailed loop state, round history, and verdicts
+  inspect <branch>          Show detailed loop state, round history, and verdicts
+                            Branch passed as query param (supports slashes in branch names)
 
   resume <loop-id>          Resume a paused_remote_ahead, paused_force_deviated, or AWAITING_REAUTH loop
     --force                 Required for paused_force_deviated (discards agent commits)
@@ -856,7 +863,7 @@ The implement agent receives both the spec path and the feedback file path. The 
 - [ ] `POST /start` returns 409 when branch already has an active loop
 - [ ] `DELETE /cancel/:id` kills the active K8s Job and transitions to CANCELLED
 - [ ] `GET /logs/:id` streams real-time SSE from active loop, returns full history for completed loop
-- [ ] `GET /inspect/:user/:branch` returns full round history with verdicts
+- [ ] `GET /inspect?branch=agent/alice/slug-hash` returns full round history with verdicts (branch as query param, not path segment)
 - [ ] Loop engine recovers all in-progress loops after crash/restart
 - [ ] CLI `nemo start --harden spec.md` triggers hardening then implementation pipeline
 - [ ] CLI `nemo harden spec.md` triggers hardening loop only, terminates at HARDENED
