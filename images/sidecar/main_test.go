@@ -18,7 +18,7 @@ func TestExtractGitHost(t *testing.T) {
 		{"https://github.com/user/repo.git", "github.com"},
 		{"git@gitlab.com:group/project.git", "gitlab.com"},
 		{"https://gitlab.com/group/project.git", "gitlab.com"},
-		{"", "github.com"}, // fallback
+		{"", ""}, // empty input = empty host (validated at startup)
 	}
 
 	for _, tt := range tests {

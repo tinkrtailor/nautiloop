@@ -362,7 +362,7 @@ pub async fn inspect(
         .store
         .get_loop_by_branch_any(branch)
         .await?
-        .ok_or(NemoError::LoopNotFound { id: Uuid::nil() })?;
+        .ok_or_else(|| NemoError::BadRequest(format!("No loop found for branch: {branch}")))?;
 
     let rounds = state.store.get_rounds(record.id).await?;
 

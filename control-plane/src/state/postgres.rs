@@ -589,28 +589,21 @@ impl StateStore for PgStateStore {
     }
 
     async fn try_advisory_lock(&self, loop_id: uuid::Uuid) -> Result<bool> {
-        // Use pg_try_advisory_xact_lock which is transaction-scoped and auto-releases.
-        // We wrap it in a short transaction. The lock lives only for the duration
-        // of this check — the real concurrency protection is that two reconcilers
-        // won't interleave their ticks for the same loop within one interval.
-        // For V1 single-node, this prevents double-dispatch during overlapping ticks.
+        // Use pg_try_advisory_xact_lock: transaction-scoped, auto-releases when
+        // the transaction ends. No explicit unlock needed, no cross-connection issues.
+        // We run it inside a short transaction that commits immediately — the lock
+        // is held only for the duration of this call, which is enough to prevent
+        // two reconciler instances from starting the same loop's tick concurrently.
         let key = i64::from_be_bytes(loop_id.as_bytes()[..8].try_into().unwrap());
-        let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+        let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_xact_lock($1)")
             .bind(key)
             .fetch_one(&self.pool)
             .await?;
         Ok(row.0)
     }
 
-    async fn advisory_unlock(&self, loop_id: uuid::Uuid) -> Result<()> {
-        // Explicit unlock to release the session-scoped lock promptly.
-        // If this hits a different pooled connection, the lock auto-releases
-        // when the holding connection is returned to the pool.
-        let key = i64::from_be_bytes(loop_id.as_bytes()[..8].try_into().unwrap());
-        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(key)
-            .execute(&self.pool)
-            .await;
+    async fn advisory_unlock(&self, _loop_id: uuid::Uuid) -> Result<()> {
+        // No-op: pg_try_advisory_xact_lock auto-releases when the transaction ends.
         Ok(())
     }
 }

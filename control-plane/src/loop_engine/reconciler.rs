@@ -100,23 +100,34 @@ impl Reconciler {
                 }
                 Err(e) => {
                     if e.is_fatal() {
-                        // Fatal error: transition to FAILED so we don't retry forever
+                        // Fatal error: transition to FAILED so we don't retry forever.
+                        // Re-read the current record to avoid overwriting fields that
+                        // tick() may have updated before failing.
                         tracing::error!(
                             loop_id = %loop_record.id,
                             error = %e,
                             "Fatal tick error, transitioning to FAILED"
                         );
-                        let mut failed = loop_record.clone();
-                        failed.state = crate::types::LoopState::Failed;
-                        failed.sub_state = None;
-                        failed.failure_reason = Some(format!("Fatal error: {e}"));
-                        failed.active_job_name = None;
-                        if let Err(update_err) = self.store.update_loop(&failed).await {
-                            tracing::error!(
-                                loop_id = %loop_record.id,
-                                error = %update_err,
-                                "Failed to mark loop as FAILED"
-                            );
+                        match self.store.get_loop(loop_record.id).await {
+                            Ok(Some(mut current)) => {
+                                current.state = crate::types::LoopState::Failed;
+                                current.sub_state = None;
+                                current.failure_reason = Some(format!("Fatal error: {e}"));
+                                current.active_job_name = None;
+                                if let Err(update_err) = self.store.update_loop(&current).await {
+                                    tracing::error!(
+                                        loop_id = %loop_record.id,
+                                        error = %update_err,
+                                        "Failed to mark loop as FAILED"
+                                    );
+                                }
+                            }
+                            _ => {
+                                tracing::error!(
+                                    loop_id = %loop_record.id,
+                                    "Could not re-read loop to mark as FAILED"
+                                );
+                            }
                         }
                     } else {
                         tracing::warn!(
