@@ -95,15 +95,14 @@ variable "agent_base_image" {
 }
 
 variable "k3s_version" {
-  description = "k3s version to install"
+  description = "k3s version to install (v1.32+ required for Traefik v3 CRDs)"
   type        = string
-  default     = "v1.30.4+k3s1"
-}
+  default     = "v1.32.13+k3s1"
 
-variable "nginx_ingress_version" {
-  description = "nginx-ingress controller version"
-  type        = string
-  default     = "v1.10.0"
+  validation {
+    condition     = can(regex("^v1\\.(3[2-9]|[4-9][0-9])", var.k3s_version))
+    error_message = "k3s_version must be v1.32 or later (Traefik v3 CRDs required)."
+  }
 }
 
 variable "cert_manager_version" {
@@ -112,11 +111,7 @@ variable "cert_manager_version" {
   default     = "v1.14.0"
 }
 
-variable "ingress_class" {
-  description = "Ingress class name"
-  type        = string
-  default     = "nginx"
-}
+
 
 variable "image_pull_secret_dockerconfigjson" {
   description = "Docker config JSON for private registry access. If provided, creates nemo-registry-creds Secret."

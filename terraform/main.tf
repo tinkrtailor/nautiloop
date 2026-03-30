@@ -24,7 +24,13 @@ resource "hcloud_server" "nemo" {
 
 # FR-44: Install k3s via remote-exec after cloud-init
 resource "null_resource" "k3s_install" {
-  depends_on = [hcloud_server.nemo]
+  depends_on = [hcloud_server.nemo, hcloud_volume_attachment.nemo_data]
+
+  # Re-run if k3s version changes (ensures Traefik is enabled on existing clusters)
+  triggers = {
+    k3s_version = var.k3s_version
+    server_id   = hcloud_server.nemo.id
+  }
 
   connection {
     type        = "ssh"
@@ -36,7 +42,7 @@ resource "null_resource" "k3s_install" {
   provisioner "remote-exec" {
     inline = [
       "cloud-init status --wait || true",
-      "curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=${var.k3s_version} sh -s - server --disable traefik",
+      "curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=${var.k3s_version} sh -s - server",
       "until kubectl get nodes 2>/dev/null | grep -q ' Ready'; do sleep 2; done",
       # FR-54: Configure container log rotation
       "mkdir -p /etc/rancher/k3s",
@@ -47,6 +53,11 @@ resource "null_resource" "k3s_install" {
       "EOF",
       "systemctl restart k3s",
       "until kubectl get nodes 2>/dev/null | grep -q ' Ready'; do sleep 2; done",
+      # Wait for Traefik CRDs and deployment (k3s deploys AddOns asynchronously).
+      # Timeout after 120s — if Traefik doesn't come up, fail fast.
+      "TRIES=0; until kubectl get crd ingressroutes.traefik.io 2>/dev/null || [ $TRIES -ge 60 ]; do sleep 2; TRIES=$((TRIES+1)); done",
+      "kubectl get crd ingressroutes.traefik.io || { echo 'ERROR: Traefik CRDs not registered after 120s'; exit 1; }",
+      "kubectl -n kube-system rollout status deployment/traefik --timeout=120s",
     ]
   }
 }
