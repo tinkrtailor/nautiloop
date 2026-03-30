@@ -60,21 +60,80 @@ Cross-model adversarial review: Claude never reviews its own work. A different m
 
 Add `--harden` to `start` or `ship` to run spec hardening first.
 
-## Quick start
+## Prerequisites
+
+- [1Password CLI](https://developer.1password.com/docs/cli) (`op`) — all secrets managed via 1Password
+- [Terraform](https://developer.hashicorp.com/terraform/install) >= 1.5
+- [Docker](https://docs.docker.com/get-docker/) with buildx
+- A "Nemo" vault in 1Password with these items:
+
+| 1Password Item | Fields | Purpose |
+|----------------|--------|---------|
+| `hetzner-cloud` | `credential` | Hetzner Cloud API token |
+| `nemo-domain` | `domain`, `email` | Control plane domain + ACME email |
+| `nemo-repo` | `ssh_url` | Git repo URL (SSH format) |
+| `github-pat` | `credential` | GitHub PAT for PR creation/merge |
+| `nemo-deploy-key` | `private_key` | SSH deploy key for repo access |
+| `github-registry` | `username`, `pat` | GHCR credentials for image push/pull |
+| `ssh-public-key` | `public_key` | SSH public key for server access |
+
+## Deploy
+
+### 1. Build and push images
 
 ```bash
-# 1. Infra lead provisions the cluster (once)
-cd terraform && terraform apply
+./build-images.sh --tag 0.1.0
+```
 
-# 2. Each engineer (once)
+Builds 3 images (control-plane, agent-base, sidecar), pushes to GHCR. Authenticates via 1Password automatically.
+
+Options: `--no-push` (local only), `--only control-plane` (single image), `--platform linux/arm64` (override arch).
+
+### 2. Provision the cluster
+
+```bash
+cd terraform
+op run --env-file=.env.1password -- terraform init
+op run --env-file=.env.1password -- terraform apply
+```
+
+This provisions a Hetzner VPS, installs k3s with Traefik, deploys Postgres, the control plane (API + loop engine), and initializes the bare repo. Takes ~5 minutes on first run.
+
+### 3. Set up each engineer
+
+```bash
 cd ~/your-monorepo
 nemo init                    # generates nemo.toml
 nemo auth --claude --openai  # pushes credentials to cluster
+```
 
-# 3. Daily
+### 4. Use it
+
+```bash
 nemo start spec.md           # PR appears when done
-nemo ship spec.md            # auto-merges when done
+nemo ship spec.md            # implement + auto-merge on convergence
+nemo harden spec.md          # harden spec before implementing
 nemo status                  # check progress
+nemo logs <loop_id>          # stream job logs
+```
+
+### Teardown (save money)
+
+```bash
+cd terraform
+op run --env-file=.env.1password -- terraform destroy
+```
+
+Destroys the server but keeps the Hetzner volume (Postgres data persists). Next `terraform apply` reattaches the same volume — no data loss.
+
+### Update (new images)
+
+```bash
+./build-images.sh --tag 0.2.0
+cd terraform
+op run --env-file=.env.1password -- terraform apply \
+  -var="control_plane_image=ghcr.io/tinkrtailor/nemo-control-plane:0.2.0" \
+  -var="agent_base_image=ghcr.io/tinkrtailor/nemo-agent-base:0.2.0"
 ```
 
 ## Configuration
