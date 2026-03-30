@@ -266,15 +266,6 @@ resource "kubernetes_deployment" "loop_engine" {
             }
           }
           env {
-            name = "NEMO_API_KEY"
-            value_from {
-              secret_key_ref {
-                name = "nemo-api-key"
-                key  = "NEMO_API_KEY"
-              }
-            }
-          }
-          env {
             name  = "BARE_REPO_PATH"
             value = "/bare-repo"
           }
@@ -371,7 +362,7 @@ resource "kubernetes_job" "repo_init" {
           command = ["/bin/sh", "-c"]
           args = [<<-EOT
             set -e
-            if [ ! -d /bare-repo/HEAD ]; then
+            if [ ! -e /bare-repo/HEAD ]; then
               git init --bare /bare-repo
             fi
             git -C /bare-repo remote remove origin 2>/dev/null || true
