@@ -110,34 +110,42 @@ All outputs are machine-readable via `terraform output -json`.
 
 ## Examples
 
-### Hetzner Cloud
+### Hetzner Cloud + Tailscale (recommended)
 
-See `terraform/examples/hetzner/` for a complete example that provisions a Hetzner VPS and calls the module. Supports 1Password for secrets management.
+See `terraform/examples/hetzner/` — hardened setup with Tailscale VPN.
+
+- SSH only via Tailscale (not exposed publicly)
+- API (8080) only via Tailscale — `http://nemo:8080` (MagicDNS)
+- Hetzner firewall blocks everything except Tailscale + optional HTTPS
+- fail2ban, unattended-upgrades, password auth disabled
 
 ```bash
 cd terraform/examples/hetzner
 terraform init
-op run --env-file=.env.1password -- terraform apply   # with 1Password
-# or
-terraform apply                                        # with TF_VAR_* env vars
+terraform apply \
+  -var="hetzner_api_token=$HETZNER_TOKEN" \
+  -var="tailscale_auth_key=$TS_AUTHKEY" \
+  -var='ssh_public_keys=["ssh-ed25519 AAAA..."]' \
+  -var="git_repo_url=git@github.com:me/repo.git" \
+  -var="git_host_token=$GITHUB_PAT"
 ```
 
 ### Existing server (any provider)
 
-See `terraform/examples/existing-server/` — bring your own IP.
+See `terraform/examples/existing-server/` — bring your own IP. The module is network-agnostic: pass a Tailscale IP, WireGuard IP, or public IP.
 
 ```bash
 cd terraform/examples/existing-server
 terraform init
 terraform apply \
-  -var="server_ip=203.0.113.10" \
+  -var="server_ip=100.64.0.1" \
   -var="git_repo_url=git@github.com:me/repo.git" \
   -var="git_host_token=ghp_..."
 ```
 
 ### IP-only (no domain)
 
-Set `domain = null` (the default). The control plane runs on HTTP at `http://IP:8080`. No cert-manager, no TLS.
+Set `domain = null` (the default). The control plane runs on HTTP at `http://IP:8080`. With Tailscale, this is `http://nemo:8080`. No cert-manager, no TLS.
 
 ### With domain + TLS
 

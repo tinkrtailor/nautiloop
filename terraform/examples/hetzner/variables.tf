@@ -1,4 +1,4 @@
-# Hetzner-specific variables + pass-through to Nemo module
+# Hetzner + Tailscale example variables
 
 # --- Hetzner ---
 
@@ -8,8 +8,14 @@ variable "hetzner_api_token" {
   sensitive   = true
 }
 
+variable "tailscale_auth_key" {
+  description = "Tailscale auth key (reusable, ephemeral recommended). Generate at https://login.tailscale.com/admin/settings/keys"
+  type        = string
+  sensitive   = true
+}
+
 variable "ssh_public_keys" {
-  description = "SSH public keys for server access"
+  description = "SSH public keys for initial Hetzner server access (before Tailscale is up)"
   type        = list(string)
 }
 
@@ -52,7 +58,7 @@ variable "repo_ssh_private_key" {
 }
 
 variable "domain" {
-  description = "Domain for the control plane. null = HTTP on raw IP."
+  description = "Domain for public HTTPS. null = API only reachable via Tailscale."
   type        = string
   default     = null
 }
