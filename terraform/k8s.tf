@@ -260,6 +260,21 @@ resource "kubernetes_secret" "registry_creds" {
   }
 }
 
+# Registry creds in nemo-system (for control plane image pulls)
+resource "kubernetes_secret" "registry_creds_system" {
+  count      = var.image_pull_secret_dockerconfigjson != null ? 1 : 0
+  depends_on = [kubernetes_namespace.system]
+
+  metadata {
+    name      = "nemo-registry-creds"
+    namespace = "nemo-system"
+  }
+  type = "kubernetes.io/dockerconfigjson"
+  data = {
+    ".dockerconfigjson" = var.image_pull_secret_dockerconfigjson
+  }
+}
+
 # FR-46b: RBAC for loop engine ServiceAccount
 
 resource "kubernetes_service_account" "loop_engine" {

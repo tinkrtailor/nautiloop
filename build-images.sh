@@ -96,11 +96,11 @@ should_build() { [ -z "$ONLY" ] || [ "$ONLY" = "$1" ]; }
 # -- GHCR auth via 1Password --------------------------------------------------
 
 if [ "$PUSH" = true ]; then
-    if ! docker login ghcr.io --get-login &>/dev/null 2>&1; then
-        warn "Not logged in to ghcr.io. Attempting login via 1Password..."
-        if ! command -v op &>/dev/null; then
-            error "Not logged in to ghcr.io and op CLI not available. Install: https://developer.1password.com/docs/cli"
-        fi
+    # Check if already logged in by inspecting Docker config
+    if grep -q "ghcr.io" ~/.docker/config.json 2>/dev/null; then
+        info "Already logged in to ghcr.io"
+    elif command -v op &>/dev/null; then
+        warn "Not logged in to ghcr.io. Logging in via 1Password..."
         if ! op account list &>/dev/null; then
             error "Not signed in to 1Password. Run: op signin"
         fi
@@ -108,6 +108,8 @@ if [ "$PUSH" = true ]; then
         GHCR_TOKEN=$(op read "op://Nemo/github-registry/pat" 2>/dev/null) || error "Failed to read GHCR token from 1Password"
         echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin || error "GHCR login failed"
         success "Logged in to ghcr.io"
+    else
+        error "Not logged in to ghcr.io. Either: install op CLI, or run: docker login ghcr.io"
     fi
 fi
 
@@ -151,8 +153,12 @@ build_image() {
         --platform "$PLATFORM"
         -f "$dockerfile"
         -t "$full_image"
-        -t "$REGISTRY/nemo-$name:latest"
     )
+
+    # Only tag :latest when building all images (prevents split-brain versions)
+    if [ -z "$ONLY" ]; then
+        build_cmd+=(-t "$REGISTRY/nemo-$name:latest")
+    fi
 
     if [ "$PUSH" = true ]; then
         build_cmd+=(--push)

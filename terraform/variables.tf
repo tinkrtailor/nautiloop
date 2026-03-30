@@ -94,6 +94,12 @@ variable "agent_base_image" {
   default     = "ghcr.io/tinkrtailor/nemo-agent-base:latest"
 }
 
+variable "sidecar_image" {
+  description = "Auth sidecar container image"
+  type        = string
+  default     = "ghcr.io/tinkrtailor/nemo-sidecar:latest"
+}
+
 variable "k3s_version" {
   description = "k3s version to install (v1.32+ required for Traefik v3 CRDs)"
   type        = string

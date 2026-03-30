@@ -104,7 +104,7 @@ This provisions a Hetzner VPS, installs k3s with Traefik, deploys Postgres, the 
 ```bash
 cd ~/your-monorepo
 nemo init                    # generates nemo.toml
-nemo auth --claude --openai  # pushes credentials to cluster
+nemo auth                    # pushes credentials (Claude, OpenAI, SSH) to cluster
 ```
 
 ### 4. Use it

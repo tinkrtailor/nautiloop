@@ -12,6 +12,8 @@ resource "kubernetes_config_map" "nemo_config" {
       [cluster]
       git_repo_url = "${var.git_repo_url}"
       agent_image = "${var.agent_base_image}"
+      sidecar_image = "${var.sidecar_image}"
+      ${var.image_pull_secret_dockerconfigjson != null ? "image_pull_secret = \"nemo-registry-creds\"" : ""}
     EOT
   }
 }
