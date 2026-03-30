@@ -461,6 +461,18 @@ resource "kubernetes_manifest" "api_ingress_http" {
       entryPoints = ["web"]
       routes = [
         {
+          # Let ACME HTTP-01 challenges through without redirect.
+          # cert-manager creates temporary Ingress for this path;
+          # this rule ensures our redirect doesn't intercept it.
+          match    = "Host(`${var.domain}`) && PathPrefix(`/.well-known/acme-challenge/`)"
+          kind     = "Rule"
+          priority = 100
+          services = [{
+            name = "nemo-api-server"
+            port = 8080
+          }]
+        },
+        {
           match = "Host(`${var.domain}`)"
           kind  = "Rule"
           middlewares = [{

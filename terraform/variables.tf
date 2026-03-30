@@ -98,6 +98,11 @@ variable "k3s_version" {
   description = "k3s version to install (v1.32+ required for Traefik v3 CRDs)"
   type        = string
   default     = "v1.32.13+k3s1"
+
+  validation {
+    condition     = can(regex("^v1\\.(3[2-9]|[4-9][0-9])", var.k3s_version))
+    error_message = "k3s_version must be v1.32 or later (Traefik v3 CRDs required)."
+  }
 }
 
 variable "cert_manager_version" {
