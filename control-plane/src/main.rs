@@ -183,9 +183,9 @@ async fn main() -> anyhow::Result<()> {
                     tracing::error!(?result, "Job watcher task exited unexpectedly");
                 }
             }
+            // Signal all tasks to stop, then drain in-flight work
             shutdown_tx.send(true)?;
-            // Give remaining tasks a moment to drain
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = tokio::join!(reconciler_handle, watcher_handle);
         }
     }
 

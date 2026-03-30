@@ -1,3 +1,21 @@
+# Control plane runtime config — mounted as /etc/nemo/nemo.toml in both deployments.
+# The binary loads this via its fallback path when ./nemo.toml doesn't exist.
+resource "kubernetes_config_map" "nemo_config" {
+  depends_on = [kubernetes_namespace.system]
+
+  metadata {
+    name      = "nemo-config"
+    namespace = "nemo-system"
+  }
+  data = {
+    "nemo.toml" = <<-EOT
+      [cluster]
+      git_repo_url = "${var.git_repo_url}"
+      agent_image = "${var.agent_base_image}"
+    EOT
+  }
+}
+
 # FR-46: Control plane Deployments (API server + Loop engine)
 
 # FR-46: API Server Deployment
@@ -9,6 +27,7 @@ resource "kubernetes_deployment" "api_server" {
     kubernetes_service_account.api_server,
     kubernetes_persistent_volume_claim.bare_repo,
     kubernetes_job.repo_init,
+    kubernetes_config_map.nemo_config,
   ]
 
   metadata {
@@ -45,7 +64,7 @@ resource "kubernetes_deployment" "api_server" {
         init_container {
           name    = "fix-permissions"
           image   = "busybox:1.36"
-          command = ["sh", "-c", "chown -R 1000:1000 /bare-repo"]
+          command = ["sh", "-c", "chown 1000:1000 /bare-repo && chmod 2775 /bare-repo"]
 
           volume_mount {
             name       = "bare-repo"
@@ -113,6 +132,12 @@ resource "kubernetes_deployment" "api_server" {
             mount_path = "/bare-repo"
           }
 
+          volume_mount {
+            name       = "nemo-config"
+            mount_path = "/etc/nemo"
+            read_only  = true
+          }
+
           startup_probe {
             http_get {
               path = "/health"
@@ -143,6 +168,13 @@ resource "kubernetes_deployment" "api_server" {
           name = "bare-repo"
           persistent_volume_claim {
             claim_name = "nemo-bare-repo"
+          }
+        }
+
+        volume {
+          name = "nemo-config"
+          config_map {
+            name = "nemo-config"
           }
         }
       }
@@ -215,7 +247,7 @@ resource "kubernetes_deployment" "loop_engine" {
         init_container {
           name    = "fix-permissions"
           image   = "busybox:1.36"
-          command = ["sh", "-c", "chown -R 1000:1000 /bare-repo"]
+          command = ["sh", "-c", "chown 1000:1000 /bare-repo && chmod 2775 /bare-repo"]
 
           volume_mount {
             name       = "bare-repo"
@@ -270,6 +302,12 @@ resource "kubernetes_deployment" "loop_engine" {
             mount_path = "/bare-repo"
           }
 
+          volume_mount {
+            name       = "nemo-config"
+            mount_path = "/etc/nemo"
+            read_only  = true
+          }
+
           resources {
             requests = {
               cpu    = "100m"
@@ -286,6 +324,13 @@ resource "kubernetes_deployment" "loop_engine" {
           name = "bare-repo"
           persistent_volume_claim {
             claim_name = "nemo-bare-repo"
+          }
+        }
+
+        volume {
+          name = "nemo-config"
+          config_map {
+            name = "nemo-config"
           }
         }
       }
@@ -386,5 +431,8 @@ resource "kubernetes_job" "repo_init" {
     }
   }
 
-  wait_for_completion = false
+  wait_for_completion = true
+  timeouts {
+    create = "5m"
+  }
 }
