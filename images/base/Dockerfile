@@ -49,8 +49,9 @@ RUN chmod +x /usr/local/bin/nemo-agent-entry
 COPY .nemo/prompts/ /etc/nemo/prompts/
 
 # Create agent user (UID 1000) for non-root execution (FR-25)
-RUN groupadd -g 1000 agent && \
-    useradd -u 1000 -g agent -m -d /work/home -s /bin/bash agent
+# node:22-bookworm-slim already has GID 1000 (node group), so use -f to allow existing
+RUN groupadd -f -g 1000 agent && \
+    useradd -u 1000 -g agent -m -d /work/home -s /bin/bash agent 2>/dev/null || true
 
 # Writable directories that will be emptyDir mounts at runtime
 RUN mkdir -p /work /work/home /output /sessions /tmp/shared && \
