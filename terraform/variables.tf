@@ -53,9 +53,14 @@ variable "ssh_private_key_path" {
 # FR-52: Optional input variables
 
 variable "server_type" {
-  description = "Hetzner server type"
+  description = "Hetzner server type (e.g., cpx31, ccx23, ccx43)"
   type        = string
-  default     = "ccx43"
+  # Common types:
+  # - cpx31: 4 vCPU (Shared), 8 GB RAM   (~€15/mo) - Good for testing
+  # - ccx23: 4 vCPU (Dedicated), 16 GB RAM (~€46/mo) - Solid performance
+  # - ccx33: 8 vCPU (Dedicated), 32 GB RAM (~€92/mo) - Heavy lifting
+  # - ccx43: 16 vCPU (Dedicated), 64 GB RAM (~€185/mo) - Maximum scale
+  default     = "ccx23"
 }
 
 variable "server_location" {
