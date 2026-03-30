@@ -11,7 +11,7 @@ resource "kubernetes_persistent_volume" "postgres" {
   }
   spec {
     capacity = {
-      storage = "20Gi"
+      storage = "${var.postgres_volume_size}Gi"
     }
     access_modes                     = ["ReadWriteOnce"]
     persistent_volume_reclaim_policy = "Retain"
@@ -38,7 +38,7 @@ resource "kubernetes_persistent_volume_claim" "postgres" {
     volume_name        = kubernetes_persistent_volume.postgres.metadata[0].name
     resources {
       requests = {
-        storage = "20Gi"
+        storage = "${var.postgres_volume_size}Gi"
       }
     }
   }

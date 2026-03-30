@@ -132,24 +132,30 @@ resource "kubernetes_deployment" "api_server" {
               path = "/health"
               port = 8080
             }
-            failure_threshold     = 30
-            period_seconds        = 2
+            failure_threshold = 30
+            period_seconds    = 2
+            timeout_seconds   = 3
           }
 
+          # Liveness: lightweight TCP check — don't consume DB pool connections.
+          # Only restarts pod if the process is completely dead.
           liveness_probe {
-            http_get {
-              path = "/health"
+            tcp_socket {
               port = 8080
             }
-            period_seconds = 15
+            period_seconds  = 15
+            timeout_seconds = 3
           }
 
+          # Readiness: deep check via /health (verifies Postgres).
+          # Removes pod from service if DB is unreachable.
           readiness_probe {
             http_get {
               path = "/health"
               port = 8080
             }
-            period_seconds = 5
+            period_seconds  = 10
+            timeout_seconds = 3
           }
         }
 
@@ -364,6 +370,11 @@ resource "kubernetes_job" "repo_init" {
           EOT
           ]
 
+          # HOME=/tmp so non-root UID 1000 can write ~/.ssh on alpine/git
+          env {
+            name  = "HOME"
+            value = "/tmp"
+          }
           env {
             name = "GIT_REPO_URL"
             value_from {

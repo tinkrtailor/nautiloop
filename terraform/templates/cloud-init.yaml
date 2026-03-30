@@ -19,12 +19,14 @@ runcmd:
   # Wait for Hetzner Volume to be attached and mount it.
   # Only format if the volume has no filesystem (blkid returns non-zero).
   # Never blindly mkfs — a transient mount error must NOT destroy data.
-  - until [ -L /dev/disk/by-id/scsi-0HC_Volume_$(echo "${volume_name}" | tr ' ' '_') ]; do sleep 1; done
-  - DISK_PATH=$(readlink -f /dev/disk/by-id/scsi-0HC_Volume_$(echo "${volume_name}" | tr ' ' '_'))
-  - blkid "$DISK_PATH" || mkfs.ext4 "$DISK_PATH"
+  # Use stable /dev/disk/by-id/ symlink in fstab — NOT the volatile /dev/sdX
+  # that readlink resolves to. Device letters can change across reboots.
+  - DISK_STABLE="/dev/disk/by-id/scsi-0HC_Volume_$(echo "${volume_name}" | tr ' ' '_')"
+  - until [ -L "$DISK_STABLE" ]; do sleep 1; done
+  - blkid "$DISK_STABLE" || mkfs.ext4 "$DISK_STABLE"
   - mkdir -p /var/lib/postgresql/data
-  - mount "$DISK_PATH" /var/lib/postgresql/data
-  - echo "$DISK_PATH /var/lib/postgresql/data ext4 defaults,nofail 0 2" >> /etc/fstab
+  - mount "$DISK_STABLE" /var/lib/postgresql/data
+  - grep -q "$DISK_STABLE" /etc/fstab || echo "$DISK_STABLE /var/lib/postgresql/data ext4 defaults 0 2" >> /etc/fstab
 
 # Disable swap (required for k3s)
 swap:
