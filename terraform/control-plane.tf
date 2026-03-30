@@ -1,3 +1,21 @@
+# Control plane runtime config — mounted as /etc/nemo/nemo.toml in both deployments.
+# The binary loads this via its fallback path when ./nemo.toml doesn't exist.
+resource "kubernetes_config_map" "nemo_config" {
+  depends_on = [kubernetes_namespace.system]
+
+  metadata {
+    name      = "nemo-config"
+    namespace = "nemo-system"
+  }
+  data = {
+    "nemo.toml" = <<-EOT
+      [cluster]
+      git_repo_url = "${var.git_repo_url}"
+      agent_image = "${var.agent_base_image}"
+    EOT
+  }
+}
+
 # FR-46: Control plane Deployments (API server + Loop engine)
 
 # FR-46: API Server Deployment
@@ -7,6 +25,9 @@ resource "kubernetes_deployment" "api_server" {
     kubernetes_secret.api_key,
     kubernetes_secret.git_host_token,
     kubernetes_service_account.api_server,
+    kubernetes_persistent_volume_claim.bare_repo,
+    kubernetes_job.repo_init,
+    kubernetes_config_map.nemo_config,
   ]
 
   metadata {
@@ -35,6 +56,10 @@ resource "kubernetes_deployment" "api_server" {
 
       spec {
         service_account_name = "nemo-api-server"
+
+        security_context {
+          fs_group = 1000
+        }
 
         container {
           name  = "api-server"
@@ -86,22 +111,65 @@ resource "kubernetes_deployment" "api_server" {
             }
           }
 
-          liveness_probe {
+          env {
+            name  = "BARE_REPO_PATH"
+            value = "/bare-repo"
+          }
+
+          volume_mount {
+            name       = "bare-repo"
+            mount_path = "/bare-repo"
+          }
+
+          volume_mount {
+            name       = "nemo-config"
+            mount_path = "/etc/nemo"
+            read_only  = true
+          }
+
+          startup_probe {
             http_get {
               path = "/health"
               port = 8080
             }
-            initial_delay_seconds = 10
-            period_seconds        = 15
+            failure_threshold = 30
+            period_seconds    = 2
+            timeout_seconds   = 3
           }
 
+          # Liveness: lightweight TCP check — don't consume DB pool connections.
+          # Only restarts pod if the process is completely dead.
+          liveness_probe {
+            tcp_socket {
+              port = 8080
+            }
+            period_seconds  = 15
+            timeout_seconds = 3
+          }
+
+          # Readiness: deep check via /health (verifies Postgres).
+          # Removes pod from service if DB is unreachable.
           readiness_probe {
             http_get {
               path = "/health"
               port = 8080
             }
-            initial_delay_seconds = 5
-            period_seconds        = 5
+            period_seconds  = 10
+            timeout_seconds = 3
+          }
+        }
+
+        volume {
+          name = "bare-repo"
+          persistent_volume_claim {
+            claim_name = "nemo-bare-repo"
+          }
+        }
+
+        volume {
+          name = "nemo-config"
+          config_map {
+            name = "nemo-config"
           }
         }
       }
@@ -138,6 +206,8 @@ resource "kubernetes_deployment" "loop_engine" {
     kubernetes_secret.git_host_token,
     kubernetes_service_account.loop_engine,
     kubernetes_persistent_volume_claim.bare_repo,
+    kubernetes_job.repo_init,
+    kubernetes_config_map.nemo_config,
   ]
 
   metadata {
@@ -166,6 +236,10 @@ resource "kubernetes_deployment" "loop_engine" {
 
       spec {
         service_account_name = "nemo-loop-engine"
+
+        security_context {
+          fs_group = 1000
+        }
 
         container {
           name  = "loop-engine"
@@ -205,6 +279,12 @@ resource "kubernetes_deployment" "loop_engine" {
             mount_path = "/bare-repo"
           }
 
+          volume_mount {
+            name       = "nemo-config"
+            mount_path = "/etc/nemo"
+            read_only  = true
+          }
+
           resources {
             requests = {
               cpu    = "100m"
@@ -215,12 +295,31 @@ resource "kubernetes_deployment" "loop_engine" {
               memory = "512Mi"
             }
           }
+
+          # Liveness: verify the process is still alive and responsive.
+          # The loop engine doesn't serve HTTP, so use exec-based check.
+          # kill -0 checks PID 1 (tini) is alive without sending a signal.
+          liveness_probe {
+            exec {
+              command = ["kill", "-0", "1"]
+            }
+            initial_delay_seconds = 15
+            period_seconds        = 30
+            timeout_seconds       = 3
+          }
         }
 
         volume {
           name = "bare-repo"
           persistent_volume_claim {
             claim_name = "nemo-bare-repo"
+          }
+        }
+
+        volume {
+          name = "nemo-config"
+          config_map {
+            name = "nemo-config"
           }
         }
       }
@@ -250,6 +349,12 @@ resource "kubernetes_job" "repo_init" {
     template {
       metadata {}
       spec {
+        security_context {
+          run_as_user  = 1000
+          run_as_group = 1000
+          fs_group     = 1000
+        }
+
         container {
           name  = "repo-init"
           image = "alpine/git:latest"
@@ -257,19 +362,24 @@ resource "kubernetes_job" "repo_init" {
           command = ["/bin/sh", "-c"]
           args = [<<-EOT
             set -e
-            if [ ! -d /bare-repo/HEAD ]; then
+            if [ ! -e /bare-repo/HEAD ]; then
               git init --bare /bare-repo
             fi
             git -C /bare-repo remote remove origin 2>/dev/null || true
             git -C /bare-repo remote add origin "$GIT_REPO_URL"
-            mkdir -p /root/.ssh
-            cp /secrets/ssh-key/id_ed25519 /root/.ssh/id_ed25519
-            chmod 600 /root/.ssh/id_ed25519
-            cp /secrets/ssh-known-hosts/known_hosts /root/.ssh/known_hosts
+            mkdir -p "$HOME/.ssh"
+            cp /secrets/ssh-key/id_ed25519 "$HOME/.ssh/id_ed25519"
+            chmod 600 "$HOME/.ssh/id_ed25519"
+            cp /secrets/ssh-known-hosts/known_hosts "$HOME/.ssh/known_hosts"
             git -C /bare-repo fetch --all
           EOT
           ]
 
+          # HOME=/tmp so non-root UID 1000 can write ~/.ssh on alpine/git
+          env {
+            name  = "HOME"
+            value = "/tmp"
+          }
           env {
             name = "GIT_REPO_URL"
             value_from {
@@ -306,7 +416,7 @@ resource "kubernetes_job" "repo_init" {
           name = "ssh-key"
           secret {
             secret_name  = "nemo-repo-ssh-key"
-            default_mode = "0600"
+            default_mode = "0444"
           }
         }
         volume {
@@ -321,5 +431,8 @@ resource "kubernetes_job" "repo_init" {
     }
   }
 
-  wait_for_completion = false
+  wait_for_completion = true
+  timeouts {
+    create = "10m"
+  }
 }

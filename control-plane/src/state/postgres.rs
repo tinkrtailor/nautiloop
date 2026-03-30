@@ -637,4 +637,12 @@ impl StateStore for PgStateStore {
         }
         Ok(())
     }
+
+    async fn health_check(&self) -> Result<()> {
+        sqlx::query("SELECT 1")
+            .execute(&self.pool)
+            .await
+            .map_err(crate::error::NemoError::Database)?;
+        Ok(())
+    }
 }

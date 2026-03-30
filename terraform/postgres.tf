@@ -1,17 +1,44 @@
 # FR-45: Postgres deployment as k3s pod with PVC
 
+# PV backed by Hetzner volume mounted at /var/lib/postgresql/data by cloud-init.
+# Using a PV+PVC instead of hostPath ensures Postgres won't silently write to
+# ephemeral root disk if the volume mount fails.
+resource "kubernetes_persistent_volume" "postgres" {
+  depends_on = [null_resource.kubeconfig]
+
+  metadata {
+    name = "nemo-postgres-data"
+  }
+  spec {
+    capacity = {
+      storage = "${var.postgres_volume_size}Gi"
+    }
+    access_modes                     = ["ReadWriteOnce"]
+    persistent_volume_reclaim_policy = "Retain"
+    storage_class_name               = "manual"
+    persistent_volume_source {
+      host_path {
+        path = "/var/lib/postgresql/data"
+        type = "Directory"
+      }
+    }
+  }
+}
+
 resource "kubernetes_persistent_volume_claim" "postgres" {
-  depends_on = [kubernetes_namespace.system]
+  depends_on = [kubernetes_namespace.system, kubernetes_persistent_volume.postgres]
 
   metadata {
     name      = "nemo-postgres-data"
     namespace = "nemo-system"
   }
   spec {
-    access_modes = ["ReadWriteOnce"]
+    access_modes       = ["ReadWriteOnce"]
+    storage_class_name = "manual"
+    volume_name        = kubernetes_persistent_volume.postgres.metadata[0].name
     resources {
       requests = {
-        storage = "20Gi"
+        storage = "${var.postgres_volume_size}Gi"
       }
     }
   }
@@ -48,6 +75,19 @@ resource "kubernetes_deployment" "postgres" {
       }
 
       spec {
+        # Fail fast if the Hetzner volume is not actually mounted.
+        # The sentinel file is created by cloud-init after successful mount.
+        init_container {
+          name    = "check-volume-mounted"
+          image   = "busybox:1.36"
+          command = ["sh", "-c", "test -f /data/.nemo-volume-mounted || (echo 'ERROR: Postgres volume not mounted — refusing to start on root disk' && exit 1)"]
+
+          volume_mount {
+            name       = "postgres-data"
+            mount_path = "/data"
+          }
+        }
+
         container {
           name  = "postgres"
           image = "postgres:16-alpine"
