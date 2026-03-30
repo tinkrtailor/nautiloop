@@ -15,6 +15,28 @@ use nemo_control_plane::loop_engine::{ConvergentLoopDriver, Reconciler, watcher:
 use nemo_control_plane::state::StateStore;
 use nemo_control_plane::state::postgres::PgStateStore;
 
+/// Run mode selected by the first CLI argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Run API server only (serves HTTP requests, health endpoint).
+    ApiServer,
+    /// Run loop engine only (reconciler + K8s job watcher).
+    LoopEngine,
+}
+
+fn parse_mode() -> anyhow::Result<Mode> {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(|s| s.as_str()) {
+        Some("api-server") => Ok(Mode::ApiServer),
+        Some("loop-engine") => Ok(Mode::LoopEngine),
+        Some(other) => anyhow::bail!(
+            "Unknown mode '{}'. Usage: nemo-server <api-server|loop-engine>",
+            other
+        ),
+        None => anyhow::bail!("Usage: nemo-server <api-server|loop-engine>"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -23,7 +45,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    tracing::info!("Starting Nemo control plane");
+    let mode = parse_mode()?;
+    tracing::info!(?mode, "Starting Nemo control plane");
 
     // TODO(V1.5): Replace flat NemoConfig with three-layer config merge
     // (cluster -> repo nemo.toml -> engineer ~/.nemo/config.toml) using
@@ -33,9 +56,9 @@ async fn main() -> anyhow::Result<()> {
     let config = NemoConfig::load().map_err(|e| anyhow::anyhow!(e))?;
     let config_arc = Arc::new(config.clone());
 
-    // Fail fast if NEMO_API_KEY is not set — better than 500 on every request
-    if std::env::var("NEMO_API_KEY").is_err() {
-        anyhow::bail!("NEMO_API_KEY environment variable is required");
+    // API server needs NEMO_API_KEY for auth middleware
+    if mode == Mode::ApiServer && std::env::var("NEMO_API_KEY").is_err() {
+        anyhow::bail!("NEMO_API_KEY environment variable is required for api-server mode");
     }
 
     // Connect to Postgres and run migrations
@@ -53,111 +76,125 @@ async fn main() -> anyhow::Result<()> {
 
     let store: Arc<dyn StateStore> = Arc::new(pg_store);
 
-    // Build K8s job dispatcher — fail hard if unavailable
-    let kube_client = kube::Client::try_default().await?;
-    tracing::info!("Connected to Kubernetes cluster");
-    let dispatcher: Arc<dyn JobDispatcher> = Arc::new(KubeJobDispatcher::new(
-        kube_client.clone(),
-        config.cluster.jobs_namespace.clone(),
-    ));
-
-    // Build git operations (bare repo)
-    // BARE_REPO_PATH is set by Terraform (control-plane.tf); fall back for local dev.
-    let bare_repo_path = std::env::var("BARE_REPO_PATH")
-        .or_else(|_| std::env::var("NEMO_BARE_REPO_PATH"))
-        .unwrap_or_else(|_| "/bare-repo".to_string());
-    let git: Arc<dyn GitOperations> = Arc::new(
-        nemo_control_plane::git::bare::BareRepoGitOperations::new(&bare_repo_path),
-    );
-
-    // Build the loop driver
-    let driver = Arc::new(ConvergentLoopDriver::new(
-        store.clone(),
-        dispatcher.clone(),
-        git.clone(),
-        config.clone(),
-    ));
-
-    // Build the API server
-    let app_state = AppState {
-        store: store.clone(),
-        git: git.clone(),
-        config: config_arc,
-        kube_client: Some(kube_client),
-    };
-    let router = api::build_router(app_state);
-
     // Setup shutdown signal
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let wake = Arc::new(Notify::new());
 
-    // Start reconciler
-    let reconciler = Reconciler::new(
-        driver,
-        store.clone(),
-        Duration::from_secs(config.cluster.reconcile_interval_secs),
-        wake.clone(),
-    );
+    match mode {
+        Mode::ApiServer => {
+            let kube_client = kube::Client::try_default().await?;
+            tracing::info!("Connected to Kubernetes cluster");
 
-    let reconciler_rx = shutdown_rx.clone();
-    let reconciler_handle = tokio::spawn(async move {
-        reconciler.run(reconciler_rx).await;
-    });
+            let bare_repo_path = std::env::var("BARE_REPO_PATH")
+                .or_else(|_| std::env::var("NEMO_BARE_REPO_PATH"))
+                .unwrap_or_else(|_| "/bare-repo".to_string());
+            let git: Arc<dyn GitOperations> = Arc::new(
+                nemo_control_plane::git::bare::BareRepoGitOperations::new(&bare_repo_path),
+            );
 
-    // Start Job watcher (wakes reconciler on K8s Job status changes)
-    let watcher_client = kube::Client::try_default().await?;
-    let job_watcher = JobWatcher::new(wake);
-    let watcher_namespace = config.cluster.jobs_namespace.clone();
-    let watcher_rx = shutdown_rx.clone();
-    let watcher_handle = tokio::spawn(async move {
-        job_watcher
-            .run(watcher_client, &watcher_namespace, watcher_rx)
-            .await;
-    });
+            let app_state = AppState {
+                store: store.clone(),
+                git,
+                config: config_arc,
+                kube_client: Some(kube_client),
+            };
+            let router = api::build_router(app_state);
 
-    // Start API server
-    let bind_addr = format!("{}:{}", config.cluster.bind_addr, config.cluster.port);
-    tracing::info!(addr = %bind_addr, "Starting API server");
+            let bind_addr = format!("{}:{}", config.cluster.bind_addr, config.cluster.port);
+            tracing::info!(addr = %bind_addr, "Starting API server");
 
-    let listener = TcpListener::bind(&bind_addr).await?;
-    let server_handle = tokio::spawn(async move {
-        axum::serve(listener, router)
-            .with_graceful_shutdown(async move {
-                let mut rx = shutdown_rx;
-                while !*rx.borrow() {
-                    if rx.changed().await.is_err() {
-                        break;
-                    }
-                }
-            })
-            .await
-            .expect("Server failed");
-    });
+            let listener = TcpListener::bind(&bind_addr).await?;
+            let server_handle = tokio::spawn(async move {
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(async move {
+                        let mut rx = shutdown_rx;
+                        while !*rx.borrow() {
+                            if rx.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                    })
+                    .await
+                    .expect("Server failed");
+            });
 
-    // Wait for SIGTERM (K8s pod shutdown) or SIGINT (ctrl-c)
-    {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut sigterm = signal(SignalKind::terminate())?;
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {},
-                _ = sigterm.recv() => {},
-            }
+            wait_for_shutdown().await?;
+            tracing::info!("Received shutdown signal");
+            shutdown_tx.send(true)?;
+            let _ = server_handle.await;
         }
-        #[cfg(not(unix))]
-        {
-            tokio::signal::ctrl_c().await?;
+
+        Mode::LoopEngine => {
+            let kube_client = kube::Client::try_default().await?;
+            tracing::info!("Connected to Kubernetes cluster");
+
+            let dispatcher: Arc<dyn JobDispatcher> = Arc::new(KubeJobDispatcher::new(
+                kube_client.clone(),
+                config.cluster.jobs_namespace.clone(),
+            ));
+
+            let bare_repo_path = std::env::var("BARE_REPO_PATH")
+                .or_else(|_| std::env::var("NEMO_BARE_REPO_PATH"))
+                .unwrap_or_else(|_| "/bare-repo".to_string());
+            let git: Arc<dyn GitOperations> = Arc::new(
+                nemo_control_plane::git::bare::BareRepoGitOperations::new(&bare_repo_path),
+            );
+
+            let driver = Arc::new(ConvergentLoopDriver::new(
+                store.clone(),
+                dispatcher,
+                git,
+                config.clone(),
+            ));
+
+            let wake = Arc::new(Notify::new());
+
+            let reconciler = Reconciler::new(
+                driver,
+                store.clone(),
+                Duration::from_secs(config.cluster.reconcile_interval_secs),
+                wake.clone(),
+            );
+
+            let reconciler_rx = shutdown_rx.clone();
+            let reconciler_handle = tokio::spawn(async move {
+                reconciler.run(reconciler_rx).await;
+            });
+
+            let watcher_client = kube::Client::try_default().await?;
+            let job_watcher = JobWatcher::new(wake);
+            let watcher_namespace = config.cluster.jobs_namespace.clone();
+            let watcher_rx = shutdown_rx.clone();
+            let watcher_handle = tokio::spawn(async move {
+                job_watcher
+                    .run(watcher_client, &watcher_namespace, watcher_rx)
+                    .await;
+            });
+
+            wait_for_shutdown().await?;
+            tracing::info!("Received shutdown signal");
+            shutdown_tx.send(true)?;
+            let _ = tokio::join!(reconciler_handle, watcher_handle);
         }
     }
-    tracing::info!("Received shutdown signal");
-
-    // Signal all tasks to stop
-    shutdown_tx.send(true)?;
-
-    // Wait for tasks to finish
-    let _ = tokio::join!(reconciler_handle, server_handle, watcher_handle);
 
     tracing::info!("Nemo control plane shut down");
+    Ok(())
+}
+
+/// Wait for SIGTERM (K8s pod shutdown) or SIGINT (ctrl-c).
+async fn wait_for_shutdown() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = signal(SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = sigterm.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+    }
     Ok(())
 }

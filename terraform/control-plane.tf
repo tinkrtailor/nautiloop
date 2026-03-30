@@ -36,6 +36,10 @@ resource "kubernetes_deployment" "api_server" {
       spec {
         service_account_name = "nemo-api-server"
 
+        security_context {
+          fs_group = 1000
+        }
+
         container {
           name  = "api-server"
           image = var.control_plane_image
@@ -86,6 +90,16 @@ resource "kubernetes_deployment" "api_server" {
             }
           }
 
+          env {
+            name  = "BARE_REPO_PATH"
+            value = "/bare-repo"
+          }
+
+          volume_mount {
+            name       = "bare-repo"
+            mount_path = "/bare-repo"
+          }
+
           liveness_probe {
             http_get {
               path = "/health"
@@ -102,6 +116,13 @@ resource "kubernetes_deployment" "api_server" {
             }
             initial_delay_seconds = 5
             period_seconds        = 5
+          }
+        }
+
+        volume {
+          name = "bare-repo"
+          persistent_volume_claim {
+            claim_name = "nemo-bare-repo"
           }
         }
       }
@@ -167,6 +188,10 @@ resource "kubernetes_deployment" "loop_engine" {
       spec {
         service_account_name = "nemo-loop-engine"
 
+        security_context {
+          fs_group = 1000
+        }
+
         container {
           name  = "loop-engine"
           image = var.control_plane_image
@@ -188,6 +213,15 @@ resource "kubernetes_deployment" "loop_engine" {
               secret_key_ref {
                 name = "nemo-git-host-token"
                 key  = "GIT_HOST_TOKEN"
+              }
+            }
+          }
+          env {
+            name = "NEMO_API_KEY"
+            value_from {
+              secret_key_ref {
+                name = "nemo-api-key"
+                key  = "NEMO_API_KEY"
               }
             }
           }
