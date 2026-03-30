@@ -417,7 +417,7 @@ resource "kubernetes_manifest" "cluster_issuer" {
         solvers = [{
           http01 = {
             ingress = {
-              class = "traefik"
+              class = var.ingress_class
             }
           }
         }]
@@ -429,6 +429,8 @@ resource "kubernetes_manifest" "cluster_issuer" {
 # Traefik middleware: block /health from external access.
 # K8s probes hit pod IP directly; this prevents unauthenticated
 # DB pool exhaustion via the public endpoint.
+# Uses ipAllowList with no allowed IPs → rejects all external traffic
+# with 403 without forwarding to the app.
 resource "kubernetes_manifest" "block_health" {
   depends_on = [kubernetes_namespace.system]
 
@@ -440,8 +442,8 @@ resource "kubernetes_manifest" "block_health" {
       namespace = "nemo-system"
     }
     spec = {
-      replacePath = {
-        path = "/blocked"
+      ipAllowList = {
+        sourceRange = []
       }
     }
   }
@@ -496,7 +498,7 @@ resource "kubernetes_manifest" "api_ingress" {
 
 # Certificate for the domain (cert-manager watches this and provisions via Let's Encrypt)
 resource "kubernetes_manifest" "api_certificate" {
-  depends_on = [kubernetes_manifest.cluster_issuer]
+  depends_on = [kubernetes_manifest.cluster_issuer, kubernetes_namespace.system]
 
   manifest = {
     apiVersion = "cert-manager.io/v1"

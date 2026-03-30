@@ -106,6 +106,12 @@ variable "cert_manager_version" {
   default     = "v1.14.0"
 }
 
+variable "ingress_class" {
+  description = "Ingress class name (traefik is k3s built-in)"
+  type        = string
+  default     = "traefik"
+}
+
 variable "image_pull_secret_dockerconfigjson" {
   description = "Docker config JSON for private registry access. If provided, creates nemo-registry-creds Secret."
   type        = string

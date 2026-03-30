@@ -24,7 +24,13 @@ resource "hcloud_server" "nemo" {
 
 # FR-44: Install k3s via remote-exec after cloud-init
 resource "null_resource" "k3s_install" {
-  depends_on = [hcloud_server.nemo]
+  depends_on = [hcloud_server.nemo, hcloud_volume_attachment.nemo_data]
+
+  # Re-run if k3s version changes (ensures Traefik is enabled on existing clusters)
+  triggers = {
+    k3s_version = var.k3s_version
+    server_id   = hcloud_server.nemo.id
+  }
 
   connection {
     type        = "ssh"
@@ -47,6 +53,9 @@ resource "null_resource" "k3s_install" {
       "EOF",
       "systemctl restart k3s",
       "until kubectl get nodes 2>/dev/null | grep -q ' Ready'; do sleep 2; done",
+      # Wait for Traefik CRDs to be registered (k3s deploys AddOns asynchronously)
+      "until kubectl get crd ingressroutes.traefik.io 2>/dev/null; do sleep 2; done",
+      "until kubectl get crd middlewares.traefik.io 2>/dev/null; do sleep 2; done",
     ]
   }
 }
