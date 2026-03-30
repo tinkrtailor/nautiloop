@@ -417,7 +417,7 @@ resource "kubernetes_manifest" "cluster_issuer" {
         solvers = [{
           http01 = {
             ingress = {
-              class = var.ingress_class
+              class = "traefik"
             }
           }
         }]
@@ -426,32 +426,11 @@ resource "kubernetes_manifest" "cluster_issuer" {
   }
 }
 
-# Traefik middleware: block /health from external access.
-# K8s probes hit pod IP directly; this prevents unauthenticated
-# DB pool exhaustion via the public endpoint.
-# Uses ipAllowList with no allowed IPs → rejects all external traffic
-# with 403 without forwarding to the app.
-resource "kubernetes_manifest" "block_health" {
-  depends_on = [kubernetes_namespace.system]
-
-  manifest = {
-    apiVersion = "traefik.io/v1alpha1"
-    kind       = "Middleware"
-    metadata = {
-      name      = "block-health"
-      namespace = "nemo-system"
-    }
-    spec = {
-      ipAllowList = {
-        sourceRange = []
-      }
-    }
-  }
-}
-
-# IngressRoute for control plane API (Traefik CRD)
-# Using IngressRoute instead of standard Ingress for native Traefik
-# middleware support (blocking /health from external access).
+# IngressRoute for control plane API (Traefik CRD).
+# /health is NOT routed — Traefik returns 404 for unmatched paths.
+# K8s probes hit pod IP directly and bypass ingress entirely.
+# PathPrefix excludes /health so it can't be used for unauthenticated
+# DB pool exhaustion from the public internet.
 resource "kubernetes_manifest" "api_ingress" {
   depends_on = [kubernetes_manifest.cluster_issuer, kubernetes_namespace.system]
 
@@ -461,27 +440,12 @@ resource "kubernetes_manifest" "api_ingress" {
     metadata = {
       name      = "nemo-api"
       namespace = "nemo-system"
-      annotations = {
-        "cert-manager.io/cluster-issuer" = "letsencrypt-prod"
-      }
     }
     spec = {
       entryPoints = ["websecure"]
       routes = [
         {
-          match = "Host(`${var.domain}`) && Path(`/health`)"
-          kind  = "Rule"
-          middlewares = [{
-            name      = "block-health"
-            namespace = "nemo-system"
-          }]
-          services = [{
-            name = "nemo-api-server"
-            port = 8080
-          }]
-        },
-        {
-          match = "Host(`${var.domain}`)"
+          match = "Host(`${var.domain}`) && !Path(`/health`)"
           kind  = "Rule"
           services = [{
             name = "nemo-api-server"

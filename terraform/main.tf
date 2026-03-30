@@ -53,9 +53,11 @@ resource "null_resource" "k3s_install" {
       "EOF",
       "systemctl restart k3s",
       "until kubectl get nodes 2>/dev/null | grep -q ' Ready'; do sleep 2; done",
-      # Wait for Traefik CRDs to be registered (k3s deploys AddOns asynchronously)
-      "until kubectl get crd ingressroutes.traefik.io 2>/dev/null; do sleep 2; done",
-      "until kubectl get crd middlewares.traefik.io 2>/dev/null; do sleep 2; done",
+      # Wait for Traefik CRDs and deployment (k3s deploys AddOns asynchronously).
+      # Timeout after 120s — if Traefik doesn't come up, fail fast.
+      "TRIES=0; until kubectl get crd ingressroutes.traefik.io 2>/dev/null || [ $TRIES -ge 60 ]; do sleep 2; TRIES=$((TRIES+1)); done",
+      "kubectl get crd ingressroutes.traefik.io || { echo 'ERROR: Traefik CRDs not registered after 120s'; exit 1; }",
+      "kubectl -n kube-system rollout status deployment/traefik --timeout=120s",
     ]
   }
 }
