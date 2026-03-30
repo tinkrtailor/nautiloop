@@ -54,10 +54,21 @@ resource "kubernetes_deployment" "api_server" {
         labels = {
           app = "nemo-api-server"
         }
+        annotations = {
+          # Trigger pod rollout when ConfigMap changes (sidecar_image, git_repo_url, etc.)
+          "config-checksum" = sha256(kubernetes_config_map.nemo_config.data["nemo.toml"])
+        }
       }
 
       spec {
         service_account_name = "nemo-api-server"
+
+        dynamic "image_pull_secrets" {
+          for_each = var.image_pull_secret_dockerconfigjson != null ? [1] : []
+          content {
+            name = "nemo-registry-creds"
+          }
+        }
 
         security_context {
           fs_group = 1000
@@ -234,10 +245,20 @@ resource "kubernetes_deployment" "loop_engine" {
         labels = {
           app = "nemo-loop-engine"
         }
+        annotations = {
+          "config-checksum" = sha256(kubernetes_config_map.nemo_config.data["nemo.toml"])
+        }
       }
 
       spec {
         service_account_name = "nemo-loop-engine"
+
+        dynamic "image_pull_secrets" {
+          for_each = var.image_pull_secret_dockerconfigjson != null ? [1] : []
+          content {
+            name = "nemo-registry-creds"
+          }
+        }
 
         security_context {
           fs_group = 1000

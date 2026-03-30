@@ -133,8 +133,11 @@ Destroys the server but keeps the Hetzner volume (Postgres data persists). Next 
 cd terraform
 op run --env-file=.env.1password -- terraform apply \
   -var="control_plane_image=ghcr.io/tinkrtailor/nemo-control-plane:0.2.0" \
-  -var="agent_base_image=ghcr.io/tinkrtailor/nemo-agent-base:0.2.0"
+  -var="agent_base_image=ghcr.io/tinkrtailor/nemo-agent-base:0.2.0" \
+  -var="sidecar_image=ghcr.io/tinkrtailor/nemo-sidecar:0.2.0"
 ```
+
+All three images must be updated together to avoid version skew. The build script enforces this by only tagging `:latest` when building all images (not with `--only`).
 
 ## Configuration
 

@@ -208,4 +208,5 @@ if [ "$PUSH" = true ]; then
     info "Update terraform vars to use tag '$IMAGE_TAG':"
     echo "  TF_VAR_control_plane_image=$REGISTRY/nemo-control-plane:$IMAGE_TAG"
     echo "  TF_VAR_agent_base_image=$REGISTRY/nemo-agent-base:$IMAGE_TAG"
+    echo "  TF_VAR_sidecar_image=$REGISTRY/nemo-sidecar:$IMAGE_TAG"
 fi
