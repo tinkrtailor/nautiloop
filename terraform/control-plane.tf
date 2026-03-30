@@ -30,6 +30,7 @@ resource "kubernetes_deployment" "api_server" {
     kubernetes_persistent_volume_claim.bare_repo,
     kubernetes_job.repo_init,
     kubernetes_config_map.nemo_config,
+    kubernetes_secret.registry_creds_system,
   ]
 
   metadata {
@@ -221,6 +222,7 @@ resource "kubernetes_deployment" "loop_engine" {
     kubernetes_persistent_volume_claim.bare_repo,
     kubernetes_job.repo_init,
     kubernetes_config_map.nemo_config,
+    kubernetes_secret.registry_creds_system,
   ]
 
   metadata {
