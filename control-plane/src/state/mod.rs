@@ -104,6 +104,9 @@ pub trait StateStore: Send + Sync + 'static {
 
     /// Release a per-loop advisory lock and return its dedicated connection to the pool.
     async fn advisory_unlock(&self, loop_id: Uuid) -> Result<()>;
+
+    /// Health check: verify the store is reachable (e.g., SELECT 1).
+    async fn health_check(&self) -> Result<()>;
 }
 
 /// Flags that can be set on a loop by the API server.
@@ -401,6 +404,10 @@ pub mod memory {
         }
 
         async fn advisory_unlock(&self, _loop_id: Uuid) -> Result<()> {
+            Ok(())
+        }
+
+        async fn health_check(&self) -> Result<()> {
             Ok(())
         }
     }

@@ -5,6 +5,7 @@ pub mod sse;
 use std::sync::Arc;
 
 use axum::Router;
+use axum::extract::State;
 use axum::middleware;
 use axum::routing::{delete, get, post};
 
@@ -35,8 +36,14 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn health() -> axum::http::StatusCode {
-    axum::http::StatusCode::OK
+/// Health check that verifies Postgres connectivity.
+/// Returns 200 if the store is reachable, 503 otherwise.
+/// K8s liveness/readiness probes use this to detect a dead control plane.
+async fn health(State(state): State<AppState>) -> axum::http::StatusCode {
+    match state.store.health_check().await {
+        Ok(()) => axum::http::StatusCode::OK,
+        Err(_) => axum::http::StatusCode::SERVICE_UNAVAILABLE,
+    }
 }
 
 /// Build the axum router without auth middleware (for testing).

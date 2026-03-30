@@ -61,17 +61,6 @@ resource "kubernetes_deployment" "api_server" {
           fs_group = 1000
         }
 
-        init_container {
-          name    = "fix-permissions"
-          image   = "busybox:1.36"
-          command = ["sh", "-c", "chown 1000:1000 /bare-repo && chmod 2775 /bare-repo"]
-
-          volume_mount {
-            name       = "bare-repo"
-            mount_path = "/bare-repo"
-          }
-        }
-
         container {
           name  = "api-server"
           image = var.control_plane_image
@@ -244,17 +233,6 @@ resource "kubernetes_deployment" "loop_engine" {
           fs_group = 1000
         }
 
-        init_container {
-          name    = "fix-permissions"
-          image   = "busybox:1.36"
-          command = ["sh", "-c", "chown 1000:1000 /bare-repo && chmod 2775 /bare-repo"]
-
-          volume_mount {
-            name       = "bare-repo"
-            mount_path = "/bare-repo"
-          }
-        }
-
         container {
           name  = "loop-engine"
           image = var.control_plane_image
@@ -360,6 +338,12 @@ resource "kubernetes_job" "repo_init" {
     template {
       metadata {}
       spec {
+        security_context {
+          run_as_user  = 1000
+          run_as_group = 1000
+          fs_group     = 1000
+        }
+
         container {
           name  = "repo-init"
           image = "alpine/git:latest"
@@ -372,10 +356,10 @@ resource "kubernetes_job" "repo_init" {
             fi
             git -C /bare-repo remote remove origin 2>/dev/null || true
             git -C /bare-repo remote add origin "$GIT_REPO_URL"
-            mkdir -p /root/.ssh
-            cp /secrets/ssh-key/id_ed25519 /root/.ssh/id_ed25519
-            chmod 600 /root/.ssh/id_ed25519
-            cp /secrets/ssh-known-hosts/known_hosts /root/.ssh/known_hosts
+            mkdir -p "$HOME/.ssh"
+            cp /secrets/ssh-key/id_ed25519 "$HOME/.ssh/id_ed25519"
+            chmod 600 "$HOME/.ssh/id_ed25519"
+            cp /secrets/ssh-known-hosts/known_hosts "$HOME/.ssh/known_hosts"
             git -C /bare-repo fetch --all
           EOT
           ]
@@ -433,6 +417,6 @@ resource "kubernetes_job" "repo_init" {
 
   wait_for_completion = true
   timeouts {
-    create = "5m"
+    create = "10m"
   }
 }
