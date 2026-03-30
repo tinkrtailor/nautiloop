@@ -9,10 +9,10 @@
 # 1. Hetzner creates server with cloud-init (installs Tailscale, hardens SSH)
 # 2. Terraform SSHes to public IP to wait for Tailscale and get the tailnet IP
 # 3. Nautiloop module provisions over the Tailscale IP (not public)
-# 4. After apply, API is only reachable via tailnet: http://nemo:8080
+# 4. After apply, API is only reachable via tailnet: http://nautiloop:8080
 #
 # SSH is open in the firewall for bootstrap provisioning. After Tailscale is up,
-# engineers should use `ssh root@nemo` (Tailscale SSH) instead of the public IP.
+# engineers should use `ssh root@nautiloop` (Tailscale SSH) instead of the public IP.
 #
 # This example uses Tailscale. If you use a different VPN or want public
 # access, pass the appropriate IP to server_ip and manage firewall rules
@@ -75,7 +75,7 @@ resource "hcloud_firewall" "nemo" {
 
   # HTTP (only if domain is set for public HTTPS)
   dynamic "rule" {
-    for_each = var.domain != null ? [1] : []
+    for_each = var.domain != null && var.domain != "" ? [1] : []
     content {
       description = "HTTP (ACME + redirect)"
       direction   = "in"
@@ -87,7 +87,7 @@ resource "hcloud_firewall" "nemo" {
 
   # HTTPS (only if domain is set)
   dynamic "rule" {
-    for_each = var.domain != null ? [1] : []
+    for_each = var.domain != null && var.domain != "" ? [1] : []
     content {
       description = "HTTPS"
       direction   = "in"

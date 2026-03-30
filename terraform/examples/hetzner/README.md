@@ -4,7 +4,7 @@ Provisions a Hetzner VPS with hardened networking and installs Nautiloop via the
 
 ## Networking model
 
-- **SSH**: Open in firewall for terraform bootstrap. After setup, use Tailscale SSH (`ssh root@nautiloop`).
+- **SSH (22)**: Open in firewall (needed for terraform provisioning). Day-to-day, use Tailscale SSH (`ssh root@nautiloop`). Password auth is disabled, key-only.
 - **API (8080)**: Not exposed publicly. Engineers reach it at `http://nautiloop:8080` (MagicDNS) or `http://100.x.x.x:8080`.
 - **HTTP/HTTPS (80/443)**: Public, only when `domain` is set. Traefik serves HTTPS with Let's Encrypt.
 - **Tailscale UDP (41641)**: Public, required for WireGuard direct connections.
@@ -18,7 +18,7 @@ Provisions a Hetzner VPS with hardened networking and installs Nautiloop via the
 
 ## Hardening
 
-- Hetzner firewall: no public 8080 (API), SSH open for bootstrap only
+- Hetzner firewall: no public 8080 (API). SSH open (key-only, fail2ban protected)
 - fail2ban (SSH brute-force protection)
 - unattended-upgrades (automatic security patches)
 - Password auth disabled (key-only SSH + Tailscale SSH)
