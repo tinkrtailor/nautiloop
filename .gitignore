@@ -22,8 +22,18 @@ node_modules/
 # Claude local settings (contains permission grants, not shared)
 .claude/settings.local.json
 
-# Secrets
+# Secrets — NEVER commit resolved env files
 .env
 .env.*
 *.pem
 *.key
+
+# 1Password reference files are safe to commit (contain only op:// URIs)
+!.env.1password
+!terraform/.env.1password
+
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate*
+terraform/kubeconfig.yaml
+terraform/*.tfvars

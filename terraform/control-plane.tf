@@ -12,6 +12,8 @@ resource "kubernetes_config_map" "nemo_config" {
       [cluster]
       git_repo_url = "${var.git_repo_url}"
       agent_image = "${var.agent_base_image}"
+      sidecar_image = "${var.sidecar_image}"
+      ${var.image_pull_secret_dockerconfigjson != null ? "image_pull_secret = \"nemo-registry-creds\"" : ""}
     EOT
   }
 }
@@ -28,6 +30,7 @@ resource "kubernetes_deployment" "api_server" {
     kubernetes_persistent_volume_claim.bare_repo,
     kubernetes_job.repo_init,
     kubernetes_config_map.nemo_config,
+    kubernetes_secret.registry_creds_system,
   ]
 
   metadata {
@@ -52,10 +55,21 @@ resource "kubernetes_deployment" "api_server" {
         labels = {
           app = "nemo-api-server"
         }
+        annotations = {
+          # Trigger pod rollout when ConfigMap changes (sidecar_image, git_repo_url, etc.)
+          "config-checksum" = sha256(kubernetes_config_map.nemo_config.data["nemo.toml"])
+        }
       }
 
       spec {
         service_account_name = "nemo-api-server"
+
+        dynamic "image_pull_secrets" {
+          for_each = var.image_pull_secret_dockerconfigjson != null ? [1] : []
+          content {
+            name = "nemo-registry-creds"
+          }
+        }
 
         security_context {
           fs_group = 1000
@@ -208,6 +222,7 @@ resource "kubernetes_deployment" "loop_engine" {
     kubernetes_persistent_volume_claim.bare_repo,
     kubernetes_job.repo_init,
     kubernetes_config_map.nemo_config,
+    kubernetes_secret.registry_creds_system,
   ]
 
   metadata {
@@ -232,10 +247,20 @@ resource "kubernetes_deployment" "loop_engine" {
         labels = {
           app = "nemo-loop-engine"
         }
+        annotations = {
+          "config-checksum" = sha256(kubernetes_config_map.nemo_config.data["nemo.toml"])
+        }
       }
 
       spec {
         service_account_name = "nemo-loop-engine"
+
+        dynamic "image_pull_secrets" {
+          for_each = var.image_pull_secret_dockerconfigjson != null ? [1] : []
+          content {
+            name = "nemo-registry-creds"
+          }
+        }
 
         security_context {
           fs_group = 1000
