@@ -609,6 +609,9 @@ resource "null_resource" "k8s_networking_ip" {
       "kubectl -n nemo-system delete middleware redirect-https --ignore-not-found 2>/dev/null || true",
       "kubectl -n nemo-system delete certificate nemo-tls --ignore-not-found 2>/dev/null || true",
       "kubectl delete clusterissuer letsencrypt-prod --ignore-not-found 2>/dev/null || true",
+      # Uninstall cert-manager helm release if it was previously installed
+      "command -v helm >/dev/null 2>&1 && helm uninstall cert-manager --namespace cert-manager 2>/dev/null || true",
+      "kubectl delete namespace cert-manager --ignore-not-found 2>/dev/null || true",
     ]
   }
 }
