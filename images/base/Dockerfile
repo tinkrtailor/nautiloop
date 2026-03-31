@@ -7,7 +7,7 @@ FROM python:3.12-slim AS python-tools
 RUN pip install --no-cache-dir yq
 
 # Stage 2: Get opencode binary from published image
-FROM ghcr.io/anomalyco/opencode:latest AS opencode-src
+FROM ghcr.io/anomalyco/opencode:latest@sha256:f19f2c5902ae1b20667b707d495dfc80d4c30761b52f4d8a66ed4f7778693d74 AS opencode-src
 
 # Stage 3: Final image
 FROM node:22-bookworm-slim
