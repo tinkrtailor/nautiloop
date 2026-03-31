@@ -325,6 +325,7 @@ resource "null_resource" "k8s_api_server" {
     null_resource.k8s_secrets,
     null_resource.k8s_config,
     null_resource.k8s_nemo_config,
+    null_resource.k8s_registry_creds,
   ]
 
   triggers = {
@@ -354,6 +355,7 @@ resource "null_resource" "k8s_loop_engine" {
     null_resource.k8s_secrets,
     null_resource.k8s_config,
     null_resource.k8s_nemo_config,
+    null_resource.k8s_registry_creds,
   ]
 
   triggers = {

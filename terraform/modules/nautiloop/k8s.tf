@@ -386,18 +386,17 @@ YAML
 resource "null_resource" "k8s_foundation" {
   depends_on = [null_resource.k3s_install]
 
+  # Only trigger replacement on the manifest content, not connection details.
+  # Changing server_ip/ssh_key should NOT tear down the cluster foundation.
   triggers = {
-    postgres_volume_size = var.postgres_volume_size
-    server_ip            = var.server_ip
-    ssh_user             = var.ssh_user
-    ssh_private_key      = var.ssh_private_key
+    manifest_hash = sha256(local.foundation_yaml)
   }
 
   connection {
     type        = "ssh"
-    host        = self.triggers.server_ip
-    user        = self.triggers.ssh_user
-    private_key = self.triggers.ssh_private_key
+    host        = var.server_ip
+    user        = var.ssh_user
+    private_key = var.ssh_private_key
   }
 
   provisioner "remote-exec" {
@@ -405,15 +404,11 @@ resource "null_resource" "k8s_foundation" {
       "echo '${base64encode(local.foundation_yaml)}' | base64 -d | kubectl apply -f -",
     ]
   }
-
-  provisioner "remote-exec" {
-    when = destroy
-    inline = [
-      "kubectl delete namespace nemo-system nemo-jobs --ignore-not-found --timeout=120s 2>/dev/null || true",
-      "kubectl delete pv nemo-bare-repo-system nemo-bare-repo-jobs nemo-postgres-data --ignore-not-found 2>/dev/null || true",
-    ]
-  }
 }
+
+# NOTE: No destroy provisioner here. On `terraform destroy`:
+# - Cloud-provisioned servers (Hetzner, etc.) are destroyed entirely
+# - Existing servers: run `k3s-uninstall.sh` to clean up k3s + all resources
 
 # --- Stage 2: Secrets ---
 
@@ -529,16 +524,13 @@ resource "null_resource" "k8s_cert_manager" {
 
   triggers = {
     cert_manager_version = var.cert_manager_version
-    server_ip            = var.server_ip
-    ssh_user             = var.ssh_user
-    ssh_private_key      = var.ssh_private_key
   }
 
   connection {
     type        = "ssh"
-    host        = self.triggers.server_ip
-    user        = self.triggers.ssh_user
-    private_key = self.triggers.ssh_private_key
+    host        = var.server_ip
+    user        = var.ssh_user
+    private_key = var.ssh_private_key
   }
 
   provisioner "remote-exec" {
@@ -550,13 +542,8 @@ resource "null_resource" "k8s_cert_manager" {
     ]
   }
 
-  provisioner "remote-exec" {
-    when = destroy
-    inline = [
-      "helm uninstall cert-manager --namespace cert-manager 2>/dev/null || true",
-      "kubectl delete namespace cert-manager --ignore-not-found 2>/dev/null || true",
-    ]
-  }
+  # No destroy provisioner — k3s-uninstall.sh handles full cleanup.
+  # Terraform destroy provisioners can't safely reference variables.
 }
 
 # --- Stage 5a: Networking — TLS mode (domain set) ---
@@ -613,6 +600,8 @@ resource "null_resource" "k8s_networking_ip" {
       # Clean up TLS resources if they exist from a previous domain deployment
       "kubectl -n nemo-system delete ingressroute nemo-api nemo-api-http --ignore-not-found 2>/dev/null || true",
       "kubectl -n nemo-system delete middleware redirect-https --ignore-not-found 2>/dev/null || true",
+      "kubectl -n nemo-system delete certificate nemo-tls --ignore-not-found 2>/dev/null || true",
+      "kubectl delete clusterissuer letsencrypt-prod --ignore-not-found 2>/dev/null || true",
     ]
   }
 }
