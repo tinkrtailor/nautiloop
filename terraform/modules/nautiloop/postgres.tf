@@ -121,6 +121,7 @@ resource "null_resource" "k8s_postgres" {
 
   triggers = {
     manifest_hash = sha256(local.postgres_yaml)
+    server_ip     = var.server_ip
   }
 
   connection {

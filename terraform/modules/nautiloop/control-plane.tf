@@ -265,6 +265,7 @@ resource "null_resource" "k8s_nemo_config" {
 
   triggers = {
     config_hash = sha256(local.nemo_config_yaml)
+    server_ip   = var.server_ip
   }
 
   connection {
@@ -294,6 +295,7 @@ resource "null_resource" "k8s_repo_init" {
 
   triggers = {
     manifest_hash = sha256(local.repo_init_yaml)
+    server_ip     = var.server_ip
   }
 
   connection {
@@ -330,6 +332,7 @@ resource "null_resource" "k8s_api_server" {
 
   triggers = {
     manifest_hash = sha256(local.api_server_yaml)
+    server_ip     = var.server_ip
   }
 
   connection {
@@ -360,6 +363,7 @@ resource "null_resource" "k8s_loop_engine" {
 
   triggers = {
     manifest_hash = sha256(local.loop_engine_yaml)
+    server_ip     = var.server_ip
   }
 
   connection {
@@ -387,7 +391,8 @@ resource "null_resource" "health_check" {
   ]
 
   triggers = {
-    api_server_image = var.control_plane_image
+    api_server_hash  = sha256(local.api_server_yaml)
+    loop_engine_hash = sha256(local.loop_engine_yaml)
     server_ip        = var.server_ip
     has_domain       = tostring(local.has_domain)
   }

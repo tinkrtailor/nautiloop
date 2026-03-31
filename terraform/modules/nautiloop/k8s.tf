@@ -390,6 +390,7 @@ resource "null_resource" "k8s_foundation" {
   # Changing server_ip/ssh_key should NOT tear down the cluster foundation.
   triggers = {
     manifest_hash = sha256(local.foundation_yaml)
+    server_ip     = var.server_ip
   }
 
   connection {
@@ -418,6 +419,7 @@ resource "null_resource" "k8s_secrets" {
   triggers = {
     secrets_hash = sha256(local.secrets_yaml)
     registry     = var.image_pull_secret_dockerconfigjson != null ? "present" : "absent"
+    server_ip    = var.server_ip
   }
 
   connection {
@@ -441,6 +443,7 @@ resource "null_resource" "k8s_registry_creds" {
 
   triggers = {
     creds_hash = sha256(local.registry_creds_yaml)
+    server_ip  = var.server_ip
   }
 
   connection {
@@ -465,6 +468,7 @@ resource "null_resource" "k8s_config" {
   triggers = {
     config_hash = sha256(local.config_yaml)
     rbac_hash   = sha256(local.rbac_yaml)
+    server_ip   = var.server_ip
   }
 
   connection {
@@ -524,6 +528,7 @@ resource "null_resource" "k8s_cert_manager" {
 
   triggers = {
     cert_manager_version = var.cert_manager_version
+    server_ip            = var.server_ip
   }
 
   connection {
@@ -558,6 +563,7 @@ resource "null_resource" "k8s_networking_tls" {
 
   triggers = {
     manifest_hash = sha256(local.networking_tls_yaml)
+    server_ip     = var.server_ip
   }
 
   connection {
@@ -585,6 +591,7 @@ resource "null_resource" "k8s_networking_ip" {
 
   triggers = {
     manifest_hash = sha256(local.networking_ip_yaml)
+    server_ip     = var.server_ip
   }
 
   connection {
