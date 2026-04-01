@@ -6,7 +6,7 @@ Nautiloop is open source under Apache 2.0. Contributions are welcome.
 
 ```bash
 git clone https://github.com/tinkrtailor/nautiloop.git
-cd nemo
+cd nautiloop
 cargo build --workspace
 cargo test --workspace
 ```
@@ -77,7 +77,7 @@ Open an issue on GitHub. Include:
 - What you expected to happen
 - What actually happened
 - Steps to reproduce
-- Nemo version (`nemo --version`)
+- Nautiloop version (`nemo --version`)
 - Relevant logs (`nemo logs <loop_id>`)
 
 ## License

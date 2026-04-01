@@ -124,9 +124,9 @@ enum Commands {
         loop_id: String,
     },
 
-    /// Scan monorepo, generate nemo.toml
+    /// Scan monorepo, generate nautiloop.toml
     Init {
-        /// Overwrite existing nemo.toml
+        /// Overwrite existing nautiloop.toml
         #[arg(long)]
         force: bool,
     },

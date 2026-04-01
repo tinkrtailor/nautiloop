@@ -486,7 +486,7 @@ The review job outputs a JSON file at `.agent/review-verdict.json`:
 ## Next Steps
 
 1. **Choose a name.** Working in a repo with a name is better than working on "the thing."
-2. **Create the repo.** `~/nemo` with: `control-plane/` (Rust), `cli/` (Rust CLI), `terraform/` (HCL), `images/` (Dockerfiles).
+2. **Create the repo.** `~/nautiloop` with: `control-plane/` (Rust), `cli/` (Rust CLI), `terraform/` (HCL), `images/` (Dockerfiles).
 3. **Build the convergent loop engine first.** Forget the CLI, forget the dashboard, forget Terraform. Can a Rust binary dispatch two K8s jobs in sequence (implement, review), parse the review verdict, and loop? That's the core.
 4. **Test on Cleared.** Your own monorepo is the first customer.
 

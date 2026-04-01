@@ -45,9 +45,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /build/target/release/nautiloop-server /usr/local/bin/nautiloop-server
 
 # Run as non-root
-RUN groupadd -g 1000 nemo && \
-    useradd -u 1000 -g nemo -m nemo
-USER nemo
+RUN groupadd -g 1000 nautiloop && \
+    useradd -u 1000 -g nautiloop -m nautiloop
+USER nautiloop
 
 ENTRYPOINT ["tini", "--", "/usr/local/bin/nautiloop-server"]
 CMD ["api-server"]

@@ -1,12 +1,12 @@
 use anyhow::Result;
 use std::path::Path;
 
-/// Generate a nemo.toml configuration file by scanning the monorepo.
+/// Generate a nautiloop.toml configuration file by scanning the monorepo.
 pub fn run(force: bool) -> Result<()> {
-    let nemo_toml = Path::new("nemo.toml");
+    let nautiloop_toml = Path::new("nautiloop.toml");
 
-    if nemo_toml.exists() && !force {
-        anyhow::bail!("nemo.toml already exists. Use --force to overwrite.");
+    if nautiloop_toml.exists() && !force {
+        anyhow::bail!("nautiloop.toml already exists. Use --force to overwrite.");
     }
 
     // Scan for common project markers to auto-detect services
@@ -78,8 +78,8 @@ reviewer = "gpt-5.4"
 {services}"#
     );
 
-    std::fs::write(nemo_toml, config)?;
-    println!("Created nemo.toml");
+    std::fs::write(nautiloop_toml, config)?;
+    println!("Created nautiloop.toml");
     if services.contains("[services.") && !services.contains("# [services.") {
         println!("  Auto-detected project structure. Review and adjust as needed.");
     } else {
