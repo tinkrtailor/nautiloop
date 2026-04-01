@@ -53,7 +53,7 @@ impl std::fmt::Display for ConfigError {
             Self::MissingField { field, role } => {
                 write!(
                     f,
-                    "No {field} configured for role '{role}'. Set it in cluster config, nemo.toml [models], or ~/.nemo/config.toml [models]."
+                    "No {field} configured for role '{role}'. Set it in cluster config, nautiloop.toml [models], or ~/.nemo/config.toml [models]."
                 )
             }
             Self::Warning(msg) => write!(f, "Config warning: {msg}"),

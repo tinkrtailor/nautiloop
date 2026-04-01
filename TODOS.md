@@ -35,7 +35,7 @@
 
 **Why:** Currently engineers must poll `nemo status`. With 5 parallel loops, you want push notifications when something needs attention or is ready.
 
-**Context:** Two approaches: (a) generic webhook endpoint in nemo.toml (engineer configures their own Slack/Discord/email integration), or (b) built-in Slack integration. Webhook is more flexible and lower effort. Add `[notifications]` section to nemo.toml with `webhook_url` and `events` filter. Loop engine fires HTTP POST on state transitions.
+**Context:** Two approaches: (a) generic webhook endpoint in nautiloop.toml (engineer configures their own Slack/Discord/email integration), or (b) built-in Slack integration. Webhook is more flexible and lower effort. Add `[notifications]` section to nautiloop.toml with `webhook_url` and `events` filter. Loop engine fires HTTP POST on state transitions.
 
 **Effort:** M
 **Priority:** P2

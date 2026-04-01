@@ -1,6 +1,6 @@
 // Three-layer config merge modules (cluster -> repo -> engineer).
-// V1: Runtime uses NemoConfig (flat file). The merge modules are used by
-// nemo init (repo.rs service detection) and prepared for V1.5 where
+// V1: Runtime uses NautiloopConfig (flat file). The merge modules are used by
+// nemo init (repo.rs service detection, via CLI) and prepared for V1.5 where
 // MergedConfig will be computed per-loop at dispatch time from three layers.
 pub mod cluster;
 pub mod engineer;
@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 
-/// Repo-level configuration loaded from `nemo.toml`.
+/// Repo-level configuration loaded from `nautiloop.toml`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct NemoConfig {
+pub struct NautiloopConfig {
     #[serde(default)]
     pub limits: LimitsConfig,
     #[serde(default)]
@@ -34,7 +34,7 @@ pub struct NemoConfig {
 }
 
 /// Configuration for a single service in the monorepo.
-/// Defined under `[services.<name>]` in nemo.toml.
+/// Defined under `[services.<name>]` in nautiloop.toml.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceConfig {
     /// Path prefix in the repo that belongs to this service.
@@ -47,16 +47,16 @@ pub struct ServiceConfig {
     pub tags: Vec<String>,
 }
 
-impl NemoConfig {
-    /// Load config from `NEMO_CONFIG_PATH` env var, or `./nemo.toml` (repo-local),
-    /// or `/etc/nemo/nemo.toml` (system), or fall back to defaults.
+impl NautiloopConfig {
+    /// Load config from `NAUTILOOP_CONFIG_PATH` env var, or `./nautiloop.toml` (repo-local),
+    /// or `/etc/nautiloop/nautiloop.toml` (system), or fall back to defaults.
     pub fn load() -> std::result::Result<Self, String> {
-        let explicit = std::env::var("NEMO_CONFIG_PATH").ok();
+        let explicit = std::env::var("NAUTILOOP_CONFIG_PATH").ok();
 
         let candidates: Vec<String> = if let Some(ref explicit_path) = explicit {
             vec![explicit_path.clone()]
         } else {
-            vec!["./nemo.toml".to_string(), "/etc/nemo/nemo.toml".to_string()]
+            vec!["./nautiloop.toml".to_string(), "/etc/nautiloop/nautiloop.toml".to_string()]
         };
 
         let path = candidates
@@ -67,9 +67,9 @@ impl NemoConfig {
         let path = match path {
             Some(p) => p,
             None => {
-                // If NEMO_CONFIG_PATH was explicitly set but doesn't exist, fail hard
+                // If NAUTILOOP_CONFIG_PATH was explicitly set but doesn't exist, fail hard
                 if let Some(ref explicit_path) = explicit {
-                    return Err(format!("NEMO_CONFIG_PATH={explicit_path} does not exist"));
+                    return Err(format!("NAUTILOOP_CONFIG_PATH={explicit_path} does not exist"));
                 }
                 tracing::warn!("No config file found at {:?}, using defaults", candidates);
                 return Ok(Self::default());
@@ -79,10 +79,10 @@ impl NemoConfig {
         let contents = std::fs::read_to_string(&path)
             .map_err(|e| format!("Failed to read config at {}: {e}", path.display()))?;
 
-        let mut config: NemoConfig = toml::from_str(&contents)
+        let mut config: NautiloopConfig = toml::from_str(&contents)
             .map_err(|e| format!("Failed to parse config at {}: {e}", path.display()))?;
 
-        // If [repo].default_branch is set in nemo.toml, use it as the runtime default.
+        // If [repo].default_branch is set in nautiloop.toml, use it as the runtime default.
         // This closes the loop: nemo init writes it, the runtime reads it.
         if let Ok(raw) = toml::from_str::<toml::Value>(&contents)
             && let Some(branch) = raw
@@ -103,16 +103,16 @@ impl NemoConfig {
     }
 }
 
-/// Ship configuration from `[ship]` in nemo.toml.
+/// Ship configuration from `[ship]` in nautiloop.toml.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShipConfig {
-    /// Enable nemo ship (default: false).
+    /// Enable nautiloop ship (default: false).
     #[serde(default)]
     pub allowed: bool,
     /// Wait for CI before merge (default: true).
     #[serde(default = "default_true")]
     pub require_passing_ci: bool,
-    /// Force --harden on nemo ship (default: false).
+    /// Force --harden on nautiloop ship (default: false).
     #[serde(default)]
     pub require_harden: bool,
     /// Max rounds for auto-merge threshold (default: 5).
@@ -135,7 +135,7 @@ impl Default for ShipConfig {
     }
 }
 
-/// Harden merge configuration from `[harden]` in nemo.toml.
+/// Harden merge configuration from `[harden]` in nautiloop.toml.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HardenMergeConfig {
     /// Merge strategy for spec PRs (default: squash).
@@ -361,28 +361,28 @@ impl Default for ClusterConfig {
 }
 
 fn default_database_url() -> String {
-    "postgres://nemo:nemo@localhost:5432/nemo".to_string()
+    "postgres://nautiloop:nautiloop@localhost:5432/nautiloop".to_string()
 }
 fn default_jobs_namespace() -> String {
-    "nemo-jobs".to_string()
+    "nautiloop-jobs".to_string()
 }
 fn default_system_namespace() -> String {
-    "nemo-system".to_string()
+    "nautiloop-system".to_string()
 }
 fn default_agent_image() -> String {
-    "nemo-agent:latest".to_string()
+    "nautiloop-agent:latest".to_string()
 }
 fn default_bare_repo_pvc() -> String {
-    "nemo-bare-repo".to_string()
+    "nautiloop-bare-repo".to_string()
 }
 fn default_sidecar_image() -> String {
-    "nemo-sidecar:latest".to_string()
+    "nautiloop-sidecar:latest".to_string()
 }
 fn default_ssh_known_hosts_configmap() -> String {
-    "nemo-ssh-known-hosts".to_string()
+    "nautiloop-ssh-known-hosts".to_string()
 }
 fn default_sessions_pvc() -> String {
-    "nemo-sessions".to_string()
+    "nautiloop-sessions".to_string()
 }
 fn default_bind_addr() -> String {
     "0.0.0.0".to_string()
@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn test_default_config() {
-        let config = NemoConfig::default();
+        let config = NautiloopConfig::default();
         assert_eq!(config.limits.max_rounds_harden, 10);
         assert_eq!(config.limits.max_rounds_implement, 15);
         assert_eq!(config.timeouts.implement_secs, 1800);
@@ -458,7 +458,7 @@ mod tests {
             implementor = "claude-sonnet-4"
             reviewer = "gpt-4o"
         "#;
-        let config: NemoConfig = toml::from_str(toml).unwrap();
+        let config: NautiloopConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.limits.max_rounds_harden, 5);
         assert_eq!(config.limits.max_rounds_implement, 10);
         assert_eq!(config.timeouts.implement_secs, 3600);
@@ -478,7 +478,7 @@ mod tests {
             test = "npm test"
             tags = ["jvm"]
         "#;
-        let config: NemoConfig = toml::from_str(toml_str).unwrap();
+        let config: NautiloopConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.services.len(), 2);
 
         let api = &config.services["api"];
@@ -494,15 +494,15 @@ mod tests {
 
     #[test]
     fn test_default_config_has_no_services() {
-        let config = NemoConfig::default();
+        let config = NautiloopConfig::default();
         assert!(config.services.is_empty());
     }
 
     #[test]
     fn test_cluster_config_new_fields() {
         let config = ClusterConfig::default();
-        assert_eq!(config.sidecar_image, "nemo-sidecar:latest");
-        assert_eq!(config.sessions_pvc, "nemo-sessions");
+        assert_eq!(config.sidecar_image, "nautiloop-sidecar:latest");
+        assert_eq!(config.sessions_pvc, "nautiloop-sessions");
         assert!(config.image_pull_secret.is_none());
     }
 }

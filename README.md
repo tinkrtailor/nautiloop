@@ -47,7 +47,7 @@ The nautiloop Terraform module installs on any Linux server with SSH access. You
 
 ```hcl
 module "nautiloop" {
-  source = "github.com/tinkrtailor/nemo//terraform/modules/nautiloop"
+  source = "github.com/tinkrtailor/nautiloop//terraform/modules/nautiloop"
 
   server_ip       = "100.64.0.1"                          # any server with SSH
   ssh_private_key = file("~/.ssh/id_ed25519")
@@ -65,7 +65,7 @@ See [docs/deploy.md](docs/deploy.md) for the full guide, examples, and all optio
 ## Set up your repo
 
 ```bash
-nemo init                    # generates nemo.toml
+nemo init                    # generates nautiloop.toml
 nemo auth                    # pushes Claude + OpenAI + SSH credentials
 
 nemo start spec.md           # PR appears when it converges
@@ -86,7 +86,7 @@ Add `--harden` to `start` or `ship` to harden the spec before implementing.
 ## Configuration
 
 ```toml
-# nemo.toml (repo root, checked in)
+# nautiloop.toml (repo root, checked in)
 [repo]
 name = "my-project"
 default_branch = "main"
@@ -154,7 +154,7 @@ terraform/
   modules/nautiloop/    Reusable module (k3s + control plane + Postgres)
   examples/hetzner/     Reference: Hetzner VPS + Tailscale + nautiloop
 
-.nemo/prompts/          Agent prompt templates
+.nautiloop/prompts/          Agent prompt templates
 ```
 
 ## Built with Nemo
