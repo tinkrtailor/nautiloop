@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 
-/// Repo-level configuration loaded from `nautiloop.toml`.
+/// Repo-level configuration loaded from `nemo.toml`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NautiloopConfig {
     #[serde(default)]
@@ -34,7 +34,7 @@ pub struct NautiloopConfig {
 }
 
 /// Configuration for a single service in the monorepo.
-/// Defined under `[services.<name>]` in nautiloop.toml.
+/// Defined under `[services.<name>]` in nemo.toml.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceConfig {
     /// Path prefix in the repo that belongs to this service.
@@ -48,15 +48,15 @@ pub struct ServiceConfig {
 }
 
 impl NautiloopConfig {
-    /// Load config from `NAUTILOOP_CONFIG_PATH` env var, or `./nautiloop.toml` (repo-local),
-    /// or `/etc/nautiloop/nautiloop.toml` (system), or fall back to defaults.
+    /// Load config from `NAUTILOOP_CONFIG_PATH` env var, or `./nemo.toml` (repo-local),
+    /// or `/etc/nautiloop/nemo.toml` (system), or fall back to defaults.
     pub fn load() -> std::result::Result<Self, String> {
         let explicit = std::env::var("NAUTILOOP_CONFIG_PATH").ok();
 
         let candidates: Vec<String> = if let Some(ref explicit_path) = explicit {
             vec![explicit_path.clone()]
         } else {
-            vec!["./nautiloop.toml".to_string(), "/etc/nautiloop/nautiloop.toml".to_string()]
+            vec!["./nemo.toml".to_string(), "/etc/nautiloop/nemo.toml".to_string()]
         };
 
         let path = candidates
@@ -82,7 +82,7 @@ impl NautiloopConfig {
         let mut config: NautiloopConfig = toml::from_str(&contents)
             .map_err(|e| format!("Failed to parse config at {}: {e}", path.display()))?;
 
-        // If [repo].default_branch is set in nautiloop.toml, use it as the runtime default.
+        // If [repo].default_branch is set in nemo.toml, use it as the runtime default.
         // This closes the loop: nemo init writes it, the runtime reads it.
         if let Ok(raw) = toml::from_str::<toml::Value>(&contents)
             && let Some(branch) = raw
@@ -103,7 +103,7 @@ impl NautiloopConfig {
     }
 }
 
-/// Ship configuration from `[ship]` in nautiloop.toml.
+/// Ship configuration from `[ship]` in nemo.toml.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShipConfig {
     /// Enable nemo ship (default: false).
@@ -135,7 +135,7 @@ impl Default for ShipConfig {
     }
 }
 
-/// Harden merge configuration from `[harden]` in nautiloop.toml.
+/// Harden merge configuration from `[harden]` in nemo.toml.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HardenMergeConfig {
     /// Merge strategy for spec PRs (default: squash).

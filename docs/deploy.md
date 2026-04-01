@@ -166,7 +166,7 @@ Each engineer runs once:
 
 ```bash
 cd ~/your-monorepo
-nemo init                    # generates nautiloop.toml
+nemo init                    # generates nemo.toml
 nemo auth                    # pushes credentials (Claude, OpenAI, SSH) to cluster
 ```
 

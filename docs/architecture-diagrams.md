@@ -314,7 +314,7 @@ Three config layers merge with increasing priority. CLI flags are the highest-pr
 graph TD
     CL["<b>Layer 1: Cluster Config</b><br/>(lowest priority)<br/>K8s ConfigMap + env vars<br/>/etc/nautiloop/cluster.toml<br/><i>node_size, provider, domain,<br/>default models, max caps</i>"]
 
-    REPO["<b>Layer 2: Repo Config</b><br/>(team conventions)<br/>nautiloop.toml in monorepo root<br/>(checked in)<br/><i>models, limits, services,<br/>max_rounds_harden/implement</i>"]
+    REPO["<b>Layer 2: Repo Config</b><br/>(team conventions)<br/>nemo.toml in monorepo root<br/>(checked in)<br/><i>models, limits, services,<br/>max_rounds_harden/implement</i>"]
 
     ENG["<b>Layer 3: Engineer Config</b><br/>(personal preferences)<br/>~/.nemo/config.toml<br/>(not checked in)<br/><i>identity, model overrides,<br/>max_parallel_loops</i>"]
 

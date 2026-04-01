@@ -183,10 +183,10 @@ case "$STAGE" in
             exit 1
         fi
 
-        # FR-42b: Read test commands from nautiloop.toml
-        TOML_FILE="/work/nautiloop.toml"
+        # FR-42b: Read test commands from nemo.toml
+        TOML_FILE="/work/nemo.toml"
         if [ ! -f "$TOML_FILE" ]; then
-            echo "NAUTILOOP_ERROR: test: nautiloop.toml not found at $TOML_FILE" >&2
+            echo "NAUTILOOP_ERROR: test: nemo.toml not found at $TOML_FILE" >&2
             exit 1
         fi
 
@@ -201,7 +201,7 @@ case "$STAGE" in
             if [ -z "$cmd" ]; then
                 # Service not found in config - unknown status
                 RESULTS=$(echo "$RESULTS" | jq --arg name "$svc" --arg cmd "unknown" \
-                    '. + [{"name": $name, "test_command": $cmd, "exit_code": -1, "stdout": "", "stderr": "service not found in nautiloop.toml"}]')
+                    '. + [{"name": $name, "test_command": $cmd, "exit_code": -1, "stdout": "", "stderr": "service not found in nemo.toml"}]')
                 CI_STATUS="unknown"
                 ALL_PASSED=false
                 continue

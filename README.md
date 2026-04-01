@@ -65,7 +65,7 @@ See [docs/deploy.md](docs/deploy.md) for the full guide, examples, and all optio
 ## Set up your repo
 
 ```bash
-nemo init                    # generates nautiloop.toml
+nemo init                    # generates nemo.toml
 nemo auth                    # pushes Claude + OpenAI + SSH credentials
 
 nemo start spec.md           # PR appears when it converges
@@ -86,7 +86,7 @@ Add `--harden` to `start` or `ship` to harden the spec before implementing.
 ## Configuration
 
 ```toml
-# nautiloop.toml (repo root, checked in)
+# nemo.toml (repo root, checked in)
 [repo]
 name = "my-project"
 default_branch = "main"

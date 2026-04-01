@@ -49,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(?mode, "Starting Nautiloop control plane");
 
     // TODO(V1.5): Replace flat NautiloopConfig with three-layer config merge
-    // (cluster -> repo nautiloop.toml -> engineer ~/.nemo/config.toml) using
+    // (cluster -> repo nemo.toml -> engineer ~/.nemo/config.toml) using
     // config::merged::MergedConfig. V1 uses flat NautiloopConfig; engineer-level
     // model/limit overrides are deferred to V1.5. The merge modules exist
     // in config/cluster.rs, config/engineer.rs, config/merged.rs, config/repo.rs.

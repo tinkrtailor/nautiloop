@@ -570,7 +570,7 @@ Engineer                API Server          Postgres            Loop Engine     
   LAYER 1 (lowest priority)            LAYER 2 (team)                LAYER 3 (highest priority)
   Cluster Config                       Repo Config                   Engineer Config
 
-  Source: K8s ConfigMap                Source: nautiloop.toml             Source: ~/.nemo/config.toml
+  Source: K8s ConfigMap                Source: nemo.toml             Source: ~/.nemo/config.toml
   /etc/nautiloop/cluster.toml              (monorepo root, checked in)   (per-machine, not checked in)
   + NAUTILOOP_CLUSTER_* env vars
 
@@ -646,14 +646,14 @@ Engineer                API Server          Postgres            Loop Engine     
   RESOLUTION ORDER (high to low):
       1. CLI flags
       2. ~/.nemo/config.toml (engineer)
-      3. nautiloop.toml (repo/team)
+      3. nemo.toml (repo/team)
       4. Cluster ConfigMap / env vars
 
   MISSING FIELD BEHAVIOR:
       If implementor_model or reviewer_model is None at all layers:
       --> ConfigError::MissingField { field: "implementor", role: "model" }
       --> nemo submit fails with: "No implementor model configured. Set in
-          nautiloop.toml [models] or ~/.nemo/config.toml [models]"
+          nemo.toml [models] or ~/.nemo/config.toml [models]"
 ```
 
 ---

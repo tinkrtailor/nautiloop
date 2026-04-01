@@ -1,6 +1,6 @@
-//! Repo-level configuration loaded from `nautiloop.toml`.
+//! Repo-level configuration loaded from `nemo.toml`.
 //!
-//! Parsed from the monorepo root. The CLI validates `nautiloop.toml` locally before
+//! Parsed from the monorepo root. The CLI validates `nemo.toml` locally before
 //! `nemo submit` (fail fast). The API revalidates on receipt. Missing file at
 //! the repo level is an error for `nemo submit`.
 
@@ -76,7 +76,7 @@ pub struct TimeoutsConfig {
     pub revise_timeout_min: Option<u32>,
 }
 
-/// Complete repo configuration from `nautiloop.toml`.
+/// Complete repo configuration from `nemo.toml`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepoConfig {
@@ -98,7 +98,7 @@ pub struct RepoConfig {
 impl RepoConfig {
     /// Parse from a TOML string.
     pub fn parse(content: &str) -> Result<Self, String> {
-        toml::from_str(content).map_err(|e| format!("Failed to parse nautiloop.toml: {e}"))
+        toml::from_str(content).map_err(|e| format!("Failed to parse nemo.toml: {e}"))
     }
 
     /// Load from a file path.

@@ -1,4 +1,4 @@
-# Control plane: nautiloop.toml config, repo-init job, API server, loop engine — applied via SSH+kubectl.
+# Control plane: nemo.toml config, repo-init job, API server, loop engine — applied via SSH+kubectl.
 
 locals {
   nautiloop_toml = <<-TOML
@@ -18,7 +18,7 @@ metadata:
   name: nautiloop-config
   namespace: nautiloop-system
 data:
-  nautiloop.toml: |
+  nemo.toml: |
     ${indent(4, local.nautiloop_toml)}
 YAML
 

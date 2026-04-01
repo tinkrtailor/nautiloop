@@ -124,7 +124,7 @@ CLI tool using git worktrees locally or over SSH. No K8s dependency.
 - Git commits attributed to the engineer who submitted the job
 - Multi-round feedback via session continuation: `claude -p --resume $SESSION_ID` (implementer) and `opencode run -s $SESSION_ID` (reviewer). Each round is a clean process invocation (clean k8s Job), session state persisted on PVC. Alternative: `opencode serve` runs as a persistent sidecar, control plane talks to it via REST API (`POST /session/:id/prompt_async`), avoiding process spawn per round.
 - Review verdict enforced via OpenCode's SDK-level JSON Schema structured output (retries on validation failure)
-- **Image strategy:** Nautiloop ships a slim base image (git, claude-code, opencode, common runtimes, `ghcr.io/anomalyco/opencode` as base for reviewer). Each monorepo provides a `Dockerfile.nautiloop` (or `nautiloop.image` in `nautiloop.toml`) that extends the base with project-specific toolchains (Rust, JVM, Node, Solidity/Foundry, Python, etc.). `nemo init` generates a starter Dockerfile based on detected toolchains. This keeps Nautiloop stack-agnostic.
+- **Image strategy:** Nautiloop ships a slim base image (git, claude-code, opencode, common runtimes, `ghcr.io/anomalyco/opencode` as base for reviewer). Each monorepo provides a `Dockerfile.nautiloop` (or `nautiloop.image` in `nemo.toml`) that extends the base with project-specific toolchains (Rust, JVM, Node, Solidity/Foundry, Python, etc.). `nemo init` generates a starter Dockerfile based on detected toolchains. This keeps Nautiloop stack-agnostic.
 
 **3. nemo CLI — three verbs**
 
@@ -144,7 +144,7 @@ Other commands:
 - `nemo logs <loop-id>` -- stream logs for a specific loop
 - `nemo inspect <branch>` -- view any teammate's in-progress work (branch passed as query param to API)
 - `nemo cancel <loop-id>` -- cancel a running loop
-- `nemo init` -- scan monorepo, detect services, generate starter `nautiloop.toml`. Engineer reviews and commits.
+- `nemo init` -- scan monorepo, detect services, generate starter `nemo.toml`. Engineer reviews and commits.
 - `nemo auth` -- pipe local model credentials (Claude Max session, OpenAI Pro tokens) to the control plane. Stored as K8s secrets scoped to the engineer. The engineer extends their own subscription into the cluster, same model as local worktrees.
 - `nemo config` -- configure personal model preferences, review thresholds (writes `~/.nemo/config.toml`)
 - Auth: API key to control plane (mTLS deferred to V2)
@@ -153,7 +153,7 @@ Other commands:
 
 Three layers, each overriding the previous:
 
-**Layer 1: Repo config (`nautiloop.toml` in monorepo root, checked in)**
+**Layer 1: Repo config (`nemo.toml` in monorepo root, checked in)**
 ```toml
 [repo]
 name = "cleared"
@@ -222,7 +222,7 @@ cd terraform && terraform apply   # provisions cluster
 
 # Each engineer (once):
 cd ~/my-monorepo
-nemo init                         # generates nautiloop.toml (commit this)
+nemo init                         # generates nemo.toml (commit this)
 nemo auth                         # pipes credentials to cluster
 
 # Daily:
