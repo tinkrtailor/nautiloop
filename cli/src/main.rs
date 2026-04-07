@@ -180,22 +180,25 @@ async fn main() -> anyhow::Result<()> {
         return commands::init::run(force);
     }
 
-    let eng_config = config::load_config()?;
-
-    let server_url = cli.server.unwrap_or(eng_config.server_url.clone());
+    let resolved = config::sources::resolve(cli.server.as_deref())?;
 
     let insecure =
         cli.insecure || matches!(std::env::var("NEMO_INSECURE").as_deref(), Ok("true" | "1"));
     // Warn early if api_key is missing — commands that hit the server will fail
-    if eng_config.api_key.is_none() {
+    if resolved.api_key.is_none() {
         // Init and Config don't need an API key
         if !matches!(cli.command, Commands::Init { .. }) {
-            anyhow::bail!("API key not configured. Run: nemo config --set api_key=<your-key>");
+            anyhow::bail!(
+                "API key not configured. Set NEMO_API_KEY, create <repo>/.nemo/credentials, or run: nemo config --set api_key=<your-key>"
+            );
         }
     }
 
-    let http_client =
-        client::NemoClient::new(&server_url, eng_config.api_key.as_deref(), insecure)?;
+    let http_client = client::NemoClient::new(
+        &resolved.server_url.value,
+        resolved.api_key.as_ref().map(|r| r.value.as_str()),
+        insecure,
+    )?;
 
     // Validate engineer is configured for commands that need it
     // Status --team doesn't need engineer
@@ -207,7 +210,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Status { team, .. } => !team,
         _ => false,
     };
-    if needs_engineer && eng_config.engineer.is_empty() {
+    if needs_engineer && resolved.engineer.value.is_empty() {
         anyhow::bail!("Engineer name not configured. Run: nemo config --set engineer=<your-name>");
     }
 
@@ -221,7 +224,7 @@ async fn main() -> anyhow::Result<()> {
             commands::start::run(
                 &http_client,
                 commands::start::StartArgs {
-                    engineer: &eng_config.engineer,
+                    engineer: &resolved.engineer.value,
                     spec_path: &spec_path,
                     harden: true,
                     harden_only: true,
@@ -244,7 +247,7 @@ async fn main() -> anyhow::Result<()> {
             commands::start::run(
                 &http_client,
                 commands::start::StartArgs {
-                    engineer: &eng_config.engineer,
+                    engineer: &resolved.engineer.value,
                     spec_path: &spec_path,
                     harden,
                     harden_only: false,
@@ -266,7 +269,7 @@ async fn main() -> anyhow::Result<()> {
             commands::start::run(
                 &http_client,
                 commands::start::StartArgs {
-                    engineer: &eng_config.engineer,
+                    engineer: &resolved.engineer.value,
                     spec_path: &spec_path,
                     harden,
                     harden_only: false,
@@ -279,7 +282,7 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         }
         Commands::Status { team, json } => {
-            commands::status::run(&http_client, &eng_config.engineer, team, json).await?;
+            commands::status::run(&http_client, &resolved.engineer.value, team, json).await?;
         }
         Commands::Logs {
             loop_id,
@@ -311,9 +314,9 @@ async fn main() -> anyhow::Result<()> {
         } => {
             commands::auth::run(
                 &http_client,
-                &eng_config.engineer,
-                &eng_config.name,
-                &eng_config.email,
+                &resolved.engineer.value,
+                &resolved.name.value,
+                &resolved.email.value,
                 claude,
                 openai,
                 ssh,
