@@ -48,17 +48,25 @@ RUN chmod +x /usr/local/bin/nautiloop-agent-entry
 # Prompts are embedded in the image as fallback defaults.
 COPY .nautiloop/prompts/ /etc/nautiloop/prompts/
 
-# Create agent user (UID 1000) for non-root execution (FR-25)
+# Create agent user (UID 1000) for non-root execution (FR-25).
 # node:22-bookworm-slim has UID/GID 1000 as 'node'. Reuse it.
-RUN mkdir -p /work/home && \
-    cp -a /home/node/. /work/home/ 2>/dev/null || true && \
-    usermod -l agent -d /work/home -s /bin/bash node && \
+#
+# HOME deliberately lives at /home/agent and NOT inside /work. /work is
+# mounted from the worktree at runtime (read-only for REVIEW/AUDIT, FR-6),
+# and a sub-mount inside a read-only mount fails at pod start because
+# containerd cannot create the mountpoint inside the read-only rootfs.
+RUN mkdir -p /home/agent && \
+    cp -a /home/node/. /home/agent/ 2>/dev/null || true && \
+    usermod -l agent -d /home/agent -s /bin/bash node && \
     groupmod -n agent node && \
-    chown -R agent:agent /work/home
+    chown -R agent:agent /home/agent
 
-# Writable directories that will be emptyDir mounts at runtime
-RUN mkdir -p /work /work/home /output /sessions /tmp/shared && \
-    chown -R agent:agent /work /output /sessions /tmp/shared
+# Writable directories that will be emptyDir mounts at runtime.
+# These must exist in the image because the agent container runs with
+# read_only_root_filesystem: true — containerd cannot create mountpoints
+# in a read-only rootfs.
+RUN mkdir -p /work /output /sessions /tmp/shared && \
+    chown -R agent:agent /work /output /sessions /tmp/shared /home/agent
 
 USER agent
 WORKDIR /work

@@ -230,10 +230,17 @@ fn build_agent_env_vars(ctx: &LoopContext, stage: &StageConfig, is_test: bool) -
         env_var("ROUND", &ctx.round.to_string()),
         env_var("MAX_ROUNDS", &ctx.max_rounds.to_string()),
         env_var("LOOP_ID", &ctx.loop_id.to_string()),
-        // FR-27: Writable path env vars
-        env_var("HOME", "/work/home"),
-        env_var("XDG_CONFIG_HOME", "/work/home/.config"),
-        env_var("XDG_CACHE_HOME", "/work/home/.cache"),
+        // FR-27: Writable path env vars.
+        // HOME lives at /home/agent (NOT inside /work) so the home EmptyDir
+        // mount doesn't need to be created inside the worktree mount. For
+        // REVIEW/AUDIT stages /work is mounted read-only (FR-6), and a
+        // sub-mount inside a read-only mount fails at pod start with:
+        //   mkdirat .../rootfs/work/home: read-only file system
+        // because containerd cannot create the mountpoint inside the
+        // read-only worktree.
+        env_var("HOME", "/home/agent"),
+        env_var("XDG_CONFIG_HOME", "/home/agent/.config"),
+        env_var("XDG_CACHE_HOME", "/home/agent/.cache"),
         env_var("TMPDIR", "/tmp"),
         // FR-8: Proxy env vars for outbound traffic through sidecar egress logger
         env_var("HTTP_PROXY", "http://localhost:9092"),
@@ -428,7 +435,7 @@ fn build_agent_mounts(
         },
         VolumeMount {
             name: "home".to_string(),
-            mount_path: "/work/home".to_string(),
+            mount_path: "/home/agent".to_string(),
             ..Default::default()
         },
     ];
@@ -437,7 +444,7 @@ fn build_agent_mounts(
     if is_implement_or_revise {
         mounts.push(VolumeMount {
             name: "claude-session".to_string(),
-            mount_path: "/work/home/.claude".to_string(),
+            mount_path: "/home/agent/.claude".to_string(),
             read_only: Some(true),
             ..Default::default()
         });
@@ -712,7 +719,7 @@ mod tests {
         assert_eq!(find_env("ROUND").unwrap(), "2");
         assert_eq!(find_env("MAX_ROUNDS").unwrap(), "15");
         assert_eq!(find_env("LOOP_ID").unwrap(), ctx.loop_id.to_string());
-        assert_eq!(find_env("HOME").unwrap(), "/work/home");
+        assert_eq!(find_env("HOME").unwrap(), "/home/agent");
         assert_eq!(find_env("TMPDIR").unwrap(), "/tmp");
 
         // FR-8: Proxy env vars
@@ -900,7 +907,7 @@ mod tests {
         let job = build_job(&ctx, &stage, &cfg);
         let agent = &job.spec.unwrap().template.spec.unwrap().containers[0];
         let mounts = agent.volume_mounts.as_ref().unwrap();
-        let claude_mount = mounts.iter().find(|m| m.mount_path == "/work/home/.claude");
+        let claude_mount = mounts.iter().find(|m| m.mount_path == "/home/agent/.claude");
         assert!(
             claude_mount.is_some(),
             "Claude session should be mounted for implement"
@@ -927,7 +934,7 @@ mod tests {
         let job = build_job(&ctx, &stage, &cfg);
         let agent = &job.spec.unwrap().template.spec.unwrap().containers[0];
         let mounts = agent.volume_mounts.as_ref().unwrap();
-        assert!(mounts.iter().all(|m| m.mount_path != "/work/home/.claude"));
+        assert!(mounts.iter().all(|m| m.mount_path != "/home/agent/.claude"));
     }
 
     #[test]
