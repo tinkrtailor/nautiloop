@@ -40,7 +40,10 @@ pub fn build_job(ctx: &LoopContext, stage: &StageConfig, cfg: &JobBuildConfig) -
     // FR-31: Include attempt number in name to avoid AlreadyExists on redispatch.
     // Attempt = retry_count + 1 (first dispatch is attempt 1, first retry is attempt 2).
     let attempt = ctx.retry_count + 1;
-    let job_name = format!("nautiloop-{short_id}-{}-r{}-t{attempt}", stage.name, ctx.round);
+    let job_name = format!(
+        "nautiloop-{short_id}-{}-r{}-t{attempt}",
+        stage.name, ctx.round
+    );
 
     // FR-32: Labels for control plane queries
     let mut labels = BTreeMap::new();
@@ -119,7 +122,7 @@ pub fn build_job(ctx: &LoopContext, stage: &StageConfig, cfg: &JobBuildConfig) -
         ..Default::default()
     };
 
-    // FR-22: Sidecar readiness/liveness probes
+    // FR-22: Sidecar readiness probe
     let readiness_probe = Probe {
         http_get: Some(HTTPGetAction {
             path: Some("/healthz".to_string()),
@@ -128,17 +131,6 @@ pub fn build_job(ctx: &LoopContext, stage: &StageConfig, cfg: &JobBuildConfig) -
         }),
         initial_delay_seconds: Some(1),
         period_seconds: Some(5),
-        ..Default::default()
-    };
-
-    let liveness_probe = Probe {
-        http_get: Some(HTTPGetAction {
-            path: Some("/healthz".to_string()),
-            port: IntOrString::Int(9093),
-            ..Default::default()
-        }),
-        initial_delay_seconds: Some(5),
-        period_seconds: Some(10),
         ..Default::default()
     };
 
@@ -167,7 +159,6 @@ pub fn build_job(ctx: &LoopContext, stage: &StageConfig, cfg: &JobBuildConfig) -
         resources: Some(sidecar_resources),
         security_context: Some(sidecar_security_ctx),
         readiness_probe: Some(readiness_probe),
-        liveness_probe: Some(liveness_probe),
         ..Default::default()
     };
 
@@ -691,12 +682,11 @@ mod tests {
             .capabilities
             .as_ref()
             .unwrap();
-        assert!(
-            caps.add
-                .as_ref()
-                .unwrap()
-                .contains(&"NET_ADMIN".to_string())
-        );
+        assert!(caps
+            .add
+            .as_ref()
+            .unwrap()
+            .contains(&"NET_ADMIN".to_string()));
     }
 
     #[test]
@@ -907,18 +897,18 @@ mod tests {
         let job = build_job(&ctx, &stage, &cfg);
         let agent = &job.spec.unwrap().template.spec.unwrap().containers[0];
         let mounts = agent.volume_mounts.as_ref().unwrap();
-        let claude_mount = mounts.iter().find(|m| m.mount_path == "/home/agent/.claude");
+        let claude_mount = mounts
+            .iter()
+            .find(|m| m.mount_path == "/home/agent/.claude");
         assert!(
             claude_mount.is_some(),
             "Claude session should be mounted for implement"
         );
         assert_eq!(claude_mount.unwrap().read_only, Some(true));
         // No /secrets or model-credentials in agent
-        assert!(
-            !mounts
-                .iter()
-                .any(|m| m.mount_path.contains("/secrets") || m.mount_path.contains("credential"))
-        );
+        assert!(!mounts
+            .iter()
+            .any(|m| m.mount_path.contains("/secrets") || m.mount_path.contains("credential")));
     }
 
     #[test]
@@ -963,24 +953,18 @@ mod tests {
 
         // Sidecar has secret mounts
         let sidecar_mounts = pod_spec.containers[1].volume_mounts.as_ref().unwrap();
-        assert!(
-            sidecar_mounts
-                .iter()
-                .any(|m| m.mount_path == "/secrets/model-credentials")
-        );
-        assert!(
-            sidecar_mounts
-                .iter()
-                .any(|m| m.mount_path == "/secrets/ssh-key")
-        );
+        assert!(sidecar_mounts
+            .iter()
+            .any(|m| m.mount_path == "/secrets/model-credentials"));
+        assert!(sidecar_mounts
+            .iter()
+            .any(|m| m.mount_path == "/secrets/ssh-key"));
 
         // Agent does NOT have /secrets/ mounts (FR-26)
         let agent_mounts = pod_spec.containers[0].volume_mounts.as_ref().unwrap();
-        assert!(
-            !agent_mounts
-                .iter()
-                .any(|m| m.mount_path.starts_with("/secrets"))
-        );
+        assert!(!agent_mounts
+            .iter()
+            .any(|m| m.mount_path.starts_with("/secrets")));
     }
 
     #[test]
@@ -991,17 +975,12 @@ mod tests {
         let job = build_job(&ctx, &stage, &cfg);
         let sidecar = &job.spec.unwrap().template.spec.unwrap().containers[1];
 
-        // FR-22: Readiness and liveness probes on :9093/healthz
+        // FR-22: Readiness probe on :9093/healthz
         let readiness = sidecar.readiness_probe.as_ref().unwrap();
         let http = readiness.http_get.as_ref().unwrap();
         assert_eq!(http.port, IntOrString::Int(9093));
         assert_eq!(http.path.as_deref(), Some("/healthz"));
-
-        let liveness = sidecar.liveness_probe.as_ref().unwrap();
-        let http = liveness.http_get.as_ref().unwrap();
-        assert_eq!(http.port, IntOrString::Int(9093));
-        assert_eq!(liveness.initial_delay_seconds, Some(5));
-        assert_eq!(liveness.period_seconds, Some(10));
+        assert!(sidecar.liveness_probe.is_none());
     }
 
     #[test]
