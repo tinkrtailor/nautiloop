@@ -88,15 +88,17 @@ impl ClusterConfig {
             config.provider = std::env::var("NAUTILOOP_CLUSTER_PROVIDER").ok();
         }
         if config.default_implementor.is_none() {
-            config.default_implementor = std::env::var("NAUTILOOP_CLUSTER_DEFAULT_IMPLEMENTOR").ok();
+            config.default_implementor =
+                std::env::var("NAUTILOOP_CLUSTER_DEFAULT_IMPLEMENTOR").ok();
         }
         if config.default_reviewer.is_none() {
             config.default_reviewer = std::env::var("NAUTILOOP_CLUSTER_DEFAULT_REVIEWER").ok();
         }
         if config.max_parallel_loops_cap.is_none() {
-            config.max_parallel_loops_cap = std::env::var("NAUTILOOP_CLUSTER_MAX_PARALLEL_LOOPS_CAP")
-                .ok()
-                .and_then(|v| v.parse().ok());
+            config.max_parallel_loops_cap =
+                std::env::var("NAUTILOOP_CLUSTER_MAX_PARALLEL_LOOPS_CAP")
+                    .ok()
+                    .and_then(|v| v.parse().ok());
         }
         if config.max_cluster_jobs.is_none() {
             config.max_cluster_jobs = std::env::var("NAUTILOOP_CLUSTER_MAX_CLUSTER_JOBS")

@@ -1693,8 +1693,7 @@ mod tests {
         git.set_branch_sha("agent/alice/test-abc12345", "deadbeefcafebabe")
             .await;
 
-        let driver =
-            ConvergentLoopDriver::new(store, dispatcher, git, NautiloopConfig::default());
+        let driver = ConvergentLoopDriver::new(store, dispatcher, git, NautiloopConfig::default());
 
         let mut record = make_pending_loop(true);
         record.current_sha = None;
