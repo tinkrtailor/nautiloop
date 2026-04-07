@@ -12,6 +12,7 @@
 //! the legacy global-file reader/writer. [`repo_toml`] and [`credentials`]
 //! handle the two per-repo sources.
 
+pub mod credentials;
 pub mod engineer;
 
 // Backwards-compatible re-exports so existing imports (`crate::config::load_config`,
