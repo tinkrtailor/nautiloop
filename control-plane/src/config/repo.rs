@@ -77,8 +77,14 @@ pub struct TimeoutsConfig {
 }
 
 /// Complete repo configuration from `nemo.toml`.
+///
+/// Note: top-level `deny_unknown_fields` is intentionally NOT set here. The
+/// `nemo.toml` file is a forward-compatible surface shared with the CLI, which
+/// owns additional sections (e.g., `[server]` for per-repo server config —
+/// see `specs/per-repo-config.md`). Unknown top-level sections are ignored.
+/// Unknown keys inside known sections (e.g., `[repo]`, `[services.*]`) still
+/// fail via the inner structs' own `deny_unknown_fields` where present.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RepoConfig {
     pub repo: RepoMeta,
     #[serde(default)]
@@ -301,7 +307,8 @@ mod tests {
     }
 
     #[test]
-    fn test_repo_config_unknown_fields() {
+    fn test_repo_config_unknown_fields_in_repo_meta() {
+        // Unknown keys inside [repo] still fail — RepoMeta is strict.
         let toml = r#"
             [repo]
             name = "my-project"
@@ -311,6 +318,38 @@ mod tests {
         let result = RepoConfig::parse(toml);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("unknown field"));
+    }
+
+    #[test]
+    fn test_repo_config_tolerates_server_section() {
+        // The CLI owns `[server]` (per-repo server URL, see specs/per-repo-config.md).
+        // The control-plane parser must not reject it.
+        let toml = r#"
+            [repo]
+            name = "my-project"
+            default_branch = "main"
+
+            [server]
+            url = "http://100.110.72.64:8080"
+        "#;
+        let config = RepoConfig::parse(toml).expect("must tolerate [server] section");
+        assert_eq!(config.repo.name, "my-project");
+    }
+
+    #[test]
+    fn test_repo_config_tolerates_unknown_top_level_sections() {
+        // Forward-compat: any future unknown top-level section must be ignored.
+        let toml = r#"
+            [repo]
+            name = "my-project"
+            default_branch = "main"
+
+            [some_future_section]
+            key = "value"
+            nested = { a = 1, b = 2 }
+        "#;
+        let config = RepoConfig::parse(toml).expect("must tolerate unknown top-level sections");
+        assert_eq!(config.repo.name, "my-project");
     }
 
     #[test]
