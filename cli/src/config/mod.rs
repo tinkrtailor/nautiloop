@@ -15,6 +15,7 @@
 pub mod credentials;
 pub mod engineer;
 pub mod repo_toml;
+pub mod sources;
 
 // Backwards-compatible re-exports so existing imports (`crate::config::load_config`,
 // `crate::config::EngineerConfig`) continue to work without ripple-churn edits.
