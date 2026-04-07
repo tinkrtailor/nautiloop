@@ -6,8 +6,45 @@
 FROM python:3.12-slim AS python-tools
 RUN pip install --no-cache-dir yq
 
-# Stage 2: Get opencode binary from published image
-FROM ghcr.io/anomalyco/opencode:latest AS opencode-src
+# Stage 2: Fetch opencode binary from the official sst/opencode releases.
+#
+# We deliberately do NOT use ghcr.io/anomalyco/opencode:latest — that image
+# ships the musl (Alpine) build of opencode, which cannot run on the
+# node:22-bookworm-slim (Debian/glibc) base: the binary's PT_INTERP points
+# at /lib/ld-musl-x86_64.so.1 and its C++ symbols come from a musl-built
+# libstdc++, so bash reports "cannot execute: required file not found" and
+# the audit/review/implement stages all fail with exit 127 before the
+# agent does any work.
+#
+# Pulling the glibc build directly from the upstream release tarball
+# sidesteps this and gets us reproducible, pinned versions.
+FROM debian:bookworm-slim AS opencode-src
+# TARGETARCH is populated by BuildKit (docker buildx). Default to amd64 so
+# plain `docker build` still works on amd64 hosts without requiring buildx.
+ARG TARGETARCH=amd64
+ARG OPENCODE_VERSION=v1.3.17
+# Pinned SHA256 digests for the two supported arches. If upstream replaces
+# a release asset (or a MITM tampers with it), the shasum check below fails
+# the build BEFORE we execute anything from the tarball. This is the whole
+# reason we verify before running `opencode --version`.
+ARG OPENCODE_SHA256_AMD64=19e540840cfd04afebed92cfe67dce0cd6c425ed5f729ef946e8071f776205a9
+ARG OPENCODE_SHA256_ARM64=345293ed29c703cf3c4b0e696db50c3586c973a4d4ff90f1db5b6cbbbb2cee4b
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64) asset="opencode-linux-x64.tar.gz";   expected_sha="$OPENCODE_SHA256_AMD64" ;; \
+      arm64) asset="opencode-linux-arm64.tar.gz"; expected_sha="$OPENCODE_SHA256_ARM64" ;; \
+      *)     echo "Unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/opencode.tar.gz \
+      "https://github.com/sst/opencode/releases/download/${OPENCODE_VERSION}/${asset}"; \
+    echo "${expected_sha}  /tmp/opencode.tar.gz" | sha256sum -c -; \
+    mkdir -p /opt/opencode; \
+    tar -xzf /tmp/opencode.tar.gz -C /opt/opencode opencode; \
+    chmod +x /opt/opencode/opencode; \
+    /opt/opencode/opencode --version
 
 # Stage 3: Final image
 FROM node:22-bookworm-slim
@@ -35,9 +72,9 @@ COPY --from=python-tools /usr/local/lib/python3.12/site-packages /usr/local/lib/
 # FR-2: Install claude-code
 RUN npm install -g @anthropic-ai/claude-code@2.1.87
 
-# FR-3: Install opencode binary
-COPY --from=opencode-src /usr/local/bin/opencode /usr/local/bin/opencode
-RUN chmod +x /usr/local/bin/opencode
+# FR-3: Install opencode binary (glibc build, see opencode-src stage)
+COPY --from=opencode-src /opt/opencode/opencode /usr/local/bin/opencode
+RUN chmod +x /usr/local/bin/opencode && /usr/local/bin/opencode --version
 
 # FR-4: Entrypoint script
 COPY images/base/nautiloop-agent-entry /usr/local/bin/nautiloop-agent-entry
