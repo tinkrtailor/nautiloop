@@ -22,11 +22,6 @@
 //! * prints a one-line stderr warning the first time a per-repo source shadows
 //!   a non-empty global source for the same key (FR-15, per-process only —
 //!   no persistent state).
-//!
-//! `dead_code` is suppressed at the module level during early steps because
-//! `main.rs` and `nemo config` (Step 6, Step 7) are the consumers and land
-//! after this module.
-#![allow(dead_code)]
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};

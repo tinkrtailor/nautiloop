@@ -11,7 +11,6 @@
 //! `[services]`, `[models]`, etc.).
 //!
 //! See `specs/per-repo-config.md` FR-1, FR-4, FR-8.
-#![allow(dead_code)]
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;

@@ -146,15 +146,23 @@ enum Commands {
         ssh: bool,
     },
 
-    /// Edit ~/.nemo/config.toml
+    /// View or edit CLI configuration (global + per-repo)
     Config {
-        /// Set a config value
+        /// Set a config value (format: key=value)
         #[arg(long)]
         set: Option<String>,
 
         /// Get a config value
         #[arg(long)]
         get: Option<String>,
+
+        /// Force write to the per-repo config (<repo>/nemo.toml or <repo>/.nemo/credentials)
+        #[arg(long, conflicts_with = "global")]
+        local: bool,
+
+        /// Force write to the global config (~/.nemo/config.toml)
+        #[arg(long)]
+        global: bool,
     },
 }
 
@@ -171,8 +179,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Handle config command before loading config — a broken config file
     // must not prevent `nemo config --set` from working.
-    if let Commands::Config { ref set, ref get } = cli.command {
-        return commands::config::run(set.clone(), get.clone());
+    if let Commands::Config {
+        ref set,
+        ref get,
+        local,
+        global,
+    } = cli.command
+    {
+        return commands::config::run(set.clone(), get.clone(), local, global);
     }
 
     // Init is local-only — don't require config
@@ -323,8 +337,9 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
         }
-        Commands::Config { set, get } => {
-            commands::config::run(set, get)?;
+        Commands::Config { .. } => {
+            // Handled above before config loading
+            unreachable!("Config is dispatched before config loading");
         }
     }
 

@@ -4,12 +4,6 @@
 //! SSH private keys work: one file, one secret, mode-enforced.
 //!
 //! See `specs/per-repo-config.md` FR-2, FR-9, NFR-3.
-//!
-//! The public items below are consumed by `config::sources::resolve` and the
-//! `nemo config --local --set api_key=...` path. `dead_code` is suppressed at
-//! the module level during early steps because the consumers land in later
-//! steps of the same spec; the allow is kept narrow to this file.
-#![allow(dead_code)]
 
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
