@@ -19,19 +19,28 @@ RUN pip install --no-cache-dir yq
 # Pulling the glibc build directly from the upstream release tarball
 # sidesteps this and gets us reproducible, pinned versions.
 FROM debian:bookworm-slim AS opencode-src
-ARG TARGETARCH
+# TARGETARCH is populated by BuildKit (docker buildx). Default to amd64 so
+# plain `docker build` still works on amd64 hosts without requiring buildx.
+ARG TARGETARCH=amd64
 ARG OPENCODE_VERSION=v1.3.17
+# Pinned SHA256 digests for the two supported arches. If upstream replaces
+# a release asset (or a MITM tampers with it), the shasum check below fails
+# the build BEFORE we execute anything from the tarball. This is the whole
+# reason we verify before running `opencode --version`.
+ARG OPENCODE_SHA256_AMD64=19e540840cfd04afebed92cfe67dce0cd6c425ed5f729ef946e8071f776205a9
+ARG OPENCODE_SHA256_ARM64=345293ed29c703cf3c4b0e696db50c3586c973a4d4ff90f1db5b6cbbbb2cee4b
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 RUN set -eux; \
     case "$TARGETARCH" in \
-      amd64) asset="opencode-linux-x64.tar.gz" ;; \
-      arm64) asset="opencode-linux-arm64.tar.gz" ;; \
+      amd64) asset="opencode-linux-x64.tar.gz";   expected_sha="$OPENCODE_SHA256_AMD64" ;; \
+      arm64) asset="opencode-linux-arm64.tar.gz"; expected_sha="$OPENCODE_SHA256_ARM64" ;; \
       *)     echo "Unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac; \
     curl -fsSL -o /tmp/opencode.tar.gz \
       "https://github.com/sst/opencode/releases/download/${OPENCODE_VERSION}/${asset}"; \
+    echo "${expected_sha}  /tmp/opencode.tar.gz" | sha256sum -c -; \
     mkdir -p /opt/opencode; \
     tar -xzf /tmp/opencode.tar.gz -C /opt/opencode opencode; \
     chmod +x /opt/opencode/opencode; \
