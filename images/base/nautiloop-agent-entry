@@ -216,11 +216,28 @@ case "$STAGE" in
     review|audit)
         # FR-6, FR-7: OpenCode for review/audit (read-only)
         export OPENCODE_PERMISSIONS='{"edit":"deny","bash":"deny","read":"allow"}'
+
+        # Pin the provider to `openai` so opencode routes through the sidecar
+        # model proxy (OPENAI_BASE_URL=http://localhost:9090/openai) instead
+        # of falling back to its built-in `opencode/*` models that go to the
+        # opencode.ai hosted backend with unknown billing. See issue #62.
+        #
+        # opencode expects `-m provider/model`. If MODEL is unset or doesn't
+        # contain a provider prefix, we prepend `openai/`. If it already has
+        # a prefix (e.g. user explicitly set `anthropic/...`), pass through.
+        # If MODEL is entirely unset, default to a cheap OpenAI model so the
+        # reviewer doesn't silently fall back to a nondeterministic default.
+        OPENCODE_MODEL="${MODEL:-gpt-4o-mini}"
+        case "$OPENCODE_MODEL" in
+            */*) ;;                              # already has provider prefix
+            *) OPENCODE_MODEL="openai/$OPENCODE_MODEL" ;;
+        esac
+
         # opencode v1.3+ removed --prompt-file; the message is either a
         # positional arg or piped in via stdin. We pipe via stdin to avoid
         # argv length limits for large specs/diffs — same reasoning the
         # original --prompt-file code had.
-        OPENCODE_ARGS=(run --format json)
+        OPENCODE_ARGS=(run --format json -m "$OPENCODE_MODEL")
         if [ -n "${SESSION_ID:-}" ]; then
             OPENCODE_ARGS+=(-s "$SESSION_ID")
         fi
