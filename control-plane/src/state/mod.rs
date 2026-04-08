@@ -178,9 +178,9 @@ pub mod memory {
                 .values()
                 .any(|l| l.branch == record.branch && !l.state.is_terminal());
             if has_active {
-                return Err(crate::error::NautiloopError::Database(sqlx::Error::Database(
-                    Box::new(MemoryUniqueViolation),
-                )));
+                return Err(crate::error::NautiloopError::Database(
+                    sqlx::Error::Database(Box::new(MemoryUniqueViolation)),
+                ));
             }
             loops.insert(record.id, record.clone());
             Ok(record.clone())

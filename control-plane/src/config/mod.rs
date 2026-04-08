@@ -56,7 +56,10 @@ impl NautiloopConfig {
         let candidates: Vec<String> = if let Some(ref explicit_path) = explicit {
             vec![explicit_path.clone()]
         } else {
-            vec!["./nemo.toml".to_string(), "/etc/nautiloop/nemo.toml".to_string()]
+            vec![
+                "./nemo.toml".to_string(),
+                "/etc/nautiloop/nemo.toml".to_string(),
+            ]
         };
 
         let path = candidates
@@ -69,7 +72,9 @@ impl NautiloopConfig {
             None => {
                 // If NAUTILOOP_CONFIG_PATH was explicitly set but doesn't exist, fail hard
                 if let Some(ref explicit_path) = explicit {
-                    return Err(format!("NAUTILOOP_CONFIG_PATH={explicit_path} does not exist"));
+                    return Err(format!(
+                        "NAUTILOOP_CONFIG_PATH={explicit_path} does not exist"
+                    ));
                 }
                 tracing::warn!("No config file found at {:?}, using defaults", candidates);
                 return Ok(Self::default());

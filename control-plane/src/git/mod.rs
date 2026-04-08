@@ -92,7 +92,9 @@ pub mod bare {
                 .current_dir(&self.repo_path)
                 .output()
                 .await
-                .map_err(|e| crate::error::NautiloopError::Git(format!("Failed to run git: {e}")))?;
+                .map_err(|e| {
+                    crate::error::NautiloopError::Git(format!("Failed to run git: {e}"))
+                })?;
 
             if output.status.success() {
                 Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -136,16 +138,18 @@ pub mod bare {
                     crate::error::NautiloopError::Git(format!("Failed to create dirs: {e}"))
                 })?;
             }
-            tokio::fs::write(&file_path, content)
-                .await
-                .map_err(|e| crate::error::NautiloopError::Git(format!("Failed to write file: {e}")))?;
+            tokio::fs::write(&file_path, content).await.map_err(|e| {
+                crate::error::NautiloopError::Git(format!("Failed to write file: {e}"))
+            })?;
 
             let add = Command::new("git")
                 .args(["add", path])
                 .current_dir(worktree_dir)
                 .output()
                 .await
-                .map_err(|e| crate::error::NautiloopError::Git(format!("git add spawn failed: {e}")))?;
+                .map_err(|e| {
+                    crate::error::NautiloopError::Git(format!("git add spawn failed: {e}"))
+                })?;
             if !add.status.success() {
                 let stderr = String::from_utf8_lossy(&add.stderr).trim().to_string();
                 return Err(crate::error::NautiloopError::Git(format!(
@@ -418,7 +422,9 @@ pub mod bare {
                 .current_dir(&worktree_dir)
                 .output()
                 .await
-                .map_err(|e| crate::error::NautiloopError::Git(format!("git rm spawn failed: {e}")))?;
+                .map_err(|e| {
+                    crate::error::NautiloopError::Git(format!("git rm spawn failed: {e}"))
+                })?;
 
             if !rm.status.success() {
                 let stderr = String::from_utf8_lossy(&rm.stderr).trim().to_string();
@@ -523,7 +529,9 @@ pub mod bare {
             self.run_git(&["push", "-u", "origin", branch])
                 .await
                 .map_err(|e| {
-                    crate::error::NautiloopError::Git(format!("Failed to push {branch} to origin: {e}"))
+                    crate::error::NautiloopError::Git(format!(
+                        "Failed to push {branch} to origin: {e}"
+                    ))
                 })?;
 
             // Check if a PR already exists for this branch (idempotent on retry)

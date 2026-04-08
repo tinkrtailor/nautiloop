@@ -523,7 +523,9 @@ pub async fn upsert_credentials(
                 .replace(&secret_name, &kube::api::PostParams::default(), &secret)
                 .await
                 .map_err(|e| {
-                    NautiloopError::Internal(format!("Failed to update K8s Secret {secret_name}: {e}"))
+                    NautiloopError::Internal(format!(
+                        "Failed to update K8s Secret {secret_name}: {e}"
+                    ))
                 })?;
         } else {
             // New secret — create
@@ -531,7 +533,9 @@ pub async fn upsert_credentials(
                 .create(&kube::api::PostParams::default(), &secret)
                 .await
                 .map_err(|e| {
-                    NautiloopError::Internal(format!("Failed to create K8s Secret {secret_name}: {e}"))
+                    NautiloopError::Internal(format!(
+                        "Failed to create K8s Secret {secret_name}: {e}"
+                    ))
                 })?;
         }
     }
@@ -774,7 +778,7 @@ mod tests {
             app,
             Request::builder()
                 .method(http::Method::POST)
-                .uri(&format!("/approve/{}", record.id))
+                .uri(format!("/approve/{}", record.id))
                 .body(Body::empty())
                 .unwrap(),
         )
