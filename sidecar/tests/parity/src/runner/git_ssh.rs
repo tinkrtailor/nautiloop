@@ -63,13 +63,18 @@ pub async fn run(case: &CorpusCase, ctx: &RunnerContext) -> Result<CaseExecution
 /// asserts the expected split:
 ///
 /// - Rust: exit status 1 from the sidecar itself, `mock-github-ssh`
-///   observed **zero** exec events from `100.64.0.21`
+///   observed **exactly zero** exec events from `100.64.0.21`
+///   (the Rust sidecar rejects bare exec locally without forwarding).
 /// - Go: exit status 128 from paramiko, `mock-github-ssh` observed
-///   **at least one** exec event from `100.64.0.20`
+///   **exactly one** exec event from `100.64.0.20` (the Go sidecar
+///   forwards unchanged and paramiko rejects).
 ///
 /// Each of the four conditions is checked individually and the
-/// failure `detail` string names whichever one failed so the report
-/// artifact points at the actual mismatch.
+/// failure `detail` string names whichever one failed — including,
+/// for the Go count check, a count-specific explanation that picks
+/// between "retry loop / double-dispatch" (count > 1) and "never
+/// reached the mock" (count == 0) so the operator gets exactly one
+/// explanation relevant to the observed failure.
 pub async fn run_bare_exec_divergence(
     case: &CorpusCase,
     ctx: &RunnerContext,
@@ -134,8 +139,14 @@ fn bare_exec_assertion(
         ));
     }
     if go_mock_exec_count != 1 {
+        let reason = if go_mock_exec_count > 1 {
+            "a count > 1 suggests a retry loop or double-dispatch regression"
+        } else {
+            // go_mock_exec_count == 0
+            "a count of 0 means the bare exec never reached the mock"
+        };
         failures.push(format!(
-            "Expected exactly 1 exec from Go (source_ip 100.64.0.20), observed {go_mock_exec_count}; a count > 1 suggests a retry loop or double-dispatch regression, a count of 0 means the bare exec never reached the mock."
+            "Expected exactly 1 exec from Go (source_ip 100.64.0.20), observed {go_mock_exec_count}; {reason}."
         ));
     }
     if rust_mock_exec_count != 0 {
@@ -430,7 +441,10 @@ mod tests {
         // Regression guard for the codex r2 P2: a retry loop or
         // double-dispatch bug on the Go side emits 2 execs. The
         // prior `>= 1` check silently accepted this; the tightened
-        // `== 1` check must flag it.
+        // `== 1` check must flag it. Codex r3 P2 additionally
+        // requires the failure message to pick the count-specific
+        // explanation (retry loop) without mentioning the
+        // "never reached the mock" path.
         let a = bare_exec_assertion(
             "divergence_bare_exec_upload_pack_rejection",
             Some(128),
@@ -439,12 +453,47 @@ mod tests {
             0,
         );
         assert!(!a.passed, "detail: {}", a.detail);
-        assert!(a.detail.contains("Expected exactly 1 exec from Go"));
-        assert!(a.detail.contains("observed 2"));
+        assert!(
+            a.detail.contains("Expected exactly 1 exec from Go"),
+            "missing 'Expected exactly 1 exec from Go' in: {}",
+            a.detail
+        );
+        assert!(
+            a.detail.contains("observed 2"),
+            "missing 'observed 2' in: {}",
+            a.detail
+        );
+        assert!(
+            a.detail
+                .contains("retry loop or double-dispatch regression"),
+            "missing retry-loop explanation in: {}",
+            a.detail
+        );
+        assert!(
+            !a.detail.contains("never reached the mock"),
+            "count>1 failure must not mention the zero-count explanation, got: {}",
+            a.detail
+        );
+    }
+
+    #[test]
+    fn bare_exec_assertion_fails_when_go_mock_count_is_three() {
+        // Higher retry counts must still land in the
+        // retry/double-dispatch branch, not the zero-count branch.
+        let a = bare_exec_assertion(
+            "divergence_bare_exec_receive_pack_rejection",
+            Some(128),
+            Some(1),
+            3,
+            0,
+        );
+        assert!(!a.passed);
+        assert!(a.detail.contains("observed 3"));
         assert!(
             a.detail
                 .contains("retry loop or double-dispatch regression")
         );
+        assert!(!a.detail.contains("never reached the mock"));
     }
 
     #[test]
@@ -475,6 +524,11 @@ mod tests {
 
     #[test]
     fn bare_exec_assertion_fails_when_go_did_not_reach_mock() {
+        // Codex r3 P2: the zero-count path must explicitly say
+        // "never reached the mock" rather than falling through to
+        // the shared combined message. This ensures the operator
+        // sees exactly one explanation relevant to the observed
+        // failure.
         let a = bare_exec_assertion(
             "divergence_bare_exec_upload_pack_rejection",
             Some(128),
@@ -483,8 +537,27 @@ mod tests {
             0,
         );
         assert!(!a.passed);
-        assert!(a.detail.contains("Expected exactly 1 exec from Go"));
-        assert!(a.detail.contains("observed 0"));
+        assert!(
+            a.detail.contains("Expected exactly 1 exec from Go"),
+            "missing 'Expected exactly 1 exec from Go' in: {}",
+            a.detail
+        );
+        assert!(
+            a.detail.contains("observed 0"),
+            "expected 'observed 0' in failure message, got: {}",
+            a.detail
+        );
+        assert!(
+            a.detail.contains("never reached the mock"),
+            "expected 'never reached the mock' explanation in failure message, got: {}",
+            a.detail
+        );
+        assert!(
+            !a.detail
+                .contains("retry loop or double-dispatch regression"),
+            "count==0 failure must not mention the count>1 explanation, got: {}",
+            a.detail
+        );
     }
 
     #[test]
