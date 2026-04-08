@@ -291,8 +291,32 @@ fn build_agent_env_vars(ctx: &LoopContext, stage: &StageConfig, is_test: bool) -
         env_var("https_proxy", "http://localhost:9092"),
         env_var("NO_PROXY", "localhost,127.0.0.1,::1"),
         env_var("no_proxy", "localhost,127.0.0.1,::1"),
-        // FR-9: OpenAI API through sidecar model proxy
+        // FR-9: OpenAI API through sidecar model proxy.
+        //
+        // OPENAI_BASE_URL points at the sidecar's :9090 model proxy. The
+        // sidecar reads /secrets/model-credentials/openai and OVERWRITES
+        // the Authorization header on every forwarded request (see
+        // modelProxyHandler in images/sidecar/main.go). So the real
+        // OpenAI Platform key never enters the agent container — the
+        // agent sends a placeholder, the sidecar swaps in the real key.
+        //
+        // OPENAI_API_KEY is a PLACEHOLDER that exists ONLY to make
+        // opencode enable its OpenAI provider. opencode v1.3.x detects
+        // the OpenAI provider via the presence of OPENAI_API_KEY in
+        // the environment (`opencode providers list` shows it in the
+        // "Environment" section). Without it, opencode falls back to
+        // its built-in `opencode/*` models routed through opencode.ai,
+        // which (a) bypasses the sidecar credential-injection path
+        // entirely, (b) sends prompts to a third-party service with
+        // unknown billing/retention, and (c) makes `nemo auth --openai`
+        // dead code. See issue #62.
+        //
+        // The literal value `sk-replaced-by-sidecar` is sent as the
+        // Bearer token in every opencode request to :9090, and the
+        // sidecar replaces it with the real key before forwarding to
+        // api.openai.com. The agent never sees the real key.
         env_var("OPENAI_BASE_URL", "http://localhost:9090/openai"),
+        env_var("OPENAI_API_KEY", "sk-replaced-by-sidecar"),
         // Note: ANTHROPIC_BASE_URL is NOT set. Claude Code authenticates via the
         // mounted ~/.claude/ session directory (FR-25b), not via the sidecar proxy.
         // Base branch for diff context in review/audit stages
@@ -787,10 +811,17 @@ mod tests {
         assert_eq!(find_env("HTTPS_PROXY").unwrap(), "http://localhost:9092");
         assert_eq!(find_env("NO_PROXY").unwrap(), "localhost,127.0.0.1,::1");
 
-        // FR-9: OpenAI base URL
+        // FR-9: OpenAI base URL points at the sidecar model proxy.
         assert_eq!(
             find_env("OPENAI_BASE_URL").unwrap(),
             "http://localhost:9090/openai"
+        );
+        // FR-9/issue #62: OPENAI_API_KEY placeholder is required so opencode
+        // enables its OpenAI provider. The sidecar overwrites the real auth
+        // header on forwarded requests, so the agent never sees a real key.
+        assert_eq!(
+            find_env("OPENAI_API_KEY").unwrap(),
+            "sk-replaced-by-sidecar"
         );
 
         // FR-10: Git identity (display name, not slug)
