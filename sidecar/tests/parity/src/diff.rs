@@ -5,6 +5,11 @@
 //! requires that failure reports point at the case's JSON file.
 //! The diff report here is plain-text and contains only field names
 //! and values — the source path is added by the caller.
+//!
+//! Container logs are NOT used as a parity gate (Go and Rust emit
+//! different log lines by construction), but a count summary is
+//! included in the report for observability. See `container_logs`
+//! module and the per-case dump in `report::dump_run_log`.
 
 use std::collections::BTreeSet;
 

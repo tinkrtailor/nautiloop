@@ -1,22 +1,38 @@
 //! FR-29 subnet whitelist validator.
 //!
-//! The harness's Docker bridge network must live inside one of four
-//! well-known IPv4 ranges that neither the Go nor Rust sidecar's SSRF
-//! blocklist rejects:
+//! The harness's Docker bridge network must live inside RFC6598
+//! Carrier-Grade NAT space (`100.64.0.0/10`) — the only range this
+//! harness currently supports end-to-end. Both sidecars explicitly
+//! permit CGNAT:
 //!
-//! - `100.64.0.0/10` (RFC6598 Carrier-Grade NAT shared address space)
-//! - `192.0.2.0/24`  (RFC5737 TEST-NET-1)
-//! - `198.51.100.0/24` (RFC5737 TEST-NET-2)
-//! - `203.0.113.0/24` (RFC5737 TEST-NET-3)
+//! - Rust: `sidecar/src/ssrf.rs:94-99` ("we DO NOT block 100.64.0.0/10")
+//! - Go: `images/sidecar/main.go:43-48` (privateRanges only lists
+//!   RFC1918 + link-local + loopback)
 //!
-//! Cross-checked against `sidecar/src/ssrf.rs:94-99` (Rust) and
-//! `images/sidecar/main.go:43-48` (Go). Any subnet the operator supplies
-//! MUST be a subset (including equality) of one of these ranges.
+//! The operator-supplied subnet MUST be a subset (including equality)
+//! of `100.64.0.0/10`.
 //!
-//! A whitelist is the correct approach here: a blacklist based on
-//! sampling single addresses is unsound because a straddling subnet
-//! like `9.255.0.0/15` contains public first and last addresses but
-//! includes `10.0.0.0/15` in the middle.
+//! # Scope
+//!
+//! The FR-29 spec lists RFC5737 TEST-NET ranges as additional
+//! "whitelistable" ranges, but the harness's compose file, mock
+//! fixtures, introspection attribution, and committed SSH
+//! `known_hosts` all hardcode `100.64.0.x` addresses. Accepting a
+//! non-CGNAT override here would pass validation but fail at runtime
+//! because the network plumbing is not parameterized. Rather than
+//! silently accept a broken override, we reject non-CGNAT subnets at
+//! validation time and point operators at a followup.
+//!
+//! TODO(parity-harness): full plumbing for `192.0.2.0/24` /
+//! `198.51.100.0/24` / `203.0.113.0/24` requires dynamic IP
+//! assignment in `docker-compose.yml`, templated `known_hosts`, and
+//! parameterized introspection source-IP matching. Track as a
+//! followup once the harness lands and stabilizes in CI.
+//!
+//! A whitelist is the correct approach for the range check: a
+//! blacklist based on sampling single addresses is unsound because a
+//! straddling subnet like `9.255.0.0/15` contains public first and
+//! last addresses but includes `10.0.0.0/15` in the middle.
 //!
 //! The resolver order is: `--subnet` CLI flag (highest) → the
 //! `PARITY_NET_SUBNET` env var → the default `100.64.0.0/24`. Whatever
@@ -33,14 +49,12 @@ pub const DEFAULT_SUBNET: &str = "100.64.0.0/24";
 /// Environment variable consulted if the `--subnet` flag is absent.
 pub const SUBNET_ENV_VAR: &str = "PARITY_NET_SUBNET";
 
-/// The four RFC ranges that neither sidecar blocks. Any resolved subnet
-/// must be a subset of one of these ranges to be accepted.
-const SAFE_RANGES: &[&str] = &[
-    "100.64.0.0/10",
-    "192.0.2.0/24",
-    "198.51.100.0/24",
-    "203.0.113.0/24",
-];
+/// The single range currently plumbed through the harness. Any
+/// resolved subnet must be a subset of this range to be accepted.
+///
+/// See the module-level TODO for the followup that would re-widen
+/// this list to the full FR-29 set.
+const SAFE_RANGES: &[&str] = &["100.64.0.0/10"];
 
 /// Errors returned by [`resolve_and_validate`] / [`validate_subnet_whitelist`].
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -124,21 +138,30 @@ mod tests {
     }
 
     #[test]
-    fn all_three_test_net_ranges_accepted() {
-        validate_subnet_whitelist("192.0.2.0/24").expect("TEST-NET-1 must pass");
-        validate_subnet_whitelist("198.51.100.0/24").expect("TEST-NET-2 must pass");
-        validate_subnet_whitelist("203.0.113.0/24").expect("TEST-NET-3 must pass");
+    fn test_net_ranges_rejected_because_not_plumbed() {
+        // FR-29 spec lists TEST-NET-{1,2,3} as potentially safe, but
+        // the harness's compose file, introspection, and fixtures
+        // hardcode `100.64.0.x` addresses. Accepting these would
+        // pass validation and fail at runtime. See the module-level
+        // TODO for the followup that would re-widen the whitelist.
+        assert!(matches!(
+            validate_subnet_whitelist("192.0.2.0/24"),
+            Err(SubnetError::NotWhitelisted { .. })
+        ));
+        assert!(matches!(
+            validate_subnet_whitelist("198.51.100.0/24"),
+            Err(SubnetError::NotWhitelisted { .. })
+        ));
+        assert!(matches!(
+            validate_subnet_whitelist("203.0.113.0/24"),
+            Err(SubnetError::NotWhitelisted { .. })
+        ));
     }
 
     #[test]
     fn proper_subnet_inside_cgnat_accepted() {
         validate_subnet_whitelist("100.64.1.0/24").expect("proper subset must pass");
         validate_subnet_whitelist("100.127.255.0/24").expect("top of range must pass");
-    }
-
-    #[test]
-    fn proper_subnet_inside_test_net_1_accepted() {
-        validate_subnet_whitelist("192.0.2.128/25").expect("half of TEST-NET-1 must pass");
     }
 
     // --- Whitelist rejection path ---
@@ -238,8 +261,8 @@ mod tests {
             std::env::set_var(SUBNET_ENV_VAR, "10.0.0.0/8");
         }
         let got =
-            resolve_and_validate(Some("192.0.2.0/24")).expect("flag wins and passes whitelist");
-        assert_eq!(got, "192.0.2.0/24");
+            resolve_and_validate(Some("100.64.2.0/24")).expect("flag wins and passes whitelist");
+        assert_eq!(got, "100.64.2.0/24");
         unsafe {
             std::env::remove_var(SUBNET_ENV_VAR);
         }

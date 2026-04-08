@@ -127,6 +127,15 @@ impl ComposeStack {
                 args.push(OsString::from(signal));
                 args.push(OsString::from(service));
             }
+            ComposeOp::LogsService { service, since } => {
+                args.push(OsString::from("logs"));
+                args.push(OsString::from("--no-color"));
+                args.push(OsString::from("--timestamps"));
+                args.push(OsString::from("--no-log-prefix"));
+                args.push(OsString::from("--since"));
+                args.push(OsString::from(since));
+                args.push(OsString::from(service));
+            }
         }
         args
     }
@@ -178,6 +187,37 @@ impl ComposeStack {
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
     }
 
+    /// Run `docker compose logs --timestamps --no-log-prefix --since
+    /// <rfc3339> <service>` and return the captured stdout. Used by
+    /// the per-case execution loop to attach sidecar container logs
+    /// to each [`crate::result::SideOutput`] for observability
+    /// (finding #5 of the codex review).
+    ///
+    /// Never fails the test run — if the call errors we return an
+    /// empty string so the per-case execution continues.
+    pub async fn logs_for_service_since(&self, service: &str, since_rfc3339: &str) -> String {
+        let args = self.args_for(ComposeOp::LogsService {
+            service: service.to_string(),
+            since: since_rfc3339.to_string(),
+        });
+        match Command::new("docker")
+            .args(&args)
+            .current_dir(&self.inner.working_dir)
+            .output()
+            .await
+        {
+            Ok(out) => String::from_utf8_lossy(&out.stdout).to_string(),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    service,
+                    "failed to spawn docker compose logs for per-case capture"
+                );
+                String::new()
+            }
+        }
+    }
+
     /// Signal a service via `docker compose kill --signal <sig>`.
     pub async fn kill_signal(&self, service: &str, signal: &str) -> Result<()> {
         self.run(ComposeOp::Kill {
@@ -214,7 +254,16 @@ pub enum ComposeOp {
     Up,
     Down,
     Logs,
-    Kill { service: String, signal: String },
+    Kill {
+        service: String,
+        signal: String,
+    },
+    /// Per-case log capture: `docker compose logs --timestamps
+    /// --no-log-prefix --since <rfc3339> <service>`.
+    LogsService {
+        service: String,
+        since: String,
+    },
 }
 
 /// NFR-7 Drop guard. On drop (unless disarmed) runs
@@ -328,6 +377,27 @@ mod tests {
         assert!(args.iter().any(|a| a == &OsString::from("--signal")));
         assert!(args.iter().any(|a| a == &OsString::from("SIGTERM")));
         assert!(args.iter().any(|a| a == &OsString::from("sidecar-go")));
+    }
+
+    #[test]
+    fn logs_service_op_embeds_since_and_flags() {
+        let stack = ComposeStack::new(
+            PathBuf::from("docker-compose.yml"),
+            PathBuf::from("/tmp/harness"),
+        );
+        let args = stack.args_for(ComposeOp::LogsService {
+            service: "sidecar-rust".to_string(),
+            since: "2026-04-08T12:34:56Z".to_string(),
+        });
+        assert!(args.iter().any(|a| a == &OsString::from("logs")));
+        assert!(args.iter().any(|a| a == &OsString::from("--timestamps")));
+        assert!(args.iter().any(|a| a == &OsString::from("--no-log-prefix")));
+        assert!(args.iter().any(|a| a == &OsString::from("--since")));
+        assert!(
+            args.iter()
+                .any(|a| a == &OsString::from("2026-04-08T12:34:56Z"))
+        );
+        assert!(args.iter().any(|a| a == &OsString::from("sidecar-rust")));
     }
 
     #[test]

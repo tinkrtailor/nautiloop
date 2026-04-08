@@ -31,7 +31,7 @@ use crate::compose::ports;
 use crate::corpus::CorpusCase;
 use crate::introspection;
 use crate::result::SideOutput;
-use crate::runner::RunnerContext;
+use crate::runner::{CaseExecution, RunnerContext};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -64,7 +64,7 @@ enum EgressInput {
     },
 }
 
-pub async fn run(case: &CorpusCase, _ctx: &RunnerContext) -> Result<(SideOutput, SideOutput)> {
+pub async fn run(case: &CorpusCase, _ctx: &RunnerContext) -> Result<CaseExecution> {
     let input: EgressInput = serde_json::from_value(case.input.clone())
         .with_context(|| format!("parsing input for case {}", case.name))?;
 
@@ -109,7 +109,7 @@ pub async fn run(case: &CorpusCase, _ctx: &RunnerContext) -> Result<(SideOutput,
     let (mut go_obs, mut rust_obs) = introspection::fetch_and_split().await?;
     go_out.mock_observations.append(&mut go_obs);
     rust_out.mock_observations.append(&mut rust_obs);
-    Ok((go_out, rust_out))
+    Ok(CaseExecution::parity(go_out, rust_out))
 }
 
 async fn run_connect(proxy_port: u16, target: &str, payload_hex: &str) -> Result<SideOutput> {

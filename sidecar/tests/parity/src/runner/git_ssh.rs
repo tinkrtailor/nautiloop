@@ -20,7 +20,7 @@ use crate::compose::ports;
 use crate::corpus::CorpusCase;
 use crate::introspection;
 use crate::result::SideOutput;
-use crate::runner::RunnerContext;
+use crate::runner::{CaseAssertion, CaseExecution, RunnerContext};
 
 #[derive(Debug, Clone, Deserialize)]
 struct GitSshInput {
@@ -47,7 +47,7 @@ fn default_request_kind() -> String {
     "exec".to_string()
 }
 
-pub async fn run(case: &CorpusCase, ctx: &RunnerContext) -> Result<(SideOutput, SideOutput)> {
+pub async fn run(case: &CorpusCase, ctx: &RunnerContext) -> Result<CaseExecution> {
     let input: GitSshInput = serde_json::from_value(case.input.clone())
         .with_context(|| format!("parsing input for case {}", case.name))?;
 
@@ -55,22 +55,25 @@ pub async fn run(case: &CorpusCase, ctx: &RunnerContext) -> Result<(SideOutput, 
     let (mut go_obs, mut rust_obs) = introspection::fetch_and_split().await?;
     go_out.mock_observations.append(&mut go_obs);
     rust_out.mock_observations.append(&mut rust_obs);
-    Ok((go_out, rust_out))
+    Ok(CaseExecution::parity(go_out, rust_out))
 }
 
 /// Bare-exec divergence runner: issues `git-upload-pack` (no args) or
-/// `git-receive-pack` (no args) to both sidecars and expects:
+/// `git-receive-pack` (no args) to both sidecars and explicitly
+/// asserts the expected split:
 ///
-/// - Rust: exit status 1 from the sidecar itself (no upstream reached)
-/// - Go: exit status 128 from paramiko (sidecar forwarded unchanged)
+/// - Rust: exit status 1 from the sidecar itself, `mock-github-ssh`
+///   observed **zero** exec events from `100.64.0.21`
+/// - Go: exit status 128 from paramiko, `mock-github-ssh` observed
+///   **at least one** exec event from `100.64.0.20`
 ///
-/// The runner encodes the two exit statuses on each side so the diff
-/// engine sees them as different — which is the divergence pass.
+/// Each of the four conditions is checked individually and the
+/// failure `detail` string names whichever one failed so the report
+/// artifact points at the actual mismatch.
 pub async fn run_bare_exec_divergence(
     case: &CorpusCase,
     ctx: &RunnerContext,
-) -> Result<(SideOutput, SideOutput)> {
-    // Bare exec input: empty command arg.
+) -> Result<CaseExecution> {
     let command = match case.name.as_str() {
         "divergence_bare_exec_upload_pack_rejection" => "git-upload-pack",
         "divergence_bare_exec_receive_pack_rejection" => "git-receive-pack",
@@ -85,9 +88,68 @@ pub async fn run_bare_exec_divergence(
     };
     let (mut go_out, mut rust_out) = issue_pair(&input, &ctx.ssh_key_path).await?;
     let (mut go_obs, mut rust_obs) = introspection::fetch_and_split().await?;
+    let go_mock_exec_count = go_obs
+        .iter()
+        .filter(|o| o.mock == "mock-github-ssh")
+        .count();
+    let rust_mock_exec_count = rust_obs
+        .iter()
+        .filter(|o| o.mock == "mock-github-ssh")
+        .count();
     go_out.mock_observations.append(&mut go_obs);
     rust_out.mock_observations.append(&mut rust_obs);
-    Ok((go_out, rust_out))
+
+    let assertion = bare_exec_assertion(
+        case.name.as_str(),
+        go_out.ssh_exit_status,
+        rust_out.ssh_exit_status,
+        go_mock_exec_count,
+        rust_mock_exec_count,
+    );
+    Ok(CaseExecution::with_assertion(go_out, rust_out, assertion))
+}
+
+/// Pure assertion evaluator for the bare-exec divergence case,
+/// extracted so unit tests can exercise the individual failure modes
+/// without spinning up ssh.
+fn bare_exec_assertion(
+    case_name: &str,
+    go_exit: Option<i32>,
+    rust_exit: Option<i32>,
+    go_mock_exec_count: usize,
+    rust_mock_exec_count: usize,
+) -> CaseAssertion {
+    const GO_EXPECTED_EXIT: i32 = 128;
+    const RUST_EXPECTED_EXIT: i32 = 1;
+
+    let mut failures: Vec<String> = Vec::new();
+    if go_exit != Some(GO_EXPECTED_EXIT) {
+        failures.push(format!(
+            "go exit_status expected Some({GO_EXPECTED_EXIT}), got {go_exit:?}"
+        ));
+    }
+    if rust_exit != Some(RUST_EXPECTED_EXIT) {
+        failures.push(format!(
+            "rust exit_status expected Some({RUST_EXPECTED_EXIT}), got {rust_exit:?}"
+        ));
+    }
+    if go_mock_exec_count < 1 {
+        failures.push(format!(
+            "mock-github-ssh expected >=1 exec observation from 100.64.0.20 (go), got {go_mock_exec_count}"
+        ));
+    }
+    if rust_mock_exec_count != 0 {
+        failures.push(format!(
+            "mock-github-ssh expected 0 exec observations from 100.64.0.21 (rust), got {rust_mock_exec_count}"
+        ));
+    }
+    if failures.is_empty() {
+        CaseAssertion::pass(format!(
+            "{case_name}: go exit={go_exit:?} (mock saw {go_mock_exec_count}), rust exit={rust_exit:?} (mock saw {rust_mock_exec_count})"
+        ))
+    } else {
+        CaseAssertion::fail(format!("{case_name}: {}", failures.join("; ")))
+    }
 }
 
 async fn issue_pair(input: &GitSshInput, key_path: &Path) -> Result<(SideOutput, SideOutput)> {
@@ -349,5 +411,102 @@ mod tests {
         let g = std::fs::read(&go).expect("go key");
         let r = std::fs::read(&rust).expect("rust key");
         assert_eq!(g, r, "go and rust client keys must be byte-identical");
+    }
+
+    #[test]
+    fn bare_exec_assertion_passes_on_expected_split() {
+        let a = bare_exec_assertion(
+            "divergence_bare_exec_upload_pack_rejection",
+            Some(128),
+            Some(1),
+            1,
+            0,
+        );
+        assert!(a.passed, "detail: {}", a.detail);
+    }
+
+    #[test]
+    fn bare_exec_assertion_passes_with_multiple_go_mock_observations() {
+        // Some paramiko versions emit the exec event twice (channel
+        // open + exec). Spec says >=1, so 2 is fine.
+        let a = bare_exec_assertion(
+            "divergence_bare_exec_upload_pack_rejection",
+            Some(128),
+            Some(1),
+            2,
+            0,
+        );
+        assert!(a.passed, "detail: {}", a.detail);
+    }
+
+    #[test]
+    fn bare_exec_assertion_fails_when_go_exit_is_not_128() {
+        let a = bare_exec_assertion(
+            "divergence_bare_exec_upload_pack_rejection",
+            Some(1),
+            Some(1),
+            1,
+            0,
+        );
+        assert!(!a.passed);
+        assert!(a.detail.contains("go exit_status expected Some(128)"));
+    }
+
+    #[test]
+    fn bare_exec_assertion_fails_when_rust_exit_is_not_1() {
+        let a = bare_exec_assertion(
+            "divergence_bare_exec_upload_pack_rejection",
+            Some(128),
+            Some(128),
+            1,
+            0,
+        );
+        assert!(!a.passed);
+        assert!(a.detail.contains("rust exit_status expected Some(1)"));
+    }
+
+    #[test]
+    fn bare_exec_assertion_fails_when_go_did_not_reach_mock() {
+        let a = bare_exec_assertion(
+            "divergence_bare_exec_upload_pack_rejection",
+            Some(128),
+            Some(1),
+            0,
+            0,
+        );
+        assert!(!a.passed);
+        assert!(a.detail.contains(">=1 exec observation from 100.64.0.20"));
+    }
+
+    #[test]
+    fn bare_exec_assertion_fails_when_rust_reached_mock() {
+        let a = bare_exec_assertion(
+            "divergence_bare_exec_upload_pack_rejection",
+            Some(128),
+            Some(1),
+            1,
+            1,
+        );
+        assert!(!a.passed);
+        assert!(
+            a.detail
+                .contains("0 exec observations from 100.64.0.21 (rust)")
+        );
+    }
+
+    #[test]
+    fn bare_exec_assertion_reports_all_failures_at_once() {
+        let a = bare_exec_assertion(
+            "divergence_bare_exec_receive_pack_rejection",
+            None,
+            None,
+            0,
+            3,
+        );
+        assert!(!a.passed);
+        assert!(a.detail.contains("go exit_status expected Some(128)"));
+        assert!(a.detail.contains("rust exit_status expected Some(1)"));
+        assert!(a.detail.contains(">=1 exec observation from 100.64.0.20"));
+        assert!(a.detail.contains("0 exec observations from 100.64.0.21"));
     }
 }

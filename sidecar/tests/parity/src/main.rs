@@ -19,6 +19,7 @@
 
 mod args;
 mod compose;
+mod container_logs;
 mod corpus;
 mod diff;
 mod health_probe;
@@ -37,12 +38,12 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use crate::args::Args;
-use crate::compose::{ComposeGuard, ComposeStack};
+use crate::compose::{ComposeGuard, ComposeStack, SIDECAR_GO_SERVICE, SIDECAR_RUST_SERVICE};
 use crate::corpus::{Category, CorpusCase, load_corpus, partition_by_order_hint};
 use crate::normalize::normalize;
 use crate::report::{dump_run_log, print_case_result, print_summary};
 use crate::result::{CaseOutcome, RunSummary, SideOutput};
-use crate::runner::RunnerContext;
+use crate::runner::{CaseAssertion, CaseExecution, RunnerContext};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
@@ -138,12 +139,12 @@ async fn main() -> Result<()> {
 
     let mut outcomes: Vec<CaseOutcome> = Vec::with_capacity(filtered.len());
     for case in rest {
-        let outcome = run_case(case, &ctx).await;
+        let outcome = run_case(case, &ctx, &compose).await;
         print_case_result(&outcome);
         outcomes.push(outcome);
     }
     for case in last {
-        let outcome = run_case(case, &ctx).await;
+        let outcome = run_case(case, &ctx, &compose).await;
         print_case_result(&outcome);
         outcomes.push(outcome);
     }
@@ -174,25 +175,58 @@ async fn main() -> Result<()> {
 
 /// Run a single case, catching any runner error and turning it into a
 /// failed outcome so the run never aborts mid-corpus.
-async fn run_case(case: &CorpusCase, ctx: &RunnerContext) -> CaseOutcome {
+///
+/// Per-case flow:
+///
+/// 1. Record the wall-clock start time so docker logs can be fetched
+///    with `--since <rfc3339>`.
+/// 2. Dispatch to the category runner, which returns a
+///    [`CaseExecution`] containing the two side outputs plus an
+///    optional explicit assertion.
+/// 3. Attach the per-case sidecar container logs (finding #5) to
+///    each side BEFORE normalization.
+/// 4. Normalize both sides (strips dynamic fields per FR-19,
+///    including the new container-log timestamp).
+/// 5. Diff the two sides.
+/// 6. Evaluate pass/fail:
+///    - Parity cases: diff must be empty AND (no assertion OR the
+///      assertion passed).
+///    - Divergence cases: the runner MUST have produced an
+///      assertion, and that assertion MUST pass. The prior "any
+///      diff = pass" rule was removed because it masked real
+///      regressions.
+async fn run_case(case: &CorpusCase, ctx: &RunnerContext, compose: &ComposeStack) -> CaseOutcome {
     let start = Instant::now();
+    let since = chrono::Utc::now().to_rfc3339();
+
     match runner::dispatch(case, ctx).await {
-        Ok((mut go, mut rust)) => {
+        Ok(execution) => {
+            let CaseExecution {
+                mut go,
+                mut rust,
+                assertion,
+            } = execution;
+
+            // Finding #5: attach per-case sidecar container logs.
+            // Use a small grace period so logs emitted right after
+            // the runner completes (e.g. request handler finalizers)
+            // still get captured.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let go_raw_logs = compose
+                .logs_for_service_since(SIDECAR_GO_SERVICE, &since)
+                .await;
+            let rust_raw_logs = compose
+                .logs_for_service_since(SIDECAR_RUST_SERVICE, &since)
+                .await;
+            go.container_logs = container_logs::parse_docker_logs(&go_raw_logs);
+            rust.container_logs = container_logs::parse_docker_logs(&rust_raw_logs);
+
             normalize(&mut go, &case.normalize);
             normalize(&mut rust, &case.normalize);
             let diff = diff::diff_sides(&go, &rust);
             let expected_parity = case.expected_parity;
-            let passed = if expected_parity {
-                diff.is_empty()
-            } else {
-                // Divergence cases must disagree in the direction
-                // described by the divergence descriptor. The runner
-                // already produced `go` and `rust` outputs that
-                // encode the comparison verdict; if those side
-                // outputs are identical for a divergence case,
-                // that's a failure (Go got fixed or Rust regressed).
-                !diff.is_empty()
-            };
+            let (passed, failure_detail) =
+                evaluate_outcome(expected_parity, &diff, assertion.as_ref());
             if passed {
                 CaseOutcome::pass(
                     &case.name,
@@ -201,7 +235,7 @@ async fn run_case(case: &CorpusCase, ctx: &RunnerContext) -> CaseOutcome {
                     go,
                     rust,
                     start.elapsed(),
-                    divergence_note(case),
+                    assertion_or_divergence_note(case, assertion.as_ref()),
                 )
             } else {
                 CaseOutcome::fail(
@@ -211,14 +245,7 @@ async fn run_case(case: &CorpusCase, ctx: &RunnerContext) -> CaseOutcome {
                     go,
                     rust,
                     start.elapsed(),
-                    if expected_parity {
-                        diff
-                    } else {
-                        format!(
-                            "divergence case matched; expected Go and Rust to differ.\n{}",
-                            diff
-                        )
-                    },
+                    failure_detail,
                 )
             }
         }
@@ -234,12 +261,70 @@ async fn run_case(case: &CorpusCase, ctx: &RunnerContext) -> CaseOutcome {
     }
 }
 
-fn divergence_note(case: &CorpusCase) -> String {
-    match (&case.category, &case.divergence) {
-        (Category::Divergence, Some(d)) => format!(
+/// Pure pass/fail evaluator. Extracted so the combined matrix of
+/// (expected_parity × assertion presence × diff emptiness) can be
+/// unit tested without spinning up docker or running a runner.
+///
+/// Returns `(passed, failure_detail)`. `failure_detail` is only
+/// meaningful when `passed == false`.
+fn evaluate_outcome(
+    expected_parity: bool,
+    diff: &str,
+    assertion: Option<&CaseAssertion>,
+) -> (bool, String) {
+    if expected_parity {
+        // Parity case: diff must be empty AND any assertion must pass.
+        let diff_ok = diff.is_empty();
+        let assertion_ok = assertion.map(|a| a.passed).unwrap_or(true);
+        if diff_ok && assertion_ok {
+            return (true, String::new());
+        }
+        let mut detail = String::new();
+        if !diff_ok {
+            detail.push_str(diff);
+        }
+        if let Some(a) = assertion
+            && !a.passed
+        {
+            if !detail.is_empty() {
+                detail.push('\n');
+            }
+            detail.push_str("assertion failed: ");
+            detail.push_str(&a.detail);
+        }
+        (false, detail)
+    } else {
+        // Divergence case: assertion is REQUIRED.
+        match assertion {
+            Some(a) if a.passed => (true, String::new()),
+            Some(a) => (
+                false,
+                format!("divergence assertion failed: {}", a.detail),
+            ),
+            None => (
+                false,
+                "divergence case produced no assertion; runner must encode the expected directional property explicitly"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+/// Format the pass-path note for a case. Divergence cases get the
+/// descriptor text from the corpus plus the runner's assertion
+/// detail; parity cases with a passing assertion get the detail;
+/// simple parity cases get empty.
+fn assertion_or_divergence_note(case: &CorpusCase, assertion: Option<&CaseAssertion>) -> String {
+    match (&case.category, &case.divergence, assertion) {
+        (Category::Divergence, Some(d), Some(a)) => format!(
+            "divergence: {} | go={} | rust={} | verified: {}",
+            d.description, d.go_expected, d.rust_expected, a.detail
+        ),
+        (Category::Divergence, Some(d), None) => format!(
             "divergence: {} | go={} | rust={}",
             d.description, d.go_expected, d.rust_expected
         ),
+        (_, _, Some(a)) if a.passed => format!("assertion: {}", a.detail),
         _ => String::new(),
     }
 }
@@ -250,4 +335,88 @@ fn divergence_note(case: &CorpusCase) -> String {
 /// directory and still find its fixtures.
 fn resolve_harness_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parity_case_passes_with_empty_diff_and_no_assertion() {
+        let (passed, detail) = evaluate_outcome(true, "", None);
+        assert!(passed);
+        assert!(detail.is_empty());
+    }
+
+    #[test]
+    fn parity_case_passes_with_empty_diff_and_passing_assertion() {
+        let a = CaseAssertion::pass("credential refreshed");
+        let (passed, _) = evaluate_outcome(true, "", Some(&a));
+        assert!(passed);
+    }
+
+    #[test]
+    fn parity_case_fails_when_diff_not_empty() {
+        let (passed, detail) = evaluate_outcome(true, "http_status: go=200, rust=403", None);
+        assert!(!passed);
+        assert!(detail.contains("http_status"));
+    }
+
+    #[test]
+    fn parity_case_fails_when_assertion_fails_even_with_empty_diff() {
+        // The credential refresh case: both sides agree on response
+        // body (parity diff is empty) but neither reloaded the
+        // credential file (assertion fails). Must fail.
+        let a = CaseAssertion::fail("neither side upstreamed new bearer");
+        let (passed, detail) = evaluate_outcome(true, "", Some(&a));
+        assert!(!passed);
+        assert!(detail.contains("assertion failed"));
+        assert!(detail.contains("neither side"));
+    }
+
+    #[test]
+    fn parity_case_fails_with_combined_detail_when_both_diff_and_assertion_fail() {
+        let a = CaseAssertion::fail("assertion detail");
+        let (passed, detail) = evaluate_outcome(true, "http_status: go=200, rust=500", Some(&a));
+        assert!(!passed);
+        assert!(detail.contains("http_status"));
+        assert!(detail.contains("assertion detail"));
+    }
+
+    #[test]
+    fn divergence_case_passes_when_assertion_passes() {
+        let a = CaseAssertion::pass("rust streamed, go buffered");
+        let (passed, _) = evaluate_outcome(false, "", Some(&a));
+        assert!(passed);
+    }
+
+    #[test]
+    fn divergence_case_passes_regardless_of_diff_when_assertion_passes() {
+        // A divergence case does not gate on the diff engine — the
+        // assertion is the only gate. Even with a large diff string
+        // the case passes if the assertion holds.
+        let a = CaseAssertion::pass("rust streamed, go buffered");
+        let (passed, _) = evaluate_outcome(false, "http_status: go=200, rust=500", Some(&a));
+        assert!(passed);
+    }
+
+    #[test]
+    fn divergence_case_fails_when_assertion_fails() {
+        let a = CaseAssertion::fail("rust is buffered, expected streaming");
+        let (passed, detail) = evaluate_outcome(false, "http_body differs", Some(&a));
+        assert!(!passed);
+        assert!(detail.contains("divergence assertion failed"));
+        assert!(detail.contains("rust is buffered"));
+    }
+
+    #[test]
+    fn divergence_case_fails_when_no_assertion_is_produced() {
+        // Regression guard for the P1 finding: the prior "any diff
+        // = pass" rule would have marked this case as passing. With
+        // the assertion contract, it must fail.
+        let (passed, detail) =
+            evaluate_outcome(false, "http_body differs\nhttp_header only on go", None);
+        assert!(!passed);
+        assert!(detail.contains("no assertion"));
+    }
 }

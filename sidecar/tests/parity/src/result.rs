@@ -64,6 +64,27 @@ pub struct SideOutput {
     /// by the `divergence_connect_drain_on_sigterm` case.
     #[serde(default)]
     pub drain_stop_ms: Option<u128>,
+
+    /// Per-case sidecar container logs captured via
+    /// `docker logs sidecar-{go,rust} --since <case-start> --timestamps`.
+    /// Normalization strips the timestamp field so the diff engine
+    /// compares message content only (FR-19). Populated by the main
+    /// per-case execution loop, not by runners.
+    #[serde(default)]
+    pub container_logs: Vec<LogLine>,
+}
+
+/// A single captured container log line.
+///
+/// `timestamp` holds the raw ISO8601 prefix emitted by
+/// `docker logs --timestamps` and is cleared by normalization per
+/// FR-19 (dynamic field). `message` carries the log body.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogLine {
+    #[serde(default)]
+    pub timestamp: String,
+    #[serde(default)]
+    pub message: String,
 }
 
 impl SideOutput {

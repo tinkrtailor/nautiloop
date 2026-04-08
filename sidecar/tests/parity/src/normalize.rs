@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use crate::corpus::NormalizeConfig;
-use crate::result::{ObservedMockRequest, SideOutput};
+use crate::result::{LogLine, ObservedMockRequest, SideOutput};
 
 /// Per-rule: headers stripped from HTTP responses before comparison.
 /// These fields are dynamic or backend-specific. The spec
@@ -28,6 +28,15 @@ pub fn normalize(side: &mut SideOutput, config: &NormalizeConfig) {
     strip_body_fields(&mut side.http_body, config);
     normalize_ssh_stderr(&mut side.ssh_stderr);
     normalize_mock_observations(&mut side.mock_observations);
+    normalize_container_logs(&mut side.container_logs);
+}
+
+/// FR-19: strip the dynamic timestamp field from each container log
+/// line so the diff engine compares message content only. Idempotent.
+pub fn normalize_container_logs(logs: &mut [LogLine]) {
+    for line in logs.iter_mut() {
+        line.timestamp.clear();
+    }
 }
 
 /// Strip baseline + per-case extra headers. Header names are compared
@@ -272,6 +281,37 @@ mod tests {
         let after_first = side.clone();
         normalize(&mut side, &cfg);
         assert_eq!(side, after_first);
+    }
+
+    #[test]
+    fn container_logs_timestamps_are_stripped() {
+        let mut logs = vec![
+            LogLine {
+                timestamp: "2026-04-08T12:00:00.123456789Z".to_string(),
+                message: "started".to_string(),
+            },
+            LogLine {
+                timestamp: "2026-04-08T12:00:01.000000000Z".to_string(),
+                message: "ready".to_string(),
+            },
+        ];
+        normalize_container_logs(&mut logs);
+        assert_eq!(logs[0].timestamp, "");
+        assert_eq!(logs[1].timestamp, "");
+        assert_eq!(logs[0].message, "started");
+        assert_eq!(logs[1].message, "ready");
+    }
+
+    #[test]
+    fn container_logs_normalization_is_idempotent() {
+        let mut logs = vec![LogLine {
+            timestamp: "2026-04-08T12:00:00Z".to_string(),
+            message: "msg".to_string(),
+        }];
+        normalize_container_logs(&mut logs);
+        let after_first = logs.clone();
+        normalize_container_logs(&mut logs);
+        assert_eq!(logs, after_first);
     }
 
     #[test]

@@ -18,7 +18,6 @@
 //! The runner encodes the drain duration on each side so the diff
 //! engine sees different bodies (pass for divergence).
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -32,7 +31,7 @@ use crate::compose::ports;
 use crate::compose::{ComposeStack, SIDECAR_GO_SERVICE, SIDECAR_RUST_SERVICE};
 use crate::corpus::CorpusCase;
 use crate::result::SideOutput;
-use crate::runner::RunnerContext;
+use crate::runner::{CaseAssertion, CaseExecution, RunnerContext};
 
 /// Maximum wall clock we watch the tunnels for a post-SIGTERM drain.
 /// A Rust sidecar should finish draining within 5s per main.rs
@@ -47,7 +46,7 @@ const BASELINE_MS: u64 = 500;
 const GO_MAX_DRAIN_MS: u128 = 400; // loose upper bound for "fast close"
 const RUST_MIN_DRAIN_MS: u128 = 1500; // loose lower bound for "slow drain"
 
-pub async fn run(_case: &CorpusCase, ctx: &RunnerContext) -> Result<(SideOutput, SideOutput)> {
+pub async fn run(_case: &CorpusCase, ctx: &RunnerContext) -> Result<CaseExecution> {
     // Establish both tunnels.
     let go_tunnel = open_connect_tunnel(ports::GO_EGRESS, "egress-target:443").await?;
     let rust_tunnel = open_connect_tunnel(ports::RUST_EGRESS, "egress-target:443").await?;
@@ -98,29 +97,50 @@ pub async fn run(_case: &CorpusCase, ctx: &RunnerContext) -> Result<(SideOutput,
         .map(|t| t.duration_since(rust_killed_at).as_millis())
         .unwrap_or(0);
 
-    let go_verdict = if go_drain_ms <= GO_MAX_DRAIN_MS {
-        format!("go_closes_fast: drain_ms={go_drain_ms} <= {GO_MAX_DRAIN_MS}")
-    } else {
-        format!("go_SLOW_DRAIN_BUG: drain_ms={go_drain_ms} > {GO_MAX_DRAIN_MS}")
-    };
-    let rust_verdict = if rust_drain_ms >= RUST_MIN_DRAIN_MS {
-        format!("rust_drains_slow: drain_ms={rust_drain_ms} >= {RUST_MIN_DRAIN_MS}")
-    } else {
-        format!("rust_FAST_CLOSE_BUG: drain_ms={rust_drain_ms} < {RUST_MIN_DRAIN_MS}")
-    };
+    let assertion = drain_assertion(go_drain_ms, rust_drain_ms);
 
     let go_out = SideOutput {
         drain_stop_ms: Some(go_drain_ms),
-        http_body: go_verdict,
         ..SideOutput::default()
     };
     let rust_out = SideOutput {
         drain_stop_ms: Some(rust_drain_ms),
-        http_body: rust_verdict,
         ..SideOutput::default()
     };
 
-    Ok((go_out, rust_out))
+    Ok(CaseExecution::with_assertion(go_out, rust_out, assertion))
+}
+
+/// Evaluate the drain-on-SIGTERM divergence from measured
+/// post-SIGTERM drain durations on each side. Extracted for unit
+/// testing.
+///
+/// The expected outcome per FR-22:
+///
+/// - Go stops within `GO_MAX_DRAIN_MS` (fast close, no drain loop).
+/// - Rust continues emitting bytes for at least `RUST_MIN_DRAIN_MS`
+///   (graceful drain, bounded by `SHUTDOWN_DRAIN_TIMEOUT` in
+///   `sidecar/src/main.rs`).
+///
+/// Both must hold. If only one holds, the failure `detail` names
+/// the specific violation.
+fn drain_assertion(go_drain_ms: u128, rust_drain_ms: u128) -> CaseAssertion {
+    let go_ok = go_drain_ms <= GO_MAX_DRAIN_MS;
+    let rust_ok = rust_drain_ms >= RUST_MIN_DRAIN_MS;
+    match (go_ok, rust_ok) {
+        (true, true) => CaseAssertion::pass(format!(
+            "drain divergence holds: go closed in {go_drain_ms}ms <= {GO_MAX_DRAIN_MS}ms AND rust drained {rust_drain_ms}ms >= {RUST_MIN_DRAIN_MS}ms"
+        )),
+        (false, true) => CaseAssertion::fail(format!(
+            "Go did not close fast: drain_ms={go_drain_ms} > {GO_MAX_DRAIN_MS} (expected immediate close on SIGTERM). Rust drained {rust_drain_ms}ms."
+        )),
+        (true, false) => CaseAssertion::fail(format!(
+            "Rust did not drain long enough: drain_ms={rust_drain_ms} < {RUST_MIN_DRAIN_MS} (expected graceful drain up to SHUTDOWN_DRAIN_TIMEOUT). Go closed in {go_drain_ms}ms."
+        )),
+        (false, false) => CaseAssertion::fail(format!(
+            "both sides failed their drain bounds: go={go_drain_ms}ms (want <= {GO_MAX_DRAIN_MS}), rust={rust_drain_ms}ms (want >= {RUST_MIN_DRAIN_MS})"
+        )),
+    }
 }
 
 async fn open_connect_tunnel(proxy_port: u16, target: &str) -> Result<TcpStream> {
@@ -207,12 +227,6 @@ fn spawn_pump(
     })
 }
 
-/// Unused import suppressor for BTreeMap (kept so diffs over this
-/// module don't shrink into clippy noise if we later add headers to
-/// the drain verdict).
-#[allow(dead_code)]
-fn _btm_is_used(_m: &BTreeMap<String, String>) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +246,39 @@ mod tests {
         let s = TunnelState::default();
         assert!(!s.closed);
         assert!(s.last_byte_at.is_none());
+    }
+
+    #[test]
+    fn drain_assertion_passes_on_expected_split() {
+        let a = drain_assertion(120, 3200);
+        assert!(a.passed, "detail: {}", a.detail);
+        assert!(a.detail.contains("drain divergence holds"));
+    }
+
+    #[test]
+    fn drain_assertion_edge_case_go_exactly_at_max() {
+        let a = drain_assertion(GO_MAX_DRAIN_MS, RUST_MIN_DRAIN_MS);
+        assert!(a.passed, "detail: {}", a.detail);
+    }
+
+    #[test]
+    fn drain_assertion_fails_when_go_drains_slowly() {
+        let a = drain_assertion(GO_MAX_DRAIN_MS + 1, 3200);
+        assert!(!a.passed);
+        assert!(a.detail.contains("Go did not close fast"));
+    }
+
+    #[test]
+    fn drain_assertion_fails_when_rust_closes_fast() {
+        let a = drain_assertion(80, RUST_MIN_DRAIN_MS - 1);
+        assert!(!a.passed);
+        assert!(a.detail.contains("Rust did not drain long enough"));
+    }
+
+    #[test]
+    fn drain_assertion_fails_when_both_sides_break_bounds() {
+        let a = drain_assertion(GO_MAX_DRAIN_MS + 100, RUST_MIN_DRAIN_MS - 100);
+        assert!(!a.passed);
+        assert!(a.detail.contains("both sides failed their drain bounds"));
     }
 }

@@ -70,17 +70,31 @@ which neither sidecar blocks:
 - Go: see `images/sidecar/main.go:43-48` (privateRanges only lists
   RFC1918 + link-local + loopback).
 
-If the host already uses `100.64.0.0/24` on another bridge (or the
-operator's ISP routes CGNAT), pass `--subnet <cidr>` (or set
-`PARITY_NET_SUBNET`). The driver validates the override against a
-whitelist of four safe ranges:
+If the host already uses `100.64.0.0/24` on another bridge, pass
+`--subnet <cidr>` (or set `PARITY_NET_SUBNET`) to point the harness at
+a different CGNAT slice such as `100.64.1.0/24`. The driver validates
+the override and accepts it only if it is a subset of
+`100.64.0.0/10`.
 
-- `100.64.0.0/10` (RFC6598)
-- `192.0.2.0/24` (RFC5737 TEST-NET-1)
-- `198.51.100.0/24` (RFC5737 TEST-NET-2)
-- `203.0.113.0/24` (RFC5737 TEST-NET-3)
+### Currently-supported override range
 
-Anything outside these ranges is refused.
+- `100.64.0.0/10` (RFC6598 CGNAT) — any subset is accepted.
+
+Anything outside `100.64.0.0/10` is rejected at startup, including the
+FR-29 "safe but not plumbed" RFC5737 TEST-NET ranges
+(`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`). The harness's
+`docker-compose.yml`, introspection source-IP attribution, mock
+service configs, and committed SSH `known_hosts` all hardcode
+`100.64.0.x` addresses today, so accepting a non-CGNAT override
+would silently fail at runtime. The FR-29 spec envisions a future
+where those are templated off the resolved subnet; until that
+plumbing lands, only CGNAT subsets are accepted. This matches the
+spec's SR-6 intent (no test-only SSRF bypass) because CGNAT is
+already declared safe by both sidecars' SSRF blocklists.
+
+If the operator's ISP routes CGNAT and the harness cannot claim it,
+file a followup to parameterize the compose network and fixtures
+off `PARITY_NET_SUBNET` so TEST-NET ranges can be used too.
 
 ## Manual smoke checks (FR-10)
 

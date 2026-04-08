@@ -51,10 +51,27 @@ pub fn print_summary(summary: &RunSummary) {
 /// ==== summary ====
 /// ...
 /// ==== case results ====
+/// [PASS|FAIL] name (source): Nms
+///   notes: ...                      (pass path, if any)
+///   <diff lines>                    (fail path)
+///   [sidecar-go container_logs: N lines]
+///     <log message>
+///     ...
+///   [sidecar-rust container_logs: N lines]
+///     <log message>
+///     ...
 /// ...
 /// ==== docker compose logs (if available) ====
 /// ...
 /// ```
+///
+/// Per-case container logs are captured by [`crate::main::run_case`]
+/// via `docker compose logs --timestamps --since <case-start>` and
+/// attached to [`crate::result::SideOutput::container_logs`] before
+/// normalization strips the timestamp field (finding #5 of the
+/// codex review). They are printed here unconditionally because Go
+/// and Rust emit different log content and cannot participate in
+/// the strict diff.
 ///
 /// `docker_logs` is the caller-captured stdout of `docker compose logs`,
 /// or an empty string if the caller couldn't get it.
@@ -94,6 +111,24 @@ pub fn dump_run_log(
                 writeln!(f, "  {line}")?;
             }
         }
+        // Per-case container log dumps (always, pass or fail) for
+        // debuggability. Empty containers produce the header only.
+        writeln!(
+            f,
+            "  [sidecar-go container_logs: {} lines]",
+            o.go_side.container_logs.len()
+        )?;
+        for line in &o.go_side.container_logs {
+            writeln!(f, "    {}", line.message)?;
+        }
+        writeln!(
+            f,
+            "  [sidecar-rust container_logs: {} lines]",
+            o.rust_side.container_logs.len()
+        )?;
+        for line in &o.rust_side.container_logs {
+            writeln!(f, "    {}", line.message)?;
+        }
     }
     writeln!(f)?;
     writeln!(f, "==== docker compose logs ====")?;
@@ -109,7 +144,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::result::{CaseOutcome, SideOutput};
+    use crate::result::{CaseOutcome, LogLine, SideOutput};
 
     #[test]
     fn dump_run_log_writes_expected_sections() {
@@ -154,5 +189,50 @@ mod tests {
         let path = tmp.path().join("deep/nested/path/harness-run.log");
         dump_run_log(&path, &RunSummary::default(), &[], "").unwrap();
         assert!(path.exists());
+    }
+
+    #[test]
+    fn dump_run_log_includes_per_case_container_logs() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("harness-run.log");
+
+        let go_side = SideOutput {
+            container_logs: vec![
+                LogLine {
+                    timestamp: String::new(),
+                    message: "go_started".into(),
+                },
+                LogLine {
+                    timestamp: String::new(),
+                    message: "go_handled_request".into(),
+                },
+            ],
+            ..SideOutput::default()
+        };
+        let rust_side = SideOutput {
+            container_logs: vec![LogLine {
+                timestamp: String::new(),
+                message: "rust INFO listening".into(),
+            }],
+            ..SideOutput::default()
+        };
+
+        let outcomes = vec![CaseOutcome::pass(
+            "c",
+            "corpus/c.json",
+            true,
+            go_side,
+            rust_side,
+            Duration::from_millis(10),
+            "",
+        )];
+        let summary = RunSummary::from_outcomes(&outcomes);
+        dump_run_log(&path, &summary, &outcomes, "").unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("[sidecar-go container_logs: 2 lines]"));
+        assert!(written.contains("go_started"));
+        assert!(written.contains("go_handled_request"));
+        assert!(written.contains("[sidecar-rust container_logs: 1 lines]"));
+        assert!(written.contains("rust INFO listening"));
     }
 }

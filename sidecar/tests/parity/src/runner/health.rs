@@ -16,7 +16,7 @@ use serde::Deserialize;
 use crate::compose::ports;
 use crate::corpus::CorpusCase;
 use crate::result::SideOutput;
-use crate::runner::RunnerContext;
+use crate::runner::{CaseExecution, RunnerContext};
 
 #[derive(Debug, Clone, Deserialize)]
 struct HealthInput {
@@ -29,7 +29,7 @@ fn default_method() -> String {
     "GET".to_string()
 }
 
-pub async fn run(case: &CorpusCase, _ctx: &RunnerContext) -> Result<(SideOutput, SideOutput)> {
+pub async fn run(case: &CorpusCase, _ctx: &RunnerContext) -> Result<CaseExecution> {
     let input: HealthInput = serde_json::from_value(case.input.clone())
         .with_context(|| format!("parsing input for case {}", case.name))?;
 
@@ -40,7 +40,7 @@ pub async fn run(case: &CorpusCase, _ctx: &RunnerContext) -> Result<(SideOutput,
 
     let go = issue(&client, &input, ports::GO_HEALTH).await?;
     let rust = issue(&client, &input, ports::RUST_HEALTH).await?;
-    Ok((go, rust))
+    Ok(CaseExecution::parity(go, rust))
 }
 
 async fn issue(client: &reqwest::Client, input: &HealthInput, port: u16) -> Result<SideOutput> {
