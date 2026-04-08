@@ -26,7 +26,23 @@ The clean fix: **use a custom Docker bridge network in `100.64.0.0/10` (RFC6598 
 
 ## Dependencies
 
-- **Requires:** PR #63 (Rust sidecar merged), PR #73 (followups merged including `__test_utils` feature), PR #56 (Go sidecar health bind fix). All three are on main.
+- **Requires (committed):** PR #63 (Rust sidecar merged), PR #73 (followups merged including `__test_utils` feature), PR #56 (Go sidecar health bind fix). All three are on main.
+- **Requires (in-progress, blocks HARNESS IMPLEMENTATION only):** Issue [#66](https://github.com/tinkrtailor/nautiloop/issues/66) — Go sidecar `modelProxyHandler` does not flush SSE streaming responses, so `io.Copy(w, resp.Body)` keeps bytes in the ~4 KiB `http.ResponseWriter` buffer until upstream closes. Breaks every review/audit loop on v0.2.10. The fix (a `streamBody` helper using `http.NewResponseController(w).Flush()`) is actively being developed on a parallel branch at the time of this spec revision.
+
+  **This spec does NOT include the #66 fix.** Rationale: separation of concerns, and the parallel session is 90% done with a well-designed fix already. Folding the fix into this spec would duplicate work, conflate bug-fix review with harness-architecture review, and step on parallel progress.
+
+  **The spec IS still mergeable before #66 lands.** Only the HARNESS IMPLEMENTATION (migration plan phase 4 commit 4, when corpus + driver cases land) requires #66 to be merged first. Until that point, the streaming cases in FR-22 (`openai_post_chat_completions_stream`, `anthropic_post_v1_messages_stream`) will fail against Go-as-of-main because the Go sidecar buffers SSE chunks forever. The harness corpus IS the long-term regression gate for #66 once the fix lands — a future regression that reverts `streamBody` will fail the streaming parity tests loudly.
+
+  Implementation order: (1) parallel session lands #66 PR → merges to main, (2) this spec's commit 4 is implemented and the streaming tests pass, (3) harness wires into CI per FR-24.
+
+### Rust-side streaming sanity check (prerequisite before commit 4)
+
+Before implementing the harness corpus, the implementer MUST verify the Rust sidecar does NOT have the same class of bug as Go's #66. The Rust implementation at `sidecar/src/model_proxy.rs:200-280` uses hyper 1.x `BoxBody` via `body.boxed()` and passes it directly to `Response::builder().body(...)`. This should stream frames immediately via hyper's http1 codec without the kind of buffer-then-flush-on-full behavior that bit Go. But *should* is not *does* — the implementer verifies by:
+
+1. Running the harness against a simple hand-crafted SSE upstream (the mock-openai stream endpoint) and measuring inter-chunk arrival delays on the client side. Delays between chunks must be <50ms (streaming), not arrive-all-at-once (buffered).
+2. If Rust is buffered, file a followup issue and fix it before proceeding — parity against a fixed Go is the whole point of the harness.
+
+Do NOT assume hyper's defaults are correct for streaming SSE passthrough. Test it.
 - **Enables:** phase 5 cutover with actual parity evidence + CI enforcement. Unblocks retiring the Go sidecar.
 - **Blocks:** nothing.
 
