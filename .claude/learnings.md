@@ -26,3 +26,13 @@ Discoveries and patterns found during Nemo development. Persists across all work
 
 - CLI config lives at `~/.nemo/config.toml`. The `toml` crate handles both serialization and deserialization.
 - `reqwest::Client` with `danger_accept_invalid_certs(true)` is needed for dev environments with self-signed TLS certs.
+
+## Sidecar parity harness
+
+- Python `cryptography.hazmat.serialization.PrivateFormat.OpenSSH` wraps PEM base64 at 76 chars; russh's `PrivateKey::from_openssh` (via the `ssh-key` crate) rejects that as `Encoding(Pem(Base64(InvalidEncoding)))`. The canonical OpenSSH format wraps at **70 chars**. When generating committed test fixtures for SSH keys, build the PROTOCOL.key blob manually and wrap at 70. See `sidecar/tests/parity/fixtures/regenerate-ssh-fixtures.py` for the reference implementation.
+- The repo's `.gitignore` has global `*.pem` and `*.key` rules for safety. When committing test-only certs/keys under `sidecar/tests/parity/fixtures/`, add explicit unignore patterns (`!sidecar/tests/parity/fixtures/**/*.pem`, `!sidecar/tests/parity/fixtures/**/*.key`) — otherwise `git add fixtures/` silently skips the cert files and the harness fails at runtime with confusing errors.
+- Docker forbids parent-directory COPYs. The parity harness Dockerfiles (Go sidecar + mock services) all set `build.context` to the repo root (`../../..` relative to `docker-compose.yml`) and then use absolute-from-context paths like `images/sidecar/main.go` and `sidecar/tests/parity/fixtures/mock-openai/server.py`.
+- RFC6598 CGNAT (`100.64.0.0/10`) is the clean workaround for dockerizing SSRF-aware services that block RFC1918. Both the Go and Rust auth sidecars explicitly leave CGNAT unblocked, so a custom bridge with `subnet: 100.64.0.0/24` reaches mock services without any test-only code bypass. See `sidecar/src/ssrf.rs:94-99` and `images/sidecar/main.go:43-48`.
+- Clippy at Rust edition 2024 rejects `assert!(CONST_EXPR)` as `assertions_on_constants` — use `const _: () = assert!(...)` for compile-time assertions. Also rejects `if let Some(x) = ... { if cond { ... } }` as `collapsible_if` — collapse with `if let Some(x) = ... && cond { ... }`.
+- russh 0.60's `Channel::data` takes `R: tokio::io::AsyncRead + Unpin`, not `&[u8]`. Wrap bytes in `std::io::Cursor::new(bytes)` to satisfy the bound.
+- russh 0.60's env request API is `Channel::set_env(want_reply, name, value)`, not `request_env`. A server that rejects env returns `ChannelMsg::Failure` on the channel's next `wait()` when `want_reply == true`.
