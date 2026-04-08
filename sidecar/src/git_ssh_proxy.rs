@@ -124,9 +124,9 @@ pub const KNOWN_HOSTS_PATH: &str = "/secrets/ssh-known-hosts/known_hosts";
 /// without touching `/secrets`.
 ///
 /// The test-only `test_override_addr` escape hatch is gated behind
-/// the `test-utils` cargo feature. Release builds of
+/// the `__test_utils` cargo feature. Release builds of
 /// `nautiloop-sidecar` (and any downstream crate that depends on the
-/// library without opting into `test-utils`) literally do not see
+/// library without opting into `__test_utils`) literally do not see
 /// the field, cannot construct a value with it populated, and
 /// therefore cannot bypass the FR-18 SSRF protection in
 /// [`ssrf::resolve_safe`]. See `Cargo.toml`'s `[features]` section.
@@ -137,9 +137,9 @@ pub struct SshAuthPaths {
     /// Test-only escape hatch: if set, the upstream proxy dials this
     /// `SocketAddr` directly instead of running
     /// [`ssrf::resolve_safe`]. Production builds MUST NOT enable the
-    /// `test-utils` feature, so this field is absent and there is
+    /// `__test_utils` feature, so this field is absent and there is
     /// no way for a library consumer to set it.
-    #[cfg(feature = "test-utils")]
+    #[cfg(feature = "__test_utils")]
     pub(crate) test_override_addr: Option<std::net::SocketAddr>,
 }
 
@@ -149,15 +149,15 @@ impl SshAuthPaths {
         Self {
             key_path: key_path.into(),
             known_hosts_path: known_hosts_path.into(),
-            #[cfg(feature = "test-utils")]
+            #[cfg(feature = "__test_utils")]
             test_override_addr: None,
         }
     }
 
     /// Test-only constructor that populates the SSRF override.
-    /// Available only when the `test-utils` cargo feature is enabled,
+    /// Available only when the `__test_utils` cargo feature is enabled,
     /// so release builds cannot call it at all.
-    #[cfg(feature = "test-utils")]
+    #[cfg(feature = "__test_utils")]
     pub fn with_test_override_addr(
         key_path: impl Into<String>,
         known_hosts_path: impl Into<String>,
@@ -788,18 +788,18 @@ async fn proxy_upstream(
         }
     })?;
 
-    // SSRF-safe upstream resolution. When the `test-utils` feature
+    // SSRF-safe upstream resolution. When the `__test_utils` feature
     // is enabled (integration tests only), a populated
     // `test_override_addr` bypasses `ssrf::resolve_safe` so tests
     // can point at a loopback mock upstream. Release builds do NOT
     // compile the field, so this always goes through the SSRF
     // resolver and the FR-18 loopback block fires as intended.
-    #[cfg(feature = "test-utils")]
+    #[cfg(feature = "__test_utils")]
     let socket_addr = match auth_paths.test_override_addr {
         Some(addr) => addr,
         None => ssrf::resolve_safe(&remote.host, remote.port).await?,
     };
-    #[cfg(not(feature = "test-utils"))]
+    #[cfg(not(feature = "__test_utils"))]
     let socket_addr = ssrf::resolve_safe(&remote.host, remote.port).await?;
 
     // FR-28 10s connect timeout. We dial plain TCP first, then pass
