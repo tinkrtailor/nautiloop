@@ -6,8 +6,8 @@
   "expected_parity": false,
   "divergence": {
     "description": "Rust gracefully drains long-lived CONNECT tunnels on SIGTERM; Go closes listeners immediately.",
-    "go_expected": "drain_ms <= 400 (fast close)",
-    "rust_expected": "drain_ms >= 1500 (slow drain)"
+    "go_expected": "drain_ms <= 250 (fast close; spec 200ms + 50ms CI tolerance)",
+    "rust_expected": "1900 <= drain_ms <= 5500 (slow drain bounded by FR-27 SHUTDOWN_DRAIN_TIMEOUT; spec 2000-5000ms +/- CI tolerance)"
   },
   "order_hint": "last"
 }

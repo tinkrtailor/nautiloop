@@ -6,7 +6,7 @@
   "expected_parity": false,
   "divergence": {
     "description": "Rust sidecar rejects bare exec locally; Go sidecar forwards unchanged.",
-    "go_expected": "exit_status=128, mock observes 1 exec event",
-    "rust_expected": "exit_status=1, mock observes 0 exec events"
+    "go_expected": "exit_status=128, mock observes exactly 1 exec event from 100.64.0.20",
+    "rust_expected": "exit_status=1, mock observes exactly 0 exec events from 100.64.0.21"
   }
 }

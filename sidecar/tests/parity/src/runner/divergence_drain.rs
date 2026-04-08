@@ -33,18 +33,63 @@ use crate::corpus::CorpusCase;
 use crate::result::SideOutput;
 use crate::runner::{CaseAssertion, CaseExecution, RunnerContext};
 
-/// Maximum wall clock we watch the tunnels for a post-SIGTERM drain.
-/// A Rust sidecar should finish draining within 5s per main.rs
-/// SHUTDOWN_DRAIN_TIMEOUT; we give ourselves 6s headroom.
-const POST_SIGTERM_WATCH: Duration = Duration::from_secs(6);
-
 /// How long to run the baseline steady-state traffic before firing
 /// SIGTERM. Matches the spec's 500ms.
 const BASELINE_MS: u64 = 500;
 
-/// Drain thresholds from FR-22.
-const GO_MAX_DRAIN_MS: u128 = 400; // loose upper bound for "fast close"
-const RUST_MIN_DRAIN_MS: u128 = 1500; // loose lower bound for "slow drain"
+// ---- FR-22 / FR-27 drain thresholds with explicit CI tolerances ----
+//
+// The spec (FR-22) expects "Go stops within 200ms, Rust continues
+// 2-5 seconds (up to the 5s drain deadline in FR-27)." All three
+// bounds are enforced individually by `drain_assertion` below.
+//
+// Each constant names its spec-origin value and the CI-noise
+// allowance added/subtracted from it. These are deliberately tight
+// — the point of the divergence case is to prove Rust's drain
+// behavior honors its deadline without ever degenerating into
+// either (a) a Go-like immediate close or (b) an unbounded drain.
+
+/// Maximum acceptable post-SIGTERM drain for the Go sidecar.
+///
+/// Spec: 200ms (Go closes listeners immediately, no drain loop).
+/// CI tolerance: +50ms to absorb `docker compose kill` latency.
+/// Enforcing `≤ 250ms` catches any future Go regression that
+/// introduces an unintended drain path.
+const GO_MAX_DRAIN_MS: u128 = 250;
+
+/// Minimum acceptable post-SIGTERM drain for the Rust sidecar.
+///
+/// Spec: 2000ms (Rust must continue draining for at least 2s,
+/// proving it is NOT behaving like Go). The baseline steady-state
+/// trickle runs for `BASELINE_MS` (500ms) before SIGTERM, so 2s
+/// past SIGTERM demonstrates the drain is actually happening
+/// — a shorter drain would look indistinguishable from an
+/// unlucky close near the Go bound.
+/// CI tolerance: -100ms for measurement jitter.
+/// Enforcing `≥ 1900ms` catches a Go-like immediate-close
+/// regression on the Rust side.
+const RUST_MIN_DRAIN_MS: u128 = 1900;
+
+/// Maximum acceptable post-SIGTERM drain for the Rust sidecar.
+///
+/// Spec: 5000ms (FR-27 `SHUTDOWN_DRAIN_TIMEOUT` — Rust MUST close
+/// all in-flight tunnels by this deadline, even at the cost of
+/// dropping bytes).
+/// CI tolerance: +500ms for scheduler / docker kill / pump read
+/// latency. Enforcing `≤ 5500ms` catches any regression that
+/// lets the drain run indefinitely (e.g. a future refactor that
+/// accidentally awaits the inner task without the bounded timeout).
+const RUST_MAX_DRAIN_MS: u128 = 5500;
+
+/// Maximum wall clock we watch the tunnels for a post-SIGTERM drain.
+///
+/// Must be strictly greater than [`RUST_MAX_DRAIN_MS`] so a
+/// violation of the upper bound is observable: the pump keeps
+/// recording `last_byte_at` until either the tunnel closes OR this
+/// watch window expires. We give ourselves 1000ms of headroom so
+/// an over-bound drain of e.g. 5900ms is still measured accurately
+/// rather than clipped at the watch edge.
+const POST_SIGTERM_WATCH: Duration = Duration::from_millis(RUST_MAX_DRAIN_MS as u64 + 1000);
 
 pub async fn run(_case: &CorpusCase, ctx: &RunnerContext) -> Result<CaseExecution> {
     // Establish both tunnels.
@@ -115,31 +160,40 @@ pub async fn run(_case: &CorpusCase, ctx: &RunnerContext) -> Result<CaseExecutio
 /// post-SIGTERM drain durations on each side. Extracted for unit
 /// testing.
 ///
-/// The expected outcome per FR-22:
+/// Three independent bounds are enforced (FR-22 + FR-27):
 ///
-/// - Go stops within `GO_MAX_DRAIN_MS` (fast close, no drain loop).
-/// - Rust continues emitting bytes for at least `RUST_MIN_DRAIN_MS`
-///   (graceful drain, bounded by `SHUTDOWN_DRAIN_TIMEOUT` in
-///   `sidecar/src/main.rs`).
+/// 1. Go stops within [`GO_MAX_DRAIN_MS`] (fast close, no drain loop).
+/// 2. Rust continues emitting bytes for at least [`RUST_MIN_DRAIN_MS`]
+///    (proves it is NOT behaving like Go and is actually draining).
+/// 3. Rust stops by [`RUST_MAX_DRAIN_MS`] (FR-27 drain deadline —
+///    the drain MUST be bounded).
 ///
-/// Both must hold. If only one holds, the failure `detail` names
-/// the specific violation.
+/// All three must hold. Any single violation fails the case with a
+/// specific message pointing at which bound was broken so the
+/// failure artifact does not require inference.
 fn drain_assertion(go_drain_ms: u128, rust_drain_ms: u128) -> CaseAssertion {
-    let go_ok = go_drain_ms <= GO_MAX_DRAIN_MS;
-    let rust_ok = rust_drain_ms >= RUST_MIN_DRAIN_MS;
-    match (go_ok, rust_ok) {
-        (true, true) => CaseAssertion::pass(format!(
-            "drain divergence holds: go closed in {go_drain_ms}ms <= {GO_MAX_DRAIN_MS}ms AND rust drained {rust_drain_ms}ms >= {RUST_MIN_DRAIN_MS}ms"
-        )),
-        (false, true) => CaseAssertion::fail(format!(
-            "Go did not close fast: drain_ms={go_drain_ms} > {GO_MAX_DRAIN_MS} (expected immediate close on SIGTERM). Rust drained {rust_drain_ms}ms."
-        )),
-        (true, false) => CaseAssertion::fail(format!(
-            "Rust did not drain long enough: drain_ms={rust_drain_ms} < {RUST_MIN_DRAIN_MS} (expected graceful drain up to SHUTDOWN_DRAIN_TIMEOUT). Go closed in {go_drain_ms}ms."
-        )),
-        (false, false) => CaseAssertion::fail(format!(
-            "both sides failed their drain bounds: go={go_drain_ms}ms (want <= {GO_MAX_DRAIN_MS}), rust={rust_drain_ms}ms (want >= {RUST_MIN_DRAIN_MS})"
-        )),
+    let mut failures: Vec<String> = Vec::new();
+    if go_drain_ms > GO_MAX_DRAIN_MS {
+        failures.push(format!(
+            "Go took {go_drain_ms}ms to stop, expected <={GO_MAX_DRAIN_MS}ms (spec: <=200ms + 50ms CI tolerance). A non-zero drain on the Go side indicates a regression from the fast-close baseline."
+        ));
+    }
+    if rust_drain_ms < RUST_MIN_DRAIN_MS {
+        failures.push(format!(
+            "Rust drained only {rust_drain_ms}ms, expected >={RUST_MIN_DRAIN_MS}ms (spec: >=2000ms - 100ms CI tolerance); possible Go-like immediate close regression."
+        ));
+    }
+    if rust_drain_ms > RUST_MAX_DRAIN_MS {
+        failures.push(format!(
+            "Rust drained {rust_drain_ms}ms, exceeded {RUST_MAX_DRAIN_MS}ms upper bound (spec: <=5000ms + 500ms CI tolerance); FR-27 drain deadline violated."
+        ));
+    }
+    if failures.is_empty() {
+        CaseAssertion::pass(format!(
+            "drain divergence holds: go={go_drain_ms}ms (<= {GO_MAX_DRAIN_MS}ms) AND rust={rust_drain_ms}ms ({RUST_MIN_DRAIN_MS}ms <= _ <= {RUST_MAX_DRAIN_MS}ms)"
+        ))
+    } else {
+        CaseAssertion::fail(failures.join(" | "))
     }
 }
 
@@ -231,15 +285,21 @@ fn spawn_pump(
 mod tests {
     use super::*;
 
-    // Guard against drift: FR-22 says Go must stop "within 200ms".
-    // We loosen to 400ms in-runner to absorb docker-kill latency but
-    // the loose bound must still be strictly less than Rust's lower
-    // bound. These are `const` assertions so the compiler evaluates
-    // them at build time — clippy rejects runtime asserts whose
-    // operands are all constants.
+    // Guard against drift: FR-22 says Go must stop "within 200ms"
+    // and Rust must drain "2-5 seconds" bounded by FR-27's 5s
+    // deadline. Encoding these as `const` assertions catches any
+    // future edit that would loosen the bounds beyond the spec.
     const _: () = assert!(GO_MAX_DRAIN_MS < RUST_MIN_DRAIN_MS);
-    const _: () = assert!(GO_MAX_DRAIN_MS <= 500);
-    const _: () = assert!(RUST_MIN_DRAIN_MS >= 1000);
+    const _: () = assert!(RUST_MIN_DRAIN_MS < RUST_MAX_DRAIN_MS);
+    // Go: spec 200ms + 50ms CI tolerance.
+    const _: () = assert!(GO_MAX_DRAIN_MS == 250);
+    // Rust min: spec 2000ms - 100ms CI tolerance.
+    const _: () = assert!(RUST_MIN_DRAIN_MS == 1900);
+    // Rust max: spec 5000ms + 500ms CI tolerance.
+    const _: () = assert!(RUST_MAX_DRAIN_MS == 5500);
+    // Watch window must strictly exceed the upper bound so a
+    // violation is observable rather than clipped at the edge.
+    const _: () = assert!(POST_SIGTERM_WATCH.as_millis() > RUST_MAX_DRAIN_MS);
 
     #[test]
     fn default_tunnel_state_is_empty() {
@@ -250,6 +310,7 @@ mod tests {
 
     #[test]
     fn drain_assertion_passes_on_expected_split() {
+        // Mid-range drain: go closes in 120ms, rust drains 3200ms.
         let a = drain_assertion(120, 3200);
         assert!(a.passed, "detail: {}", a.detail);
         assert!(a.detail.contains("drain divergence holds"));
@@ -262,23 +323,71 @@ mod tests {
     }
 
     #[test]
+    fn drain_assertion_edge_case_rust_exactly_at_max() {
+        // Rust exactly at 5500ms must PASS (upper bound is inclusive).
+        let a = drain_assertion(GO_MAX_DRAIN_MS, RUST_MAX_DRAIN_MS);
+        assert!(a.passed, "detail: {}", a.detail);
+    }
+
+    #[test]
     fn drain_assertion_fails_when_go_drains_slowly() {
         let a = drain_assertion(GO_MAX_DRAIN_MS + 1, 3200);
         assert!(!a.passed);
-        assert!(a.detail.contains("Go did not close fast"));
+        assert!(
+            a.detail.contains("Go took 251ms to stop"),
+            "detail: {}",
+            a.detail
+        );
+        assert!(a.detail.contains("<=250ms"));
     }
 
     #[test]
     fn drain_assertion_fails_when_rust_closes_fast() {
         let a = drain_assertion(80, RUST_MIN_DRAIN_MS - 1);
         assert!(!a.passed);
-        assert!(a.detail.contains("Rust did not drain long enough"));
+        assert!(a.detail.contains("Rust drained only 1899ms"));
+        assert!(a.detail.contains("Go-like immediate close regression"));
+    }
+
+    #[test]
+    fn drain_assertion_fails_when_rust_exceeds_upper_bound() {
+        // Regression guard for the codex r2 P1: a drain-forever bug
+        // that would have silently passed the old (no upper bound)
+        // assertion must now fail with a specific message.
+        let a = drain_assertion(120, RUST_MAX_DRAIN_MS + 1);
+        assert!(!a.passed);
+        assert!(a.detail.contains("Rust drained 5501ms"));
+        assert!(a.detail.contains("FR-27 drain deadline violated"));
+    }
+
+    #[test]
+    fn drain_assertion_fails_when_rust_drain_is_way_over_deadline() {
+        // A drain of 30s would be clipped to ~POST_SIGTERM_WATCH by
+        // the runner loop, but even so the failure path must name
+        // the upper bound explicitly.
+        let a = drain_assertion(120, 30_000);
+        assert!(!a.passed);
+        assert!(a.detail.contains("exceeded 5500ms upper bound"));
     }
 
     #[test]
     fn drain_assertion_fails_when_both_sides_break_bounds() {
+        // Go too slow AND rust too fast — both failures reported.
         let a = drain_assertion(GO_MAX_DRAIN_MS + 100, RUST_MIN_DRAIN_MS - 100);
         assert!(!a.passed);
-        assert!(a.detail.contains("both sides failed their drain bounds"));
+        assert!(a.detail.contains("Go took"));
+        assert!(a.detail.contains("Rust drained only"));
+    }
+
+    #[test]
+    fn drain_assertion_reports_go_slow_and_rust_over_upper_bound_together() {
+        // Pathological double-regression: Go gained a drain loop AND
+        // Rust's deadline stopped bounding the drain. Both messages
+        // must appear joined by " | ".
+        let a = drain_assertion(GO_MAX_DRAIN_MS + 500, RUST_MAX_DRAIN_MS + 500);
+        assert!(!a.passed);
+        assert!(a.detail.contains("Go took"));
+        assert!(a.detail.contains("exceeded 5500ms upper bound"));
+        assert!(a.detail.contains(" | "));
     }
 }

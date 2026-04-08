@@ -133,14 +133,14 @@ fn bare_exec_assertion(
             "rust exit_status expected Some({RUST_EXPECTED_EXIT}), got {rust_exit:?}"
         ));
     }
-    if go_mock_exec_count < 1 {
+    if go_mock_exec_count != 1 {
         failures.push(format!(
-            "mock-github-ssh expected >=1 exec observation from 100.64.0.20 (go), got {go_mock_exec_count}"
+            "Expected exactly 1 exec from Go (source_ip 100.64.0.20), observed {go_mock_exec_count}; a count > 1 suggests a retry loop or double-dispatch regression, a count of 0 means the bare exec never reached the mock."
         ));
     }
     if rust_mock_exec_count != 0 {
         failures.push(format!(
-            "mock-github-ssh expected 0 exec observations from 100.64.0.21 (rust), got {rust_mock_exec_count}"
+            "Expected exactly 0 execs from Rust (source_ip 100.64.0.21), observed {rust_mock_exec_count}; any non-zero count means the Rust sidecar forwarded a bare exec instead of rejecting it locally."
         ));
     }
     if failures.is_empty() {
@@ -426,9 +426,11 @@ mod tests {
     }
 
     #[test]
-    fn bare_exec_assertion_passes_with_multiple_go_mock_observations() {
-        // Some paramiko versions emit the exec event twice (channel
-        // open + exec). Spec says >=1, so 2 is fine.
+    fn bare_exec_assertion_fails_when_go_mock_count_is_greater_than_one() {
+        // Regression guard for the codex r2 P2: a retry loop or
+        // double-dispatch bug on the Go side emits 2 execs. The
+        // prior `>= 1` check silently accepted this; the tightened
+        // `== 1` check must flag it.
         let a = bare_exec_assertion(
             "divergence_bare_exec_upload_pack_rejection",
             Some(128),
@@ -436,7 +438,13 @@ mod tests {
             2,
             0,
         );
-        assert!(a.passed, "detail: {}", a.detail);
+        assert!(!a.passed, "detail: {}", a.detail);
+        assert!(a.detail.contains("Expected exactly 1 exec from Go"));
+        assert!(a.detail.contains("observed 2"));
+        assert!(
+            a.detail
+                .contains("retry loop or double-dispatch regression")
+        );
     }
 
     #[test]
@@ -475,7 +483,8 @@ mod tests {
             0,
         );
         assert!(!a.passed);
-        assert!(a.detail.contains(">=1 exec observation from 100.64.0.20"));
+        assert!(a.detail.contains("Expected exactly 1 exec from Go"));
+        assert!(a.detail.contains("observed 0"));
     }
 
     #[test]
@@ -488,10 +497,8 @@ mod tests {
             1,
         );
         assert!(!a.passed);
-        assert!(
-            a.detail
-                .contains("0 exec observations from 100.64.0.21 (rust)")
-        );
+        assert!(a.detail.contains("Expected exactly 0 execs from Rust"));
+        assert!(a.detail.contains("observed 1"));
     }
 
     #[test]
@@ -506,7 +513,7 @@ mod tests {
         assert!(!a.passed);
         assert!(a.detail.contains("go exit_status expected Some(128)"));
         assert!(a.detail.contains("rust exit_status expected Some(1)"));
-        assert!(a.detail.contains(">=1 exec observation from 100.64.0.20"));
-        assert!(a.detail.contains("0 exec observations from 100.64.0.21"));
+        assert!(a.detail.contains("Expected exactly 1 exec from Go"));
+        assert!(a.detail.contains("Expected exactly 0 execs from Rust"));
     }
 }

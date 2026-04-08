@@ -45,6 +45,19 @@ use crate::report::{dump_run_log, print_case_result, print_summary};
 use crate::result::{CaseOutcome, RunSummary, SideOutput};
 use crate::runner::{CaseAssertion, CaseExecution, RunnerContext};
 
+/// Grace period between a runner returning and the per-case sidecar
+/// container log snapshot via `docker compose logs --since ...`.
+///
+/// Best-effort observability bound: long enough to capture log
+/// lines emitted by typical response-path finalizers in both
+/// Rust's tracing/JSON emit path and Go's unbuffered
+/// `fmt.Println`, but NOT a race-free guarantee. Any log line
+/// emitted after the snapshot is silently absent.
+///
+/// Container logs do not participate in the parity diff — this
+/// grace only affects post-hoc debuggability, never pass/fail.
+const CONTAINER_LOG_GRACE: Duration = Duration::from_millis(500);
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -208,10 +221,31 @@ async fn run_case(case: &CorpusCase, ctx: &RunnerContext, compose: &ComposeStack
             } = execution;
 
             // Finding #5: attach per-case sidecar container logs.
-            // Use a small grace period so logs emitted right after
-            // the runner completes (e.g. request handler finalizers)
-            // still get captured.
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            //
+            // NOTE — best-effort observability, NOT a gating signal.
+            // `docker compose logs --since <case-start>` is a
+            // snapshot: any log line the sidecar emits AFTER this
+            // snapshot call is silently absent from the captured
+            // `container_logs`. We wait [`CONTAINER_LOG_GRACE`]
+            // before snapshotting so the typical "finalizer writes
+            // one more line after the response flushes" pattern is
+            // captured. This grace is long enough for both Rust's
+            // tracing/JSON emit path and Go's `fmt.Println` (both
+            // unbuffered) but it is NOT race-free for pathological
+            // cases that defer log emission by hundreds of ms.
+            //
+            // Container logs DO NOT participate in the parity diff
+            // (see `diff.rs` doc comment) — they are dumped per
+            // case in `harness-run.log` for post-hoc debugging only.
+            // A dropped late log line therefore cannot cause a
+            // false-positive pass/fail, only reduce the debuggability
+            // of an already-failing case.
+            tokio::time::sleep(CONTAINER_LOG_GRACE).await;
+            tracing::debug!(
+                grace_ms = CONTAINER_LOG_GRACE.as_millis() as u64,
+                case = %case.name,
+                "snapshotting per-case sidecar container logs (best-effort)"
+            );
             let go_raw_logs = compose
                 .logs_for_service_since(SIDECAR_GO_SERVICE, &since)
                 .await;
