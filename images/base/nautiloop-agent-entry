@@ -131,9 +131,15 @@ run_and_emit_result() {
     if [ "$exit_code" -ne 0 ]; then
         local stderr_tail
         stderr_tail=$(tail -c 5000 "$cli_stderr" 2>/dev/null || echo "")
-        # Build a failure result envelope
+        # Build a failure result envelope.
+        # `-c` is critical: the loop engine's `extract_nautiloop_result` in
+        # control-plane/src/loop_engine/driver.rs scans pod log LINES for the
+        # `NAUTILOOP_RESULT:` prefix and parses what comes after as JSON. If
+        # the JSON is pretty-printed (default), only the first line matches
+        # the prefix and that line is just `NAUTILOOP_RESULT:{` which fails
+        # to parse, so the loop engine gets None and the verdict is lost.
         local result
-        result=$(jq -n \
+        result=$(jq -nc \
             --arg stage "$stage_name" \
             --argjson exit_code "$exit_code" \
             --arg stderr "$stderr_tail" \
@@ -167,19 +173,26 @@ run_and_emit_result() {
     #   the `data` field. The verdict schema downstream will parse it as
     #   needed — this keeps parity with the old behavior for the
     #   happy path and just stops blowing up on size.
+    # `-c` (compact) is critical here: the loop engine's
+    # extract_nautiloop_result in control-plane/src/loop_engine/driver.rs
+    # scans pod log LINES for the `NAUTILOOP_RESULT:` prefix and parses
+    # what follows as JSON. Without -c, jq pretty-prints the envelope
+    # across multiple lines, only the first line gets the prefix, and that
+    # line is just `NAUTILOOP_RESULT:{` which fails to parse, so the loop
+    # engine logs "No NAUTILOOP_RESULT line found in pod logs" and retries.
     local result
     if [ "$stage_name" = "implement" ] || [ "$stage_name" = "revise" ]; then
-        result=$(jq -n \
+        result=$(jq -nc \
             --arg stage "$stage_name" \
             --slurpfile events "$cli_stdout" \
             '{stage: $stage, data: ([$events[] | select(.type == "assistant")] | last // null)}' \
             2>/dev/null) || \
-        result=$(jq -n \
+        result=$(jq -nc \
             --arg stage "$stage_name" \
             --rawfile data "$cli_stdout" \
             '{stage: $stage, data: $data}')
     else
-        result=$(jq -n \
+        result=$(jq -nc \
             --arg stage "$stage_name" \
             --rawfile data "$cli_stdout" \
             '{stage: $stage, data: $data}')
