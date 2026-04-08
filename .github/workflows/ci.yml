@@ -1,0 +1,75 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # FR-24 job 1: cargo fmt + clippy + test with the default feature
+  # set. Runs on every PR and push to main, no path filter.
+  rust-checks:
+    name: rust checks (default features)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --locked
+
+  # FR-24 job 2: cargo clippy + test with the internal __test_utils
+  # feature enabled (covers the 7 git-SSH integration tests from
+  # PR #73 that cargo test skips without the feature).
+  rust-checks-with-test-utils:
+    name: rust checks (__test_utils feature)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-testutils-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-testutils-${{ runner.os }}-
+      - run: cargo clippy --workspace --all-targets --features nautiloop-sidecar/__test_utils -- -D warnings
+      - run: cargo test --workspace --features nautiloop-sidecar/__test_utils --locked
+
+  # FR-24 job 3 / FR-28: ensure the __test_utils feature never leaks
+  # into a CI release build path AND that NAUTILOOP_EXTRA_CA_BUNDLE
+  # is only referenced from the allowlisted two files.
+  prod-leak-lint:
+    name: prod leak lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash sidecar/scripts/lint-no-test-utils-in-prod.sh
