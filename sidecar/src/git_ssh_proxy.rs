@@ -1200,25 +1200,22 @@ mod tests {
         // without first draining the saturated data channel. We
         // enforce a tight timeout so an accidental regression
         // (e.g. routing Close through `data_tx`) fails loudly.
-        let observed = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            async {
-                loop {
-                    tokio::select! {
-                        control = control_rx.recv() => return control,
-                        _ = data_rx.recv() => {
-                            // Drain one data message, then loop — a
-                            // correct pump does NOT have to do this,
-                            // but even if it did, the unbounded
-                            // control send should still win the race.
-                            // We panic if the loop never yields a
-                            // control message, which the outer
-                            // timeout catches.
-                        }
+        let observed = tokio::time::timeout(std::time::Duration::from_millis(50), async {
+            loop {
+                tokio::select! {
+                    control = control_rx.recv() => return control,
+                    _ = data_rx.recv() => {
+                        // Drain one data message, then loop — a
+                        // correct pump does NOT have to do this,
+                        // but even if it did, the unbounded
+                        // control send should still win the race.
+                        // We panic if the loop never yields a
+                        // control message, which the outer
+                        // timeout catches.
                     }
                 }
-            },
-        )
+            }
+        })
         .await
         .expect("control channel must deliver Close within 50ms even with saturated data queue");
 
