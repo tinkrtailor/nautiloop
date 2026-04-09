@@ -439,21 +439,17 @@ pub async fn upsert_credentials(
         ));
     }
 
-    // K8s Secret key = provider name (claude, anthropic, openai, opencode-auth, ssh).
+    // K8s Secret key = provider name (claude, anthropic, openai, ssh).
     // "claude" = session dir for implement/revise agent mount.
     // "anthropic" = API key for sidecar proxy.
-    // "opencode-auth" = opencode subscription auth bundle, mounted at
-    //   /home/agent/.local/share/opencode/auth.json on review/audit pods (#67).
     let secret_key = req.provider.as_str();
 
     // Process credential content based on provider type.
     // "claude" = session directory content, stored as-is (not an API key).
     // "anthropic"/"openai" = API keys, extracted from JSON if needed.
-    // "opencode-auth" = JSON bundle of OAuth tokens, stored verbatim.
     // "ssh" = PEM key, stored as-is.
     let raw_content = req.credential_ref.trim().to_string();
-    let api_key = if secret_key == "claude" || secret_key == "ssh" || secret_key == "opencode-auth"
-    {
+    let api_key = if secret_key == "claude" || secret_key == "ssh" {
         // Store verbatim — not an API key
         raw_content
     } else if raw_content.starts_with('{') {
