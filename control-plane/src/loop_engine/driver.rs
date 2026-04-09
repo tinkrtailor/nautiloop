@@ -1791,18 +1791,20 @@ impl ConvergentLoopDriver {
         updated.reauth_from_state = Some(reauth_from);
         updated.active_job_name = None;
         updated.failure_reason = Some(format!("Credential preflight: {reason}"));
-        // Do NOT touch retry_count here. Two competing concerns:
-        //   (a) Repeated `nemo resume` before fixing creds shouldn't
-        //       silently burn the stage's retry budget on phantom
-        //       failures (codex round 3).
-        //   (b) A loop that hit the preflight AFTER a real stage
-        //       failure already had its retry_count incremented by
-        //       handle_job_failed; zeroing it would grant extra
-        //       retries beyond max_retries_for_stage (codex round 7).
-        // Leaving it as the caller set it is the less-wrong option:
-        // users who repeat-resume into a broken secret eventually
-        // hit retry exhaustion and the loop goes FAILED, which is
-        // the correct signal to stop mashing resume.
+        // Offset the retry counter by -1 to cancel the mandatory +1
+        // bump that handle_awaiting_reauth applies on the next
+        // resume. The preflight never created a pod, so no job-name
+        // collision justifies burning a retry slot on it. Starting
+        // at retry_count - 1 means:
+        //   start_implementing, retry_count=0 → preflight → stored
+        //     as -1 → resume bumps to 0 → first real dispatch is
+        //     attempt 1 (matches normal behavior).
+        //   mid-retry handle_job_failed bumped to 2 → preflight →
+        //     stored as 1 → resume bumps to 2 → dispatch attempt 3
+        //     (preserves the two prior real failures).
+        // See codex rounds 3, 7, and 8 on #98 for the full
+        // ping-pong that led here.
+        updated.retry_count -= 1;
         self.store.update_loop(&updated).await?;
         Ok(Some(LoopState::AwaitingReauth))
     }
