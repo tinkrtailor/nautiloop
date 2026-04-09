@@ -169,10 +169,26 @@ run_and_emit_result() {
     # - Claude stream-json (implement/revise): slurp the file, keep the
     #   last `{"type":"assistant",...}` object, fall back to the raw text
     #   if the file doesn't parse as JSON.
-    # - OpenCode (review/audit): wrap the raw file contents as a string in
-    #   the `data` field. The verdict schema downstream will parse it as
-    #   needed — this keeps parity with the old behavior for the
-    #   happy path and just stops blowing up on size.
+    # - OpenCode (review/audit): extract the LLM's final text-event
+    #   payload as the AuditVerdict / ReviewVerdict JSON, pull
+    #   token_usage from the last step_finish event, and wrap in the
+    #   ReviewResultData envelope the loop-engine's
+    #   control-plane/src/loop_engine/driver.rs parses via
+    #   serde_json::from_value::<ReviewResultData>(data). The audit and
+    #   review prompts in .nautiloop/prompts/spec-audit.md and
+    #   .nautiloop/prompts/review.md both instruct the model to:
+    #
+    #     "Output ONLY the verdict JSON object as your final message.
+    #      No markdown wrapping, no commentary, no prefix."
+    #
+    #   so the last `{type: "text"}` event's `.part.text` is expected
+    #   to already be valid JSON matching AuditVerdict / ReviewVerdict
+    #   ({clean, confidence, issues, summary, token_usage}). We parse
+    #   it with `fromjson` and nest it under `verdict`. If that fails,
+    #   fall back to the --rawfile wrap so the loop-engine at least
+    #   sees *something* instead of hanging on a missing envelope —
+    #   though it will still flag the verdict as malformed and retry.
+    #
     # `-c` (compact) is critical here: the loop engine's
     # extract_nautiloop_result in control-plane/src/loop_engine/driver.rs
     # scans pod log LINES for the `NAUTILOOP_RESULT:` prefix and parses
@@ -192,6 +208,42 @@ run_and_emit_result() {
             --rawfile data "$cli_stdout" \
             '{stage: $stage, data: $data}')
     else
+        result=$(jq -nc \
+            --arg stage "$stage_name" \
+            --argjson exit_code "$exit_code" \
+            --slurpfile events "$cli_stdout" \
+            '
+              ($events
+                | map(select(.type == "text" and (.part.text // "") != ""))
+                | last
+                | .part.text
+                | fromjson
+              ) as $verdict
+              |
+              ($events
+                | map(select(.type == "step_finish"))
+                | last
+                | .part.tokens // {}
+              ) as $tokens
+              |
+              ($events
+                | map(.sessionID // empty)
+                | last // ""
+              ) as $session_id
+              |
+              {
+                stage: $stage,
+                data: {
+                  verdict: $verdict,
+                  token_usage: {
+                    input:  ($tokens.input  // 0),
+                    output: ($tokens.output // 0)
+                  },
+                  exit_code: $exit_code,
+                  session_id: $session_id
+                }
+              }
+            ' 2>/dev/null) || \
         result=$(jq -nc \
             --arg stage "$stage_name" \
             --rawfile data "$cli_stdout" \
