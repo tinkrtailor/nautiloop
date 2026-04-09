@@ -1025,17 +1025,39 @@ impl ConvergentLoopDriver {
                 if let Ok(Some(sha)) = self.git.get_branch_sha(&record.branch).await {
                     updated.current_sha = Some(sha);
                 }
-                let result = self.redispatch_current_stage(&updated).await?;
-                self.store
-                    .set_loop_flag(record.id, crate::state::LoopFlag::Resume, false)
-                    .await?;
-                tracing::info!(
-                    loop_id = %record.id,
-                    round = updated.round,
-                    target_state = ?failed_from,
-                    "Resumed FAILED loop"
-                );
-                Ok(result)
+                // Redispatch can still fail after stale cleanup (e.g.
+                // the worktree/branch can no longer be resolved, build_job
+                // fails, k8s create rejects). Clear the resume flag on
+                // error so this terminal row doesn't keep getting picked
+                // up by the reconciler holding the branch hostage. The
+                // loop stays Failed; operator can retry after fixing the
+                // underlying cause.
+                match self.redispatch_current_stage(&updated).await {
+                    Ok(result) => {
+                        self.store
+                            .set_loop_flag(record.id, crate::state::LoopFlag::Resume, false)
+                            .await?;
+                        tracing::info!(
+                            loop_id = %record.id,
+                            round = updated.round,
+                            target_state = ?failed_from,
+                            "Resumed FAILED loop"
+                        );
+                        Ok(result)
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            loop_id = %record.id,
+                            error = %e,
+                            "Redispatch during resume failed; releasing branch ownership so operator can retry or abandon"
+                        );
+                        let _ = self
+                            .store
+                            .set_loop_flag(record.id, crate::state::LoopFlag::Resume, false)
+                            .await;
+                        Err(e)
+                    }
+                }
             } else {
                 // No failed_from_state: either the loop failed via a
                 // non-transient path (max rounds, logical failure) or it
