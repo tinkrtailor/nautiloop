@@ -74,6 +74,17 @@ fn find_existing_credentials() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// Return the first FRESH credential file across all known
+/// candidate paths, or None if every candidate is missing/stale.
+/// This matters when a stale high-priority file (e.g. the
+/// claude-worktree convention path left over from an old session)
+/// shadows a fresh XDG path that Claude Code is actively updating.
+fn find_fresh_credentials(now_ms: u64) -> Option<PathBuf> {
+    credential_candidate_paths()
+        .into_iter()
+        .find(|p| p.is_file() && !is_stale(p, now_ms))
+}
+
 /// Decide whether the on-disk credential bundle is stale. Returns
 /// true if the file is missing, unparseable, has no expiry, has
 /// already expired, or is within EXPIRY_BUFFER_SECS of expiring.
@@ -188,28 +199,29 @@ pub async fn ensure_fresh(
     // not just the macOS default. A Linux/XDG user whose Claude Code
     // writes to ~/.config/claude-code/credentials.json would otherwise
     // look permanently stale here and the preflight would never run.
+    //
+    // Prefer the first *fresh* candidate over the first *existing*
+    // one — a stale high-priority file (e.g. a leftover claude-worktree
+    // cache) shouldn't shadow a fresh XDG path that Claude Code is
+    // actively updating. If nothing is fresh, fall back to the
+    // first-existing location for the keychain-refresh write target.
     let now = now_ms();
-    let existing_path = find_existing_credentials();
-    let is_fresh = existing_path
-        .as_ref()
-        .map(|p| !is_stale(p, now))
-        .unwrap_or(false);
-    if is_fresh {
-        // The local file is fresh but the control plane might still
-        // have a stale copy — either because the token rotated on
-        // disk (Linux/XDG case where Claude Code writes directly) or
+    if let Some(fresh_path) = find_fresh_credentials(now) {
+        // Local file is fresh but the control plane might still have
+        // a stale copy — either because the token rotated on disk
+        // (Linux/XDG case where Claude Code writes directly) or
         // because an earlier dispatch pushed an older version. Push
         // the current local contents unconditionally so the next job
         // mount picks them up. One extra HTTP POST per dispatch is
         // cheap compared to a loop that dies on 401.
-        if let Some(path) = existing_path
-            && let Ok(contents) = std::fs::read_to_string(&path)
+        if let Ok(contents) = std::fs::read_to_string(&fresh_path)
             && !contents.trim().is_empty()
         {
             push_to_control_plane(client, engineer, name, email, contents.trim()).await;
         }
         return Ok(());
     }
+    let existing_path = find_existing_credentials();
 
     let Some(fresh) = extract_from_keychain() else {
         // Not macOS, or keychain entry missing, or extraction failed.
