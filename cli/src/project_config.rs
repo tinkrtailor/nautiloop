@@ -190,12 +190,8 @@ mod tests {
         assert_eq!(r.as_deref(), Some("env-review"));
 
         // Layer 1: flag wins over env.
-        let (i, r) = resolve_models(
-            Some("flag-impl".into()),
-            Some("flag-review".into()),
-            &user,
-        )
-        .unwrap();
+        let (i, r) =
+            resolve_models(Some("flag-impl".into()), Some("flag-review".into()), &user).unwrap();
         assert_eq!(i.as_deref(), Some("flag-impl"));
         assert_eq!(r.as_deref(), Some("flag-review"));
 
