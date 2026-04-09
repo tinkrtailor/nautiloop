@@ -1,6 +1,7 @@
 mod client;
 mod commands;
 mod config;
+mod project_config;
 
 use clap::{Parser, Subcommand};
 
@@ -217,6 +218,8 @@ async fn main() -> anyhow::Result<()> {
             model_impl,
             model_review,
         } => {
+            let (model_impl, model_review) =
+                project_config::resolve_models(model_impl, model_review, &eng_config.models)?;
             // nemo harden: harden=true, harden_only=true, ship_mode=false
             commands::start::run(
                 &http_client,
@@ -240,6 +243,8 @@ async fn main() -> anyhow::Result<()> {
             model_impl,
             model_review,
         } => {
+            let (model_impl, model_review) =
+                project_config::resolve_models(model_impl, model_review, &eng_config.models)?;
             // nemo start: ship_mode=false
             commands::start::run(
                 &http_client,
@@ -262,6 +267,8 @@ async fn main() -> anyhow::Result<()> {
             model_impl,
             model_review,
         } => {
+            let (model_impl, model_review) =
+                project_config::resolve_models(model_impl, model_review, &eng_config.models)?;
             // nemo ship: ship_mode=true, auto_approve implied
             commands::start::run(
                 &http_client,

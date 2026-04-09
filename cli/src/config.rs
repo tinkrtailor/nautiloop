@@ -2,6 +2,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::project_config::ModelsSection;
+
 /// Engineer-level configuration from ~/.nemo/config.toml.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineerConfig {
@@ -15,6 +17,10 @@ pub struct EngineerConfig {
     #[serde(default)]
     pub email: String,
     pub api_key: Option<String>,
+    /// Global default models, lowest-priority layer before the control plane's own default.
+    /// See project_config::resolve_models for the full precedence chain.
+    #[serde(default)]
+    pub models: ModelsSection,
 }
 
 fn default_server_url() -> String {
@@ -29,6 +35,7 @@ impl Default for EngineerConfig {
             name: String::new(),
             email: String::new(),
             api_key: None,
+            models: ModelsSection::default(),
         }
     }
 }
