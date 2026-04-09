@@ -213,7 +213,11 @@ pub mod memory {
             let loops = self.loops.read().await;
             Ok(loops
                 .values()
-                .filter(|l| !l.state.is_terminal())
+                .filter(|l| {
+                    // #96: include FAILED loops with a pending resume so
+                    // handle_failed gets a chance to redispatch them.
+                    !l.state.is_terminal() || (l.state == LoopState::Failed && l.resume_requested)
+                })
                 .cloned()
                 .collect())
         }
