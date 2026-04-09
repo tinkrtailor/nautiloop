@@ -11,7 +11,7 @@
 # NOTE: `NAUTILOOP_EXTRA_CA_BUNDLE` is test-only per SR-10. Production
 # images MUST NOT set it and this Dockerfile MUST NOT reference it.
 
-FROM rust:1.83-alpine AS builder
+FROM rust:1.88-alpine AS builder
 
 RUN apk add --no-cache musl-dev
 
