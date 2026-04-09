@@ -8,9 +8,14 @@
 //! Precedence (first match wins):
 //!   1. CLI flag (--model-impl / --model-review)
 //!   2. Env var (NEMO_MODEL_IMPLEMENTOR / NEMO_MODEL_REVIEWER)
-//!   3. ./nemo.toml [models] (walking up from $PWD)
-//!   4. ~/.nemo/config.toml [models]
+//!   3. ~/.nemo/config.toml [models]          (engineer override)
+//!   4. ./nemo.toml [models] (walking up)     (repo default)
 //!   5. None (control plane uses its own default)
+//!
+//! Engineer wins over repo to match the control plane's existing merge
+//! contract (engineer > repo > cluster, see control-plane/src/config/merged.rs
+//! and docs/architecture.md). An engineer who wants a per-repo pin can still
+//! use an env var in a direnv/.envrc or pass the flag explicitly.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -80,13 +85,13 @@ pub fn resolve_models(
 
     let implementor = non_empty(flag_impl)
         .or_else(|| non_empty(env_impl))
-        .or_else(|| non_empty(project.implementor.clone()))
-        .or_else(|| non_empty(user_models.implementor.clone()));
+        .or_else(|| non_empty(user_models.implementor.clone()))
+        .or_else(|| non_empty(project.implementor.clone()));
 
     let reviewer = non_empty(flag_review)
         .or_else(|| non_empty(env_review))
-        .or_else(|| non_empty(project.reviewer.clone()))
-        .or_else(|| non_empty(user_models.reviewer.clone()));
+        .or_else(|| non_empty(user_models.reviewer.clone()))
+        .or_else(|| non_empty(project.reviewer.clone()));
 
     Ok((implementor, reviewer))
 }
@@ -175,12 +180,19 @@ mod tests {
             reviewer: Some("user-review".into()),
         };
 
-        // Layer 3: project wins over user.
+        // Layer 3: user (engineer) wins over project (repo).
+        // Mirrors the control plane merge contract: engineer > repo > cluster.
         let (i, r) = resolve_models(None, None, &user).unwrap();
+        assert_eq!(i.as_deref(), Some("user-impl"));
+        assert_eq!(r.as_deref(), Some("user-review"));
+
+        // With user empty, project fills in (layer 4).
+        let empty_user = ModelsSection::default();
+        let (i, r) = resolve_models(None, None, &empty_user).unwrap();
         assert_eq!(i.as_deref(), Some("proj-impl"));
         assert_eq!(r.as_deref(), Some("proj-review"));
 
-        // Layer 2: env wins over project.
+        // Layer 2: env wins over user.
         unsafe {
             std::env::set_var("NEMO_MODEL_IMPLEMENTOR", "env-impl");
             std::env::set_var("NEMO_MODEL_REVIEWER", "env-review");
@@ -200,19 +212,23 @@ mod tests {
         assert_eq!(i.as_deref(), Some("flag-impl"));
         assert_eq!(r.as_deref(), Some("env-review"));
 
-        // Layer 4: clear env + project-only-impl, reviewer falls to user.
+        // Layer 4: clear env + user-empty-reviewer, reviewer falls to project.
         unsafe {
             std::env::remove_var("NEMO_MODEL_IMPLEMENTOR");
             std::env::remove_var("NEMO_MODEL_REVIEWER");
         }
         fs::write(
             project_dir.join("nemo.toml"),
-            "[models]\nimplementor = \"proj-impl\"\n",
+            "[models]\nimplementor = \"proj-impl\"\nreviewer = \"proj-review\"\n",
         )
         .unwrap();
-        let (i, r) = resolve_models(None, None, &user).unwrap();
-        assert_eq!(i.as_deref(), Some("proj-impl"));
-        assert_eq!(r.as_deref(), Some("user-review"));
+        let user_impl_only = ModelsSection {
+            implementor: Some("user-impl".into()),
+            reviewer: None,
+        };
+        let (i, r) = resolve_models(None, None, &user_impl_only).unwrap();
+        assert_eq!(i.as_deref(), Some("user-impl"));
+        assert_eq!(r.as_deref(), Some("proj-review"));
 
         // Layer 5: no project file, no env, no user -> all None.
         std::fs::remove_file(project_dir.join("nemo.toml")).unwrap();
@@ -221,17 +237,22 @@ mod tests {
         assert!(i.is_none());
         assert!(r.is_none());
 
-        // Regression for the codex review finding: empty strings at any
+        // Regression for the earlier codex review: empty strings at any
         // layer must be treated as absent so they fall through instead
-        // of shipping a blank model name to the loop.
+        // of shipping a blank model name to the loop. With user > project,
+        // an empty user-impl should fall through to project-impl.
         fs::write(
             project_dir.join("nemo.toml"),
-            "[models]\nimplementor = \"\"\nreviewer = \"proj-review\"\n",
+            "[models]\nimplementor = \"proj-impl\"\nreviewer = \"proj-review\"\n",
         )
         .unwrap();
-        let (i, r) = resolve_models(None, None, &user).unwrap();
-        assert_eq!(i.as_deref(), Some("user-impl")); // "" project -> user
-        assert_eq!(r.as_deref(), Some("proj-review"));
+        let user_empty_impl = ModelsSection {
+            implementor: Some(String::new()),
+            reviewer: Some("user-review".into()),
+        };
+        let (i, r) = resolve_models(None, None, &user_empty_impl).unwrap();
+        assert_eq!(i.as_deref(), Some("proj-impl"));
+        assert_eq!(r.as_deref(), Some("user-review"));
 
         // Empty env var also falls through.
         unsafe {
