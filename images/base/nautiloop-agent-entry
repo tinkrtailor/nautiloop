@@ -256,13 +256,50 @@ run_and_emit_result() {
 # --- FR-4: Stage dispatch ---
 case "$STAGE" in
     implement|revise)
-        # FR-5, FR-7: Claude Code for implement/revise
-        # Use --prompt-file to avoid argv length limits on large specs/diffs
-        CLAUDE_ARGS=(--prompt-file "$PROMPT_FILE" --output-format stream-json --dangerously-skip-permissions)
+        # FR-5, FR-7: Claude Code for implement/revise.
+        #
+        # Claude Code v2.x removed `--prompt-file`; the CLI now takes the
+        # prompt as either a positional argument or via stdin. We pipe
+        # via stdin (same pattern as the opencode path for review/audit,
+        # see #51) to avoid argv length limits on large specs/diffs —
+        # which is the whole reason the original code used --prompt-file.
+        # Symptom of the regression on a fresh v0.3.5 install:
+        #
+        #   NAUTILOOP_RESULT:{"stage":"revise","data":{
+        #     "exit_code":1,
+        #     "error":"error: unknown option '--prompt-file'"
+        #   }}
+        #
+        # The stage exits 1, the K8s Job retries 2x in ~10 seconds each,
+        # and the loop FAILs as BackoffLimitExceeded without ever running
+        # any agent work. This blocked every implement/revise stage — so
+        # after the audit path got unblocked (#84, #86), loops now reach
+        # HARDENING -> dispatch_revise and then die here because the
+        # revise stage can't start.
+        #
+        # `--print` is required for non-interactive mode in v2.x —
+        # the CLI starts an interactive session by default. The docs
+        # state that `--output-format`, `--input-format`, and
+        # `--max-budget-usd` all only work with `--print`.
+        #
+        # `--verbose` is required by v2.x when combining `--print` with
+        # `--output-format=stream-json`. Without it, claude exits 1 with:
+        #
+        #   Error: When using --print, --output-format=stream-json
+        #          requires --verbose
+        #
+        # stream-json is the shape the downstream extractor expects
+        # (see run_and_emit_result's `jq -s '[.[] | select(.type ==
+        # "assistant")] | last'` filter), so we opt into --verbose
+        # rather than fall back to `json`.
+        CLAUDE_ARGS=(--print --output-format stream-json --verbose --dangerously-skip-permissions)
+        if [ -n "${MODEL:-}" ]; then
+            CLAUDE_ARGS+=(--model "$MODEL")
+        fi
         if [ -n "${SESSION_ID:-}" ]; then
             CLAUDE_ARGS+=(--resume "$SESSION_ID")
         fi
-        run_and_emit_result "$STAGE" claude "${CLAUDE_ARGS[@]}"
+        STDIN_FILE="$PROMPT_FILE" run_and_emit_result "$STAGE" claude "${CLAUDE_ARGS[@]}"
         ;;
 
     review|audit)
