@@ -129,8 +129,22 @@ run_and_emit_result() {
     set -e
 
     if [ "$exit_code" -ne 0 ]; then
-        local stderr_tail
+        local stderr_tail stdout_tail
         stderr_tail=$(tail -c 5000 "$cli_stderr" 2>/dev/null || echo "")
+        # Also capture the tail of stdout. Claude Code in --output-format
+        # stream-json mode and opencode in --format json mode both write
+        # structured diagnostics (including fatal errors like invalid model
+        # names, auth failures, tool registration errors) to stdout rather
+        # than stderr. Without this, every CLI regression where stdout
+        # carries the real error and stderr is empty surfaces to the loop
+        # engine as `{"error":""}` and the operator has to race-exec into
+        # a pod that exits in <2 seconds to figure out what happened.
+        # Specific example: claude v2.x `--model <unknown-alias>` exits 1
+        # with the rejection message in a stream-json `{"type":"result",
+        # "is_error":true,"result":"..."}` event on stdout, nothing on
+        # stderr. With this change the message lands in the NAUTILOOP_RESULT
+        # error envelope and `nemo logs <loop-id>` shows it directly.
+        stdout_tail=$(tail -c 5000 "$cli_stdout" 2>/dev/null || echo "")
         # Build a failure result envelope.
         # `-c` is critical: the loop engine's `extract_nautiloop_result` in
         # control-plane/src/loop_engine/driver.rs scans pod log LINES for the
@@ -143,7 +157,8 @@ run_and_emit_result() {
             --arg stage "$stage_name" \
             --argjson exit_code "$exit_code" \
             --arg stderr "$stderr_tail" \
-            '{stage: $stage, data: {exit_code: $exit_code, error: $stderr}}')
+            --arg stdout "$stdout_tail" \
+            '{stage: $stage, data: {exit_code: $exit_code, error: $stderr, stdout_tail: $stdout}}')
         echo "$result" > /output/result.json
         echo "NAUTILOOP_RESULT:$result"
         exit "$exit_code"
