@@ -6,6 +6,7 @@ use crate::client::NemoClient;
 ///
 /// Reads local credential files, validates they exist, and registers them
 /// with the control plane so AWAITING_REAUTH loops can recover via `nemo resume`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     client: &NemoClient,
     engineer: &str,
@@ -13,6 +14,7 @@ pub async fn run(
     email: &str,
     claude: bool,
     openai: bool,
+    opencode_auth: bool,
     ssh: bool,
 ) -> Result<()> {
     if engineer.is_empty() {
@@ -26,13 +28,19 @@ pub async fn run(
     if openai {
         providers.push("openai");
     }
+    if opencode_auth {
+        providers.push("opencode-auth");
+    }
     if ssh {
         providers.push("ssh");
     }
-    // Default: all three if none specified
+    // Default: everything we can find if none explicitly specified.
+    // opencode-auth is included so ChatGPT-plan users get subscription auth
+    // wired up automatically alongside any Platform key they have (#67).
     if providers.is_empty() {
-        providers = vec!["claude", "openai", "ssh"];
+        providers = vec!["claude", "openai", "opencode-auth", "ssh"];
     }
+    let any_explicit = claude || openai || opencode_auth || ssh;
 
     let mut any_registered = false;
     let mut any_error = false;
@@ -70,6 +78,15 @@ pub async fn run(
                     .cloned()
                     .unwrap_or_else(|| candidates[0].clone())
             }
+            "opencode-auth" => {
+                // opencode's subscription auth bundle (OAuth tokens for
+                // ChatGPT Plus/Team/Enterprise plans). Mirrors what the
+                // opencode CLI writes when the user runs `opencode auth login`.
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                let data_dir = std::env::var("XDG_DATA_HOME")
+                    .unwrap_or_else(|_| format!("{home}/.local/share"));
+                format!("{data_dir}/opencode/auth.json")
+            }
             "ssh" => {
                 let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
                 format!("{home}/.ssh/id_ed25519")
@@ -78,17 +95,26 @@ pub async fn run(
         };
 
         if !std::path::Path::new(&cred_path).exists() {
+            // Silently skip opencode-auth in the default (all-providers) run.
+            // Most engineers have either a Platform key OR a subscription, not both,
+            // and we don't want the default `nemo auth` to error on "no auth.json".
+            if *provider == "opencode-auth" && !any_explicit {
+                continue;
+            }
             eprintln!("No {provider} credentials found at {cred_path}");
             match *provider {
                 "claude" => eprintln!("  Run: claude login"),
                 "openai" => {
                     eprintln!("  Create {cred_path} with your OpenAI API key as content")
                 }
+                "opencode-auth" => {
+                    eprintln!("  Run: opencode auth login (then re-run nemo auth)")
+                }
                 "ssh" => eprintln!("  Run: ssh-keygen -t ed25519"),
                 _ => {}
             }
             // If the provider was explicitly requested (not default "all"), treat as error
-            if claude || openai || ssh {
+            if any_explicit {
                 any_error = true;
             }
             continue;
@@ -110,11 +136,18 @@ pub async fn run(
             continue;
         }
 
-        // For claude/openai, validate content is either valid JSON or a raw API key string.
-        // Reject obviously malformed content (e.g. truncated JSON, binary data).
+        // For claude/openai/opencode-auth, validate content is either valid JSON or a raw
+        // API key string. Reject obviously malformed content (e.g. truncated JSON, binary data).
+        // opencode-auth is always a JSON bundle, so validate it strictly.
         if *provider != "ssh" {
             let trimmed = content.trim();
-            if trimmed.starts_with('{')
+            if *provider == "opencode-auth" {
+                if serde_json::from_str::<serde_json::Value>(trimmed).is_err() {
+                    eprintln!("Error: opencode-auth credentials at {cred_path} are not valid JSON");
+                    any_error = true;
+                    continue;
+                }
+            } else if trimmed.starts_with('{')
                 && serde_json::from_str::<serde_json::Value>(trimmed).is_err()
             {
                 eprintln!("Error: {provider} credentials at {cred_path} contain malformed JSON");

@@ -138,9 +138,13 @@ enum Commands {
         #[arg(long)]
         claude: bool,
 
-        /// Push OpenAI credentials only
+        /// Push OpenAI Platform API key only
         #[arg(long)]
         openai: bool,
+
+        /// Push opencode subscription auth (~/.local/share/opencode/auth.json) only
+        #[arg(long = "opencode-auth")]
+        opencode_auth: bool,
 
         /// Push SSH key only
         #[arg(long)]
@@ -314,6 +318,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Auth {
             claude,
             openai,
+            opencode_auth,
             ssh,
         } => {
             commands::auth::run(
@@ -323,6 +328,7 @@ async fn main() -> anyhow::Result<()> {
                 &eng_config.email,
                 claude,
                 openai,
+                opencode_auth,
                 ssh,
             )
             .await?;

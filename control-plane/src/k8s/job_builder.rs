@@ -98,6 +98,29 @@ pub fn build_job(ctx: &LoopContext, stage: &StageConfig, cfg: &JobBuildConfig) -
         });
     }
 
+    // #67: opencode subscription auth volume for REVIEW/AUDIT stages.
+    // Engineers on a ChatGPT Plus/Team plan can point their reviewer model
+    // at their subscription via opencode's native auth.json, bypassing the
+    // metered Platform API key path. The volume is optional so engineers
+    // who only have a Platform key (the #64 path) still work unchanged.
+    if is_review_or_audit {
+        let safe_engineer: String = ctx.engineer.to_lowercase().replace('_', "-");
+        volumes.push(Volume {
+            name: "opencode-auth".to_string(),
+            secret: Some(SecretVolumeSource {
+                secret_name: Some(format!("nautiloop-creds-{safe_engineer}")),
+                items: Some(vec![KeyToPath {
+                    key: "opencode-auth".to_string(),
+                    path: "auth.json".to_string(),
+                    mode: Some(0o400),
+                }]),
+                optional: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
+
     // Build agent container volume mounts (with subPath for worktree isolation)
     let agent_mounts = build_agent_mounts(
         is_review_or_audit,
@@ -525,6 +548,20 @@ fn build_agent_mounts(
         mounts.push(VolumeMount {
             name: "claude-session".to_string(),
             mount_path: "/home/agent/.claude".to_string(),
+            read_only: Some(true),
+            ..Default::default()
+        });
+    }
+
+    // #67: Mount opencode subscription auth bundle for REVIEW/AUDIT stages.
+    // subPath lands only auth.json at the target; the rest of
+    // ~/.local/share/opencode/ stays writable via the agent home volume
+    // so opencode can still write session state, logs, etc. at runtime.
+    if is_review_or_audit {
+        mounts.push(VolumeMount {
+            name: "opencode-auth".to_string(),
+            mount_path: "/home/agent/.local/share/opencode/auth.json".to_string(),
+            sub_path: Some("auth.json".to_string()),
             read_only: Some(true),
             ..Default::default()
         });
@@ -1065,6 +1102,81 @@ mod tests {
         let agent = &job.spec.unwrap().template.spec.unwrap().containers[0];
         let mounts = agent.volume_mounts.as_ref().unwrap();
         assert!(mounts.iter().all(|m| m.mount_path != "/home/agent/.claude"));
+    }
+
+    #[test]
+    fn test_build_job_review_has_opencode_auth_mount() {
+        // #67: review/audit stages get an opencode-auth subPath mount so
+        // engineers on a ChatGPT plan can use subscription auth.
+        let ctx = test_ctx();
+        for stage_name in ["review", "audit"] {
+            let stage = StageConfig {
+                name: stage_name.to_string(),
+                timeout: Duration::from_secs(900),
+                ..Default::default()
+            };
+            let cfg = test_cfg();
+            let job = build_job(&ctx, &stage, &cfg);
+            let pod_spec = job.spec.unwrap().template.spec.unwrap();
+
+            // Volume present + optional + items -> auth.json
+            let vol = pod_spec
+                .volumes
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|v| v.name == "opencode-auth")
+                .unwrap_or_else(|| panic!("opencode-auth volume missing for {stage_name}"));
+            let secret = vol.secret.as_ref().unwrap();
+            assert_eq!(secret.optional, Some(true));
+            let items = secret.items.as_ref().unwrap();
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].key, "opencode-auth");
+            assert_eq!(items[0].path, "auth.json");
+
+            // Mount is a subPath file mount at the expected opencode path.
+            let agent = &pod_spec.containers[0];
+            let mounts = agent.volume_mounts.as_ref().unwrap();
+            let mount = mounts
+                .iter()
+                .find(|m| m.name == "opencode-auth")
+                .unwrap_or_else(|| panic!("opencode-auth mount missing for {stage_name}"));
+            assert_eq!(
+                mount.mount_path,
+                "/home/agent/.local/share/opencode/auth.json"
+            );
+            assert_eq!(mount.sub_path.as_deref(), Some("auth.json"));
+            assert_eq!(mount.read_only, Some(true));
+        }
+    }
+
+    #[test]
+    fn test_build_job_implement_no_opencode_auth_mount() {
+        // opencode-auth is only for review/audit. implement/revise use the
+        // claude-session path, not opencode, so the mount must be absent.
+        let ctx = test_ctx();
+        let stage = test_stage(); // implement
+        let cfg = test_cfg();
+        let job = build_job(&ctx, &stage, &cfg);
+        let pod_spec = job.spec.unwrap().template.spec.unwrap();
+        assert!(
+            pod_spec
+                .volumes
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|v| v.name != "opencode-auth"),
+            "opencode-auth volume should not exist on implement stage"
+        );
+        let agent = &pod_spec.containers[0];
+        assert!(
+            agent
+                .volume_mounts
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|m| m.name != "opencode-auth")
+        );
     }
 
     #[test]
