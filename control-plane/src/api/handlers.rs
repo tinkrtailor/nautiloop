@@ -310,10 +310,21 @@ pub async fn pod_logs(
             .into_response()
     }
 
+    // Terminal loops with no active pod: there's nothing to tail.
+    // Return an appropriate error so the CLI can fall back to the
+    // historical /logs/{id} endpoint. Only non-terminal loops with
+    // no active_job_name (between-stage gap, just-dispatched) get
+    // the benign 200 info_response.
     let Some(job_name) = record.active_job_name.clone() else {
+        if record.state.is_terminal() {
+            return Err(NautiloopError::BadRequest(format!(
+                "loop {id} is {}: use `nemo logs {}` (without --tail) for historical logs",
+                record.state, id,
+            )));
+        }
         return Ok(info_response(format!(
-            "# loop {id} has no active pod right now (state={})\n",
-            record.state
+            "# loop {id} is between stages (state={}), no active pod right now\n",
+            record.state,
         )));
     };
 
@@ -343,27 +354,45 @@ pub async fn pod_logs(
         NautiloopError::Internal(format!("Failed to list pods for {job_name}: {e}"))
     })?;
 
-    let Some(pod) = pod_list.items.first() else {
-        // Normal race: active_job_name is persisted before the Job's
-        // pod exists. Retrying in a few seconds usually works. Return
-        // a 200 with a hint instead of a 4xx so the CLI doesn't bark.
+    if pod_list.items.is_empty() {
         return Ok(info_response(format!(
             "# no pod yet for job {job_name} (pre-creation race or TTL cleanup)\n"
         )));
-    };
-    let Some(pod_name) = pod.metadata.name.as_ref() else {
-        return Err(NautiloopError::Internal(
-            "pod matched by label selector has no name".to_string(),
-        ));
-    };
+    }
 
+    // Iterate matching pods and return the first successful logs result.
+    // A Job can have multiple pods after eviction or node loss, and
+    // list order is not guaranteed by k8s, so trying only the first
+    // pod would be racy. Mirrors control-plane/src/k8s/client.rs
+    // `get_job_logs` which already does this loop.
     let log_params = kube::api::LogParams {
         container: Some(container),
         tail_lines: Some(tail_lines),
         ..Default::default()
     };
-    let logs = pods_api.logs(pod_name, &log_params).await.map_err(|e| {
-        NautiloopError::Internal(format!("Failed to read pod logs for {pod_name}: {e}"))
+    let mut logs: Option<String> = None;
+    for pod in &pod_list.items {
+        if let Some(pod_name) = &pod.metadata.name {
+            match pods_api.logs(pod_name, &log_params).await {
+                Ok(l) => {
+                    logs = Some(l);
+                    break;
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        pod = %pod_name,
+                        error = %e,
+                        "Failed to read logs from pod (trying next)"
+                    );
+                }
+            }
+        }
+    }
+    let logs = logs.ok_or_else(|| {
+        NautiloopError::Internal(format!(
+            "All {} matching pods failed to return logs for job {job_name}",
+            pod_list.items.len()
+        ))
     })?;
 
     Ok((
