@@ -347,10 +347,14 @@ async fn main() -> anyhow::Result<()> {
                 // should surface directly to the operator.
                 match commands::logs::run_tail(&http_client, &loop_id, tail_lines, &container).await
                 {
-                    Ok(()) => {}
+                    Ok(commands::logs::TailResult::Ok) => {}
+                    Ok(commands::logs::TailResult::NoPod) => {
+                        eprintln!("--tail: no active pod; falling back to historical logs");
+                        commands::logs::run(&http_client, &loop_id, None, None).await?;
+                    }
                     Err(e) => {
                         let msg = e.to_string();
-                        if msg.contains("use `nemo logs") || msg.contains("no active pod") {
+                        if msg.contains("use `nemo logs") {
                             eprintln!("--tail: {msg}; falling back to historical logs");
                             commands::logs::run(&http_client, &loop_id, None, None).await?;
                         } else {

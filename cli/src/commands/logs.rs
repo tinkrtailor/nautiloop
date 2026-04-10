@@ -9,12 +9,23 @@ use crate::client::NemoClient;
 /// directly, bypassing the Postgres log stream. Works mid-run and
 /// gives an operator the same information `kubectl logs -c agent`
 /// would, without requiring kubectl access.
+/// Result of `run_tail`: either real pod logs were printed, or an
+/// informational "no pod" banner was received (the caller may want
+/// to fall back to historical logs in that case).
+pub enum TailResult {
+    /// Real log output was printed.
+    Ok,
+    /// Server returned a benign "no pod yet" or similar info banner.
+    /// The caller should fall back to /logs/{id}.
+    NoPod,
+}
+
 pub async fn run_tail(
     client: &NemoClient,
     loop_id: &str,
     tail_lines: u32,
     container: &str,
-) -> Result<()> {
+) -> Result<TailResult> {
     let path = format!("/pod-logs/{loop_id}?tail={tail_lines}&container={container}");
     let resp = client.get_stream(&path).await?;
     let status = resp.status();
@@ -22,11 +33,17 @@ pub async fn run_tail(
     if !status.is_success() {
         anyhow::bail!("pod-logs returned {status}: {text}");
     }
+    // The server returns 200 with a "# ..." comment line for benign
+    // no-pod states (between-stage gap, container still creating).
+    // Treat as NoPod so the CLI can fall back to historical logs.
+    if text.starts_with("# ") && text.lines().count() <= 2 {
+        return Ok(TailResult::NoPod);
+    }
     print!("{text}");
     if !text.ends_with('\n') {
         println!();
     }
-    Ok(())
+    Ok(TailResult::Ok)
 }
 
 pub async fn run(
