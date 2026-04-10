@@ -65,9 +65,9 @@ enum AgentData {
 /// never delay teardown. Because the control channel is unbounded,
 /// `channel_close` and `channel_eof` callbacks never block on
 /// capacity, so the handler returns immediately even when the data
-/// channel is full. The pump's `select!` sees the control message
-/// within one scheduling slice and acts on it, tearing the upstream
-/// session down without waiting for buffered data to drain.
+/// channel is full. The pump can then observe the control message
+/// without needing data-channel capacity to free up, which keeps
+/// close/eof delivery non-blocking even under backpressure.
 #[derive(Debug)]
 enum AgentControl {
     /// The agent sent EOF. The upstream channel's stdin should be
@@ -871,11 +871,9 @@ async fn proxy_upstream(
     // branch first, and a continuously readable upstream would
     // then starve the agent→upstream direction indefinitely. The
     // default pseudo-random selection guarantees all branches make
-    // progress under sustained load. Priority for control messages
-    // is achieved NOT via `biased` but via the unbounded control
-    // channel: because `channel_close` cannot block on capacity,
-    // the pump observes `Close` in the next scheduling slice
-    // regardless of data backlog.
+    // progress under sustained load. The control channel is unbounded
+    // so `channel_close` / `channel_eof` never block behind buffered
+    // data, but control still competes fairly with upstream reads.
     let mut agent_eof_sent = false;
     let mut agent_closed = false;
     loop {
@@ -1163,12 +1161,12 @@ mod tests {
         assert_eq!(result, Err("file is empty".to_string()));
     }
 
-    // --- priority control channel (Codex v3 finding #1) ---
+    // --- non-blocking control channel (Codex v3 finding #1) ---
 
     /// Regression for Codex v3 finding #1. Fill the bounded data
     /// channel to capacity, then prove that a Close sent on the
-    /// unbounded control channel is immediately visible to the pump
-    /// side, without waiting for a single data slot to free up.
+    /// unbounded control channel reaches the pump side without
+    /// waiting for a data slot to free up.
     ///
     /// Any implementation that routes `Close` through the same
     /// bounded queue as data would block indefinitely here.

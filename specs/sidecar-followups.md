@@ -4,7 +4,7 @@
 
 Three P2 followups from the final Codex v3 review of PR #63 (Rust sidecar rewrite). All are refinements of fixes that already landed at commit `393a112`. None are catastrophic. All are tracked as GitHub issues:
 
-- #68 — SSH priority channel for control messages
+- #68 — SSH non-blocking control channel for close/eof messages
 - #69 — Further restrict `test-utils` feature visibility
 - #70 — E2E test coverage for SSH reject paths
 
@@ -56,10 +56,10 @@ Files: `sidecar/tests/git_ssh_proxy_e2e.rs:28`, `:139`, `:360`, `sidecar/src/git
 
 ## Requirements
 
-### Problem 1 — Priority channel for control messages
+### Problem 1 — Non-blocking control channel for control messages
 
 - FR-1: The SSH proxy pump shall use a **separate unbounded `mpsc` channel dedicated to control messages** (`Close`, `Eof`), distinct from the bounded `mpsc::channel(256)` used for `Data` messages.
-- FR-2: The pump's `tokio::select!` shall poll both channels fairly. When a `Close` message is available, the pump shall call `upstream_channel.close().await` and exit the loop immediately, regardless of outstanding `Data` messages in the data channel.
+- FR-2: The pump's `tokio::select!` shall poll channels fairly. A queued `Close` message shall not require any `Data` slot to free up first. When the control branch wins, the pump shall call `upstream_channel.close().await` and exit the loop immediately, regardless of outstanding `Data` messages in the data channel.
 - FR-3: `Handler::channel_close` shall send `Close` to the control channel, not the data channel. The send is non-blocking (unbounded channel).
 - FR-4: `Handler::channel_eof` shall send `Eof` to the control channel, not the data channel. Non-blocking.
 - FR-5: `Handler::data` continues to use the bounded data channel (FR-1 leaves the existing backpressure behavior intact).
@@ -99,7 +99,7 @@ Files: `sidecar/tests/git_ssh_proxy_e2e.rs:28`, `:139`, `:360`, `sidecar/src/git
 - NFR-3: `cargo clippy --workspace --all-targets --features nautiloop-sidecar/__test_utils -- -D warnings` green.
 - NFR-4: `cargo test --workspace --features nautiloop-sidecar/__test_utils` passes all tests. Integration tests should show **5 passed** (1 existing happy path + 4 new reject path).
 - NFR-5: Single commit per problem, three commits total. Commit messages:
-  - `fix(sidecar): separate priority channel for SSH control messages (closes #68)`
+  - `fix(sidecar): separate non-blocking SSH control channel (closes #68)`
   - `fix(sidecar): restrict test-utils feature with double-underscore prefix (closes #69)`
   - `test(sidecar): add e2e coverage for SSH reject path exit statuses (closes #70)`
 - NFR-6: All three commits land on a single branch `fix/sidecar-followups` and a single PR closes all three issues.
@@ -111,7 +111,7 @@ Files: `sidecar/tests/git_ssh_proxy_e2e.rs:28`, `:139`, `:360`, `sidecar/src/git
 
 ## Architecture
 
-### Priority channel pattern (Problem 1)
+### Non-blocking control channel pattern (Problem 1)
 
 The current `AgentToUpstream` enum and the single bounded `mpsc::channel(256)` become:
 
@@ -138,9 +138,9 @@ The pump loop:
 ```rust
 loop {
     tokio::select! {
-        // Control messages get priority via select ordering is NOT enough
-        // because select! is fair, not priority. We structure the loop so
-        // that control is checked first on each iteration.
+        // Control messages do not have strict priority here.
+        // The guarantee is narrower: close/eof delivery is non-blocking
+        // because the control channel is unbounded.
         control = control_rx.recv() => {
             match control {
                 Some(AgentControl::Close) => {
@@ -169,9 +169,9 @@ loop {
 }
 ```
 
-**Note on "priority":** `tokio::select!` is fair by default; removing `biased` was the round-2 fix. To get actual control-message priority, we don't use `biased` (which brings back the starvation risk). Instead, we rely on the unbounded control channel — `Close` sends from `Handler::channel_close` cannot block, so the callback returns immediately even if the data channel is full. The pump's next `select!` iteration will see the control message within one scheduling slice and act on it.
+**Note on scheduling:** `tokio::select!` is fair by default; removing `biased` was the round-2 fix. This design does not provide strict control-message priority over an always-readable upstream branch. The guarantee is that `Close` / `Eof` sends from `Handler::channel_close` / `channel_eof` cannot block on channel capacity, so teardown signals remain non-blocking even when the data queue is saturated.
 
-If finer-grained priority is needed in the future, a dedicated loop structure or `FuturesUnordered` with explicit prioritization can replace this. Not required for this spec.
+If strict control-message priority is needed in the future, a dedicated loop structure or `FuturesUnordered` with explicit prioritization can replace this. Not required for this spec.
 
 ### Feature rename (Problem 2)
 
@@ -260,7 +260,7 @@ The happy-path test also moves to use the helper, keeping assertions intact but 
 
 Three ordered commits on a single branch:
 
-### Commit 1 — Priority channel for control messages
+### Commit 1 — Non-blocking control channel for control messages
 - `sidecar/src/git_ssh_proxy.rs`: split `AgentToUpstream` into `AgentData` and `AgentControl`, add unbounded control channel, update pump loop, update `Handler::data` / `channel_eof` / `channel_close` to send to the right channel.
 - Existing unit tests continue to pass without modification.
 - A new unit or integration test asserts: filling the data channel to capacity and then calling `channel_close` results in `upstream_channel.close()` being called within 50ms, not blocking on the data drain.
@@ -317,7 +317,7 @@ All six commands must succeed.
 ## Out of Scope
 
 - **Wiring the lint script into CI.** Tracked as followup to #71.
-- **Priority queue beyond Data/Control split.** If in the future we need Eof to be higher priority than Data but lower than Close, a third channel or explicit priority queue is needed. Not required today.
+- **Strict priority beyond Data/Control split.** If in the future we need Eof to be higher priority than Data but lower than Close, a third channel or explicit priority queue is needed. Not required today.
 - **Refactoring `serve_with_auth` or module visibility.** Codex v3 noted `pub mod git_ssh_proxy` is still public because the binary depends on it. The feature gate is the security boundary; changing module visibility would require restructuring the binary/library boundary and is a separate concern.
 - **Any unrelated sidecar changes.** This spec is strictly scoped to closing issues #68, #69, #70.
 
