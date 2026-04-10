@@ -23,10 +23,14 @@
 #    propagate it into a running container (Dockerfile / YAML /
 #    shell / .env / Terraform / HCL) is a lint failure.
 #
-#    The env var name is intentionally built from fragments below so
-#    this script itself does not contain the literal token as a
-#    single contiguous byte run — `git grep` will not match this
-#    file even though it describes the pattern.
+# 3. The parity-only bind override env var follows the same rule: it
+#    may exist only in the parity compose/workflow files. Production
+#    manifests must never widen the sidecar listeners.
+#
+#    The env var names are intentionally built from fragments below so
+#    this script itself does not contain the literal tokens as a
+#    single contiguous byte run. `git grep` will not match this file
+#    even though it describes the patterns.
 #
 #    File-type scoping (runtime-propagation shapes only) keeps
 #    documentation and reader code like `sidecar/src/tls.rs` out of
@@ -52,14 +56,15 @@ else
   echo "No $WORKFLOWS directory; skipping __test_utils check"
 fi
 
-# ---- Check 2: FR-28 extra-CA-bundle env var allowlist ---------------
-#
-# The env var name is assembled from two fragments so the literal
-# token never appears contiguously inside this script. `git grep` for
-# the full name will not match this file.
+# ---- Check 2/3: parity-only env-var allowlist -----------------------
+
 CA_BUNDLE_ENV_PREFIX="NAUTILOOP_EXTRA"
 CA_BUNDLE_ENV_SUFFIX="CA_BUNDLE"
 CA_BUNDLE_ENV="${CA_BUNDLE_ENV_PREFIX}_${CA_BUNDLE_ENV_SUFFIX}"
+
+BIND_ALL_ENV_A="NAUTILOOP_BIND"
+BIND_ALL_ENV_B="ALL_INTERFACES"
+BIND_ALL_ENV="${BIND_ALL_ENV_A}_${BIND_ALL_ENV_B}"
 
 # File-type scope: only files that could actually propagate an env
 # var into a container at runtime. Rust source and markdown are
@@ -85,39 +90,42 @@ ALLOWED_PATHS=(
   ':!.github/workflows/parity.yml'
 )
 
-if git rev-parse --git-dir > /dev/null 2>&1; then
-  # `-n` so the error output names line numbers. We match ANY
-  # reference to the env var NAME within scoped files. A negative
-  # lookahead at the start of the line excludes full-line comments
-  # in YAML / Dockerfile / shell (lines whose first non-whitespace
-  # character is `#`) so that pure documentation comments in
-  # production files do not trip the lint. Any non-comment line
-  # that mentions the var — assignment, export, interpolation,
-  # heredoc, whatever — is flagged.
-  CA_BUNDLE_PATTERN="^(?![[:space:]]*#).*${CA_BUNDLE_ENV}"
-  MATCHES=$(
-    git grep -nP "$CA_BUNDLE_PATTERN" \
+check_allowed_env_references() {
+  local env_name="$1"
+  local label="$2"
+  local matches pattern
+
+  pattern="^(?![[:space:]]*#).*${env_name}"
+  matches=$(
+    git grep -nP "$pattern" \
       -- "${SCOPED_PATHSPECS[@]}" "${ALLOWED_PATHS[@]}" \
       2>/dev/null || true
   )
-  if [ -n "$MATCHES" ]; then
-    echo "ERROR: ${CA_BUNDLE_ENV} referenced outside the FR-28 allowlist:"
-    echo "$MATCHES"
+
+  if [ -n "$matches" ]; then
+    echo "ERROR: ${env_name} referenced outside the parity allowlist (${label}):"
+    echo "$matches"
     echo ""
-    echo "The only files allowed to reference this env var (per SR-5) are:"
+    echo "The only files allowed to reference this env var are:"
     echo "  - sidecar/tests/parity/docker-compose.yml"
     echo "  - .github/workflows/parity.yml"
     echo ""
     echo "Full-line comments in YAML / Dockerfile / shell are allowed,"
     echo "but any non-comment reference inside a runtime-propagation"
     echo "file type (Dockerfile / YAML / shell / .env / terraform / HCL)"
-    echo "is a FR-28 violation. Rust source and markdown docs are out"
+    echo "is a violation. Rust/Go source and markdown docs are out"
     echo "of scope because they cannot set env vars in a container."
     exit 1
   fi
+}
+
+if git rev-parse --git-dir > /dev/null 2>&1; then
+  check_allowed_env_references "$CA_BUNDLE_ENV" "extra CA bundle"
+  check_allowed_env_references "$BIND_ALL_ENV" "parity bind override"
 else
   echo "Not inside a git repo; skipping ${CA_BUNDLE_ENV} reference check"
 fi
 
 echo "OK: no __test_utils feature references in release CI workflows"
 echo "OK: ${CA_BUNDLE_ENV} references are within the FR-28 allowlist"
+echo "OK: ${BIND_ALL_ENV} references are within the parity allowlist"

@@ -918,6 +918,20 @@ async fn proxy_upstream(
                 match control {
                     Some(AgentControl::Eof) => {
                         if !agent_eof_sent {
+                            // Preserve wire order: if agent data frames are
+                            // already buffered, forward them before the
+                            // upstream EOF. Otherwise `git-receive-pack`
+                            // can observe EOF before the final pack bytes and
+                            // treat the push as empty.
+                            while let Ok(AgentData::Data(bytes)) = data_rx.try_recv() {
+                                if let Err(e) = upstream_channel.data(bytes.as_slice()).await {
+                                    logging::warn(&format!(
+                                        "failed to flush buffered agent data before EOF: {e}"
+                                    ));
+                                    agent_closed = true;
+                                    break;
+                                }
+                            }
                             agent_eof_sent = true;
                             if let Err(e) = upstream_channel.eof().await {
                                 logging::warn(&format!(

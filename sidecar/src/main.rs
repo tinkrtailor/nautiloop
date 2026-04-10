@@ -23,6 +23,7 @@ const MODEL_PROXY_PORT: u16 = 9090;
 const GIT_SSH_PROXY_PORT: u16 = 9091;
 const EGRESS_PORT: u16 = 9092;
 const HEALTH_PORT: u16 = 9093;
+const PARITY_BIND_ALL_INTERFACES_ENV: &str = "NAUTILOOP_BIND_ALL_INTERFACES";
 
 /// Graceful shutdown budget. Matches Go `main.go:826`.
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -73,20 +74,25 @@ async fn run() -> Result<(), String> {
     // is a fatal startup error.
     let loopback = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
     let all_interfaces = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+    let private_listener_bind_ip = private_listener_bind_ip();
 
-    let model_listener = TcpListener::bind(SocketAddr::new(loopback, MODEL_PROXY_PORT))
-        .await
-        .map_err(|e| format!("failed to bind model proxy listener: {e}"))?;
-    let egress_listener = TcpListener::bind(SocketAddr::new(loopback, EGRESS_PORT))
+    let model_listener =
+        TcpListener::bind(SocketAddr::new(private_listener_bind_ip, MODEL_PROXY_PORT))
+            .await
+            .map_err(|e| format!("failed to bind model proxy listener: {e}"))?;
+    let egress_listener = TcpListener::bind(SocketAddr::new(private_listener_bind_ip, EGRESS_PORT))
         .await
         .map_err(|e| format!("failed to bind egress logger listener: {e}"))?;
     // FR-20: health endpoint binds all interfaces, NOT loopback. See spec.
     let health_listener = TcpListener::bind(SocketAddr::new(all_interfaces, HEALTH_PORT))
         .await
         .map_err(|e| format!("failed to bind health endpoint listener: {e}"))?;
-    let git_ssh_listener = TcpListener::bind(SocketAddr::new(loopback, GIT_SSH_PROXY_PORT))
-        .await
-        .map_err(|e| format!("failed to bind git SSH proxy listener: {e}"))?;
+    let git_ssh_listener = TcpListener::bind(SocketAddr::new(
+        private_listener_bind_ip,
+        GIT_SSH_PROXY_PORT,
+    ))
+    .await
+    .map_err(|e| format!("failed to bind git SSH proxy listener: {e}"))?;
 
     // Shutdown signal distributed to the model proxy, egress, and git
     // SSH proxy servers. `false` = keep running.
@@ -220,4 +226,48 @@ async fn run() -> Result<(), String> {
 
     logging::info("shutdown complete");
     Ok(())
+}
+
+fn private_listener_bind_ip() -> IpAddr {
+    match std::env::var(PARITY_BIND_ALL_INTERFACES_ENV) {
+        Ok(value) if is_truthy_env(&value) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        _ => IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+    }
+}
+
+fn is_truthy_env(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_listener_bind_ip_defaults_to_loopback() {
+        unsafe {
+            std::env::remove_var(PARITY_BIND_ALL_INTERFACES_ENV);
+        }
+        assert_eq!(
+            private_listener_bind_ip(),
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))
+        );
+    }
+
+    #[test]
+    fn private_listener_bind_ip_uses_all_interfaces_when_enabled() {
+        unsafe {
+            std::env::set_var(PARITY_BIND_ALL_INTERFACES_ENV, "true");
+        }
+        assert_eq!(
+            private_listener_bind_ip(),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        );
+        unsafe {
+            std::env::remove_var(PARITY_BIND_ALL_INTERFACES_ENV);
+        }
+    }
 }

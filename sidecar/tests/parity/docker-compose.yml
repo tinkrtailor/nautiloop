@@ -29,6 +29,9 @@ services:
       - "19093:9093"  # health
     environment:
       GIT_REPO_URL: "git@github.com:test/repo.git"
+      # Parity-harness only: bind private proxy ports on all interfaces so
+      # Docker's published host ports can reach them.
+      NAUTILOOP_BIND_ALL_INTERFACES: "true"
     volumes:
       - ./fixtures/go-secrets:/secrets:ro
     networks:
@@ -68,6 +71,9 @@ services:
       - "29093:9093"
     environment:
       GIT_REPO_URL: "git@github.com:test/repo.git"
+      # Parity-harness only: bind private proxy ports on all interfaces so
+      # Docker's published host ports can reach them.
+      NAUTILOOP_BIND_ALL_INTERFACES: "true"
       # SR-5: this env var is permitted ONLY here and in
       # `.github/workflows/parity.yml`. The script at
       # `sidecar/scripts/lint-no-test-utils-in-prod.sh` enforces the

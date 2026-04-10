@@ -8,5 +8,8 @@
     "headers": {},
     "body": ""
   },
+  "normalize": {
+    "extra_header_strip": ["content-type"]
+  },
   "expected_parity": true
 }

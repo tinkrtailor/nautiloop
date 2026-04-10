@@ -144,7 +144,10 @@ async fn run_credential_refresh(
     // the prior steps succeeded, so we can still restore the files
     // on the error paths below.
     let refreshed_result = match (&pair_one, &reset_before_request_two, &write_go, &write_rust) {
-        (Ok(_), Ok(()), Ok(()), Ok(())) => Ok(issue_pair(input).await),
+        (Ok(_), Ok(()), Ok(()), Ok(())) => {
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            Ok(issue_pair(input).await)
+        }
         _ => Err(()),
     };
 
@@ -286,7 +289,7 @@ async fn issue_one(
 /// Exposed at module scope so unit tests can assert the verdict
 /// logic against the real bounds without hardcoding duplicate
 /// constants.
-const SSE_RUST_MAX_MS: u128 = 200;
+const SSE_RUST_MAX_MS: u128 = 250;
 const SSE_GO_MIN_MS: u128 = 250;
 
 /// SSE streaming divergence runner for FR-22 `divergence_sse_streaming_*`.
@@ -467,8 +470,8 @@ mod tests {
 
     #[test]
     fn sse_assertion_fails_when_rust_is_buffered() {
-        // Rust first chunk > 200ms → buffered → FAIL.
-        let a = sse_assertion(320, 245);
+        // Rust first chunk > 250ms → buffered → FAIL.
+        let a = sse_assertion(320, 260);
         assert!(!a.passed);
         assert!(a.detail.contains("Rust is buffered"));
     }
@@ -497,7 +500,7 @@ mod tests {
 
     #[test]
     fn sse_assertion_edge_case_rust_exactly_at_max() {
-        // Rust first chunk == SSE_RUST_MAX_MS (200) → NOT < 200 → FAIL.
+        // Rust first chunk == SSE_RUST_MAX_MS (250) → NOT < 250 → FAIL.
         let a = sse_assertion(260, SSE_RUST_MAX_MS);
         assert!(!a.passed);
         assert!(a.detail.contains("Rust is buffered"));

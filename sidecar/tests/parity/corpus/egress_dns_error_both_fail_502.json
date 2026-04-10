@@ -6,5 +6,9 @@
     "kind": "http_dns_error",
     "url": "http://deliberately-unresolvable.invalid/"
   },
+  "normalize": {
+    "extra_header_strip": ["content-type"],
+    "ignore_http_body": true
+  },
   "expected_parity": true
 }

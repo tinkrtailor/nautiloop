@@ -48,6 +48,16 @@ var privateRanges = []net.IPNet{
 	parseCIDR("127.0.0.0/8"),
 }
 
+const bindAllInterfacesEnv = "NAUTILOOP_BIND_ALL_INTERFACES"
+
+func privateListenerBindHost() string {
+	value := strings.TrimSpace(strings.ToLower(os.Getenv(bindAllInterfacesEnv)))
+	if value == "1" || value == "true" || value == "yes" || value == "on" {
+		return "0.0.0.0"
+	}
+	return "127.0.0.1"
+}
+
 func parseCIDR(cidr string) net.IPNet {
 	_, n, err := net.ParseCIDR(cidr)
 	if err != nil {
@@ -371,7 +381,7 @@ var allowedGitCommands = map[string]bool{
 	"git-receive-pack": true,
 }
 
-func startGitProxy(ctx context.Context, gitRemoteHost string, allowedRepoPath string) error {
+func startGitProxy(ctx context.Context, gitRemoteHost string, allowedRepoPath string, bindHost string) error {
 	// Generate an ephemeral host key for the local SSH server.
 	_, hostPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -387,7 +397,7 @@ func startGitProxy(ctx context.Context, gitRemoteHost string, allowedRepoPath st
 	}
 	config.AddHostKey(hostSigner)
 
-	listener, err := net.Listen("tcp", "127.0.0.1:9091")
+	listener, err := net.Listen("tcp", net.JoinHostPort(bindHost, "9091"))
 	if err != nil {
 		return fmt.Errorf("failed to listen on :9091: %w", err)
 	}
@@ -709,18 +719,19 @@ func main() {
 	logJSON("NAUTILOOP_SIDECAR", "info", fmt.Sprintf("git remote host: %s, allowed repo: %s", remote.host, remote.repoPath))
 
 	// Start all three servers
+	privateBindHost := privateListenerBindHost()
 
 	// FR-15/16: Model API proxy on :9090
 	modelMux := http.NewServeMux()
 	modelMux.HandleFunc("/", modelProxyHandler)
 	modelServer := &http.Server{
-		Addr:    "127.0.0.1:9090",
+		Addr:    net.JoinHostPort(privateBindHost, "9090"),
 		Handler: modelMux,
 	}
 
 	// FR-19: Egress logger on :9092
 	egressServer := &http.Server{
-		Addr:    "127.0.0.1:9092",
+		Addr:    net.JoinHostPort(privateBindHost, "9092"),
 		Handler: &egressProxy{},
 	}
 
@@ -756,7 +767,7 @@ func main() {
 
 	// FR-18: Git SSH proxy on :9091
 	gitHostAddr := fmt.Sprintf("%s:%s", remote.host, remote.port)
-	if err := startGitProxy(ctx, gitHostAddr, remote.repoPath); err != nil {
+	if err := startGitProxy(ctx, gitHostAddr, remote.repoPath, privateBindHost); err != nil {
 		log.Fatalf("git proxy error: %v", err)
 	}
 
