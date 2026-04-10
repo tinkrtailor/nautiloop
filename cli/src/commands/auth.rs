@@ -1,6 +1,18 @@
 use anyhow::Result;
+use serde_json::Value;
 
 use crate::client::NemoClient;
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct CanonicalCodexOauthBundle {
+    #[serde(rename = "type")]
+    bundle_type: String,
+    access: String,
+    refresh: String,
+    expires: i64,
+    #[serde(rename = "accountId", skip_serializing_if = "Option::is_none")]
+    account_id: Option<String>,
+}
 
 /// Push local model credentials to the cluster.
 ///
@@ -56,11 +68,13 @@ pub async fn run(
                     .unwrap_or_else(|| candidates[0].clone())
             }
             "openai" => {
-                // OpenCode / OpenAI credential paths (checked in priority order)
+                // OpenCode / Codex / OpenAI credential paths (checked in priority order)
                 let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
                 let config_dir =
                     std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{home}/.config"));
                 let candidates = [
+                    format!("{home}/.local/share/opencode/auth.json"), // opencode ChatGPT OAuth
+                    format!("{home}/.codex/auth.json"),                // codex CLI file cache
                     format!("{config_dir}/opencode/credentials.json"), // opencode reviewer auth
                     format!("{config_dir}/openai/credentials.json"),   // direct OpenAI
                 ];
@@ -123,12 +137,18 @@ pub async fn run(
             }
         }
 
+        let normalized_content = if *provider == "openai" {
+            normalize_openai_credential(&content)
+        } else {
+            Ok(content.trim().to_string())
+        }?;
+
         // Register credentials with the control plane
         match client
             .register_credentials(
                 engineer,
                 provider,
-                &content,
+                &normalized_content,
                 if name.is_empty() { None } else { Some(name) },
                 if email.is_empty() { None } else { Some(email) },
             )
@@ -166,4 +186,107 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+fn normalize_openai_credential(content: &str) -> Result<String> {
+    let trimmed = content.trim();
+    let parsed = match serde_json::from_str::<Value>(trimmed) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(trimmed.to_string()),
+    };
+
+    if let Some(bundle) = extract_codex_oauth_bundle(&parsed) {
+        return Ok(serde_json::to_string(&bundle)?);
+    }
+
+    if let Some(api_key) = extract_api_key(&parsed) {
+        return Ok(api_key);
+    }
+
+    Ok(trimmed.to_string())
+}
+
+fn extract_codex_oauth_bundle(value: &Value) -> Option<CanonicalCodexOauthBundle> {
+    for candidate in [
+        Some(value),
+        value.get("openai"),
+        value.get("chatgptAuthTokens"),
+        value.get("chatgpt_auth_tokens"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let access = candidate
+            .get("access")
+            .or_else(|| candidate.get("access_token"))
+            .or_else(|| candidate.get("accessToken"))
+            .and_then(Value::as_str);
+        let refresh = candidate
+            .get("refresh")
+            .or_else(|| candidate.get("refresh_token"))
+            .or_else(|| candidate.get("refreshToken"))
+            .and_then(Value::as_str);
+        let (Some(access), Some(refresh)) = (access, refresh) else {
+            continue;
+        };
+        let expires = candidate
+            .get("expires")
+            .or_else(|| candidate.get("expires_at"))
+            .or_else(|| candidate.get("expiresAt"))
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+        let account_id = candidate
+            .get("accountId")
+            .or_else(|| candidate.get("account_id"))
+            .or_else(|| candidate.get("chatgpt_account_id"))
+            .or_else(|| candidate.get("chatgptAccountId"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+
+        return Some(CanonicalCodexOauthBundle {
+            bundle_type: "oauth".to_string(),
+            access: access.to_string(),
+            refresh: refresh.to_string(),
+            expires,
+            account_id,
+        });
+    }
+
+    None
+}
+
+fn extract_api_key(value: &Value) -> Option<String> {
+    let candidate = value.get("openai").unwrap_or(value);
+    candidate
+        .get("api_key")
+        .or_else(|| candidate.get("key"))
+        .or_else(|| candidate.get("apiKey"))
+        .or_else(|| candidate.get("OPENAI_API_KEY"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_openai_credential_extracts_opencode_oauth_bundle() {
+        let normalized = normalize_openai_credential(
+            r#"{"openai":{"type":"oauth","access":"access-token","refresh":"refresh-token","expires":1776698155357,"accountId":"acct-123"},"moonshotai":{"api_key":"ignore-me"}}"#,
+        )
+        .expect("normalize");
+
+        assert_eq!(
+            normalized,
+            r#"{"type":"oauth","access":"access-token","refresh":"refresh-token","expires":1776698155357,"accountId":"acct-123"}"#
+        );
+    }
+
+    #[test]
+    fn normalize_openai_credential_extracts_api_key_from_json() {
+        let normalized =
+            normalize_openai_credential(r#"{"api_key":"sk-test-key"}"#).expect("normalize");
+        assert_eq!(normalized, "sk-test-key");
+    }
 }
