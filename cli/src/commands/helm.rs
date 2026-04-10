@@ -1,0 +1,869 @@
+use std::collections::VecDeque;
+use std::io::{self, Stdout};
+use std::time::Duration;
+
+use anyhow::Result;
+use crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use futures::StreamExt;
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use tokio::sync::{mpsc, watch};
+
+use crate::api_types::LoopSummary;
+use crate::client::NemoClient;
+use crate::commands::status;
+
+const BG: Color = Color::Rgb(15, 15, 14);
+const SURFACE: Color = Color::Rgb(26, 25, 24);
+const BORDER: Color = Color::Rgb(46, 45, 43);
+const TEXT: Color = Color::Rgb(232, 230, 227);
+const MUTED: Color = Color::Rgb(138, 135, 132);
+const TEAL: Color = Color::Rgb(27, 107, 90);
+const AMBER: Color = Color::Rgb(232, 168, 56);
+const GREEN: Color = Color::Rgb(45, 122, 79);
+const RED: Color = Color::Rgb(196, 57, 45);
+const BLUE: Color = Color::Rgb(59, 123, 192);
+const MAX_LOG_LINES: usize = 500;
+
+#[derive(Debug)]
+enum AppEvent {
+    Input(KeyEvent),
+    Resize,
+    Status(Vec<LoopSummary>),
+    StatusError(String),
+    LogLine(uuid::Uuid, String),
+    LogStatus(uuid::Uuid, String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppAction {
+    None,
+    Quit,
+    SelectionChanged,
+    ReconnectLogs,
+}
+
+#[derive(Debug)]
+struct App {
+    loops: Vec<LoopSummary>,
+    list_state: ListState,
+    selected_loop_id: Option<uuid::Uuid>,
+    logs: VecDeque<String>,
+    status_line: String,
+    log_status: String,
+    team_view: bool,
+}
+
+impl App {
+    fn new(team_view: bool) -> Self {
+        Self {
+            loops: Vec::new(),
+            list_state: ListState::default(),
+            selected_loop_id: None,
+            logs: VecDeque::new(),
+            status_line: "Loading active loops...".to_string(),
+            log_status: "Select a loop to tail persisted logs".to_string(),
+            team_view,
+        }
+    }
+
+    fn selected_loop(&self) -> Option<&LoopSummary> {
+        self.selected_loop_id.and_then(|loop_id| {
+            self.loops
+                .iter()
+                .find(|loop_item| loop_item.loop_id == loop_id)
+        })
+    }
+
+    fn set_loops(&mut self, mut loops: Vec<LoopSummary>) {
+        loops.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        self.loops = loops;
+
+        if self.loops.is_empty() {
+            self.selected_loop_id = None;
+            self.list_state.select(None);
+            self.status_line = if self.team_view {
+                "No active loops across the team".to_string()
+            } else {
+                "No active loops for this engineer".to_string()
+            };
+            return;
+        }
+
+        if self.selected_loop_id.is_none_or(|selected| {
+            self.loops
+                .iter()
+                .all(|loop_item| loop_item.loop_id != selected)
+        }) {
+            self.selected_loop_id = Some(self.loops[0].loop_id);
+        }
+
+        if let Some(selected_loop_id) = self.selected_loop_id {
+            let selected_index = self
+                .loops
+                .iter()
+                .position(|loop_item| loop_item.loop_id == selected_loop_id)
+                .unwrap_or(0);
+            self.list_state.select(Some(selected_index));
+            self.status_line = format!(
+                "{} active loop{}",
+                self.loops.len(),
+                if self.loops.len() == 1 { "" } else { "s" }
+            );
+        }
+    }
+
+    fn move_selection(&mut self, delta: isize) -> bool {
+        if self.loops.is_empty() {
+            return false;
+        }
+
+        let current = self.list_state.selected().unwrap_or(0) as isize;
+        let next = (current + delta).clamp(0, self.loops.len().saturating_sub(1) as isize) as usize;
+        self.list_state.select(Some(next));
+        let next_loop_id = self.loops[next].loop_id;
+        let changed = self.selected_loop_id != Some(next_loop_id);
+        self.selected_loop_id = Some(next_loop_id);
+        changed
+    }
+
+    fn select_first(&mut self) -> bool {
+        if self.loops.is_empty() {
+            return false;
+        }
+        self.list_state.select(Some(0));
+        let loop_id = self.loops[0].loop_id;
+        let changed = self.selected_loop_id != Some(loop_id);
+        self.selected_loop_id = Some(loop_id);
+        changed
+    }
+
+    fn select_last(&mut self) -> bool {
+        if self.loops.is_empty() {
+            return false;
+        }
+        let last = self.loops.len() - 1;
+        self.list_state.select(Some(last));
+        let loop_id = self.loops[last].loop_id;
+        let changed = self.selected_loop_id != Some(loop_id);
+        self.selected_loop_id = Some(loop_id);
+        changed
+    }
+
+    fn reset_logs(&mut self) {
+        self.logs.clear();
+        self.log_status = self
+            .selected_loop()
+            .map(|loop_item| format!("Connecting log stream for {}", loop_item.loop_id))
+            .unwrap_or_else(|| "Select a loop to tail persisted logs".to_string());
+    }
+
+    fn push_log_line(&mut self, line: String) {
+        if self.logs.len() == MAX_LOG_LINES {
+            self.logs.pop_front();
+        }
+        self.logs.push_back(line);
+    }
+
+    fn handle_input(&mut self, key: KeyEvent) -> AppAction {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => AppAction::Quit,
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.move_selection(1) {
+                    AppAction::SelectionChanged
+                } else {
+                    AppAction::None
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.move_selection(-1) {
+                    AppAction::SelectionChanged
+                } else {
+                    AppAction::None
+                }
+            }
+            KeyCode::Char('g') => {
+                if self.select_first() {
+                    AppAction::SelectionChanged
+                } else {
+                    AppAction::None
+                }
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                if self.select_last() {
+                    AppAction::SelectionChanged
+                } else {
+                    AppAction::None
+                }
+            }
+            KeyCode::Home => {
+                if self.select_first() {
+                    AppAction::SelectionChanged
+                } else {
+                    AppAction::None
+                }
+            }
+            KeyCode::Char('r') => AppAction::ReconnectLogs,
+            _ => AppAction::None,
+        }
+    }
+}
+
+enum StreamOutcome {
+    HistoricalComplete,
+    Ended(String),
+    Disconnected,
+}
+
+pub async fn run(client: &NemoClient, engineer: &str, team: bool) -> Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
+
+    let result = run_app(&mut terminal, client.clone(), engineer.to_string(), team).await;
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    result
+}
+
+async fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    client: NemoClient,
+    engineer: String,
+    team: bool,
+) -> Result<()> {
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (selection_tx, selection_rx) = watch::channel(None::<uuid::Uuid>);
+
+    spawn_input_task(event_tx.clone());
+    spawn_status_task(client.clone(), engineer, team, event_tx.clone());
+    spawn_log_task(client, selection_rx, event_tx.clone());
+
+    let mut app = App::new(team);
+
+    loop {
+        terminal.draw(|frame| render(frame, &mut app))?;
+
+        let Some(event) = event_rx.recv().await else {
+            break;
+        };
+
+        let previous_selection = app.selected_loop_id;
+        match event {
+            AppEvent::Input(key) => match app.handle_input(key) {
+                AppAction::Quit => break,
+                AppAction::SelectionChanged | AppAction::ReconnectLogs => {
+                    app.reset_logs();
+                    let _ = selection_tx.send(app.selected_loop_id);
+                }
+                AppAction::None => {}
+            },
+            AppEvent::Resize => {}
+            AppEvent::Status(loops) => {
+                app.set_loops(loops);
+                if app.selected_loop_id != previous_selection {
+                    app.reset_logs();
+                    let _ = selection_tx.send(app.selected_loop_id);
+                }
+            }
+            AppEvent::StatusError(error) => {
+                app.status_line = format!("status refresh failed: {error}");
+            }
+            AppEvent::LogLine(loop_id, line) => {
+                if Some(loop_id) == app.selected_loop_id {
+                    app.push_log_line(line);
+                }
+            }
+            AppEvent::LogStatus(loop_id, status_line) => {
+                if Some(loop_id) == app.selected_loop_id {
+                    app.log_status = status_line;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn spawn_input_task(event_tx: mpsc::UnboundedSender<AppEvent>) {
+    tokio::task::spawn_blocking(move || {
+        loop {
+            match event::poll(Duration::from_millis(250)) {
+                Ok(true) => match event::read() {
+                    Ok(CrosstermEvent::Key(key)) if key.kind == KeyEventKind::Press => {
+                        if event_tx.send(AppEvent::Input(key)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(CrosstermEvent::Resize(_, _)) => {
+                        if event_tx.send(AppEvent::Resize).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        if event_tx
+                            .send(AppEvent::StatusError(
+                                "terminal input stream failed".to_string(),
+                            ))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                },
+                Ok(false) => {}
+                Err(_) => {
+                    if event_tx
+                        .send(AppEvent::StatusError(
+                            "terminal input polling failed".to_string(),
+                        ))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn spawn_status_task(
+    client: NemoClient,
+    engineer: String,
+    team: bool,
+    event_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        loop {
+            match status::fetch(&client, &engineer, team).await {
+                Ok(response) => {
+                    if event_tx.send(AppEvent::Status(response.loops)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    if event_tx
+                        .send(AppEvent::StatusError(error.to_string()))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
+}
+
+fn spawn_log_task(
+    client: NemoClient,
+    mut selection_rx: watch::Receiver<Option<uuid::Uuid>>,
+    event_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let mut current_task: Option<tokio::task::JoinHandle<()>> = None;
+
+        loop {
+            if let Some(task) = current_task.take() {
+                task.abort();
+            }
+
+            if let Some(loop_id) = *selection_rx.borrow() {
+                let client = client.clone();
+                let event_tx = event_tx.clone();
+                current_task = Some(tokio::spawn(async move {
+                    stream_logs_for_loop(client, loop_id, event_tx).await;
+                }));
+            }
+
+            if selection_rx.changed().await.is_err() {
+                if let Some(task) = current_task {
+                    task.abort();
+                }
+                break;
+            }
+        }
+    });
+}
+
+async fn stream_logs_for_loop(
+    client: NemoClient,
+    loop_id: uuid::Uuid,
+    event_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let mut emitted_lines = Vec::new();
+
+    loop {
+        let path = format!("/logs/{loop_id}");
+        let response = match client.get_stream(&path).await {
+            Ok(response) => response,
+            Err(error) => {
+                if event_tx
+                    .send(AppEvent::LogStatus(
+                        loop_id,
+                        format!("log stream failed: {error}"),
+                    ))
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let outcome = if content_type.contains("text/event-stream") {
+            if event_tx
+                .send(AppEvent::LogStatus(
+                    loop_id,
+                    "Streaming persisted loop logs".to_string(),
+                ))
+                .is_err()
+            {
+                return;
+            }
+            stream_sse_logs(response, loop_id, &event_tx, &mut emitted_lines).await
+        } else {
+            if event_tx
+                .send(AppEvent::LogStatus(
+                    loop_id,
+                    "Showing persisted historical logs".to_string(),
+                ))
+                .is_err()
+            {
+                return;
+            }
+            stream_historical_logs(response, loop_id, &event_tx, &mut emitted_lines).await
+        };
+
+        match outcome {
+            Ok(StreamOutcome::HistoricalComplete) => return,
+            Ok(StreamOutcome::Ended(state)) => {
+                let _ = event_tx.send(AppEvent::LogStatus(loop_id, format!("Loop ended: {state}")));
+                return;
+            }
+            Ok(StreamOutcome::Disconnected) => {
+                if event_tx
+                    .send(AppEvent::LogStatus(
+                        loop_id,
+                        "Log stream disconnected, reconnecting...".to_string(),
+                    ))
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(error) => {
+                if event_tx
+                    .send(AppEvent::LogStatus(
+                        loop_id,
+                        format!("log decode failed: {error}"),
+                    ))
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
+async fn stream_historical_logs(
+    response: reqwest::Response,
+    loop_id: uuid::Uuid,
+    event_tx: &mpsc::UnboundedSender<AppEvent>,
+    emitted_lines: &mut Vec<String>,
+) -> Result<StreamOutcome> {
+    let body = response.text().await?;
+    let logs: Vec<serde_json::Value> = serde_json::from_str(&body)?;
+
+    let mut replay_index = 0;
+    for log in logs {
+        let Some(formatted_line) = format_log_json(&log) else {
+            continue;
+        };
+        emit_or_skip_replayed_line(
+            loop_id,
+            formatted_line,
+            emitted_lines,
+            &mut replay_index,
+            event_tx,
+        )?;
+    }
+
+    Ok(StreamOutcome::HistoricalComplete)
+}
+
+async fn stream_sse_logs(
+    response: reqwest::Response,
+    loop_id: uuid::Uuid,
+    event_tx: &mpsc::UnboundedSender<AppEvent>,
+    emitted_lines: &mut Vec<String>,
+) -> Result<StreamOutcome> {
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+    let mut replay_index = 0;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+        while let Some(position) = buffer.find("\n\n") {
+            let event = buffer[..position].to_string();
+            buffer = buffer[position + 2..].to_string();
+
+            for line in event.lines() {
+                let Some(data) = line.strip_prefix("data: ") else {
+                    continue;
+                };
+                let parsed: serde_json::Value = match serde_json::from_str(data) {
+                    Ok(parsed) => parsed,
+                    Err(_) => continue,
+                };
+
+                if parsed.get("type").and_then(|value| value.as_str()) == Some("end") {
+                    let state = parsed
+                        .get("state")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("UNKNOWN")
+                        .to_string();
+                    return Ok(StreamOutcome::Ended(state));
+                }
+
+                let Some(formatted_line) = format_log_json(&parsed) else {
+                    continue;
+                };
+                emit_or_skip_replayed_line(
+                    loop_id,
+                    formatted_line,
+                    emitted_lines,
+                    &mut replay_index,
+                    event_tx,
+                )?;
+            }
+        }
+    }
+
+    Ok(StreamOutcome::Disconnected)
+}
+
+fn emit_or_skip_replayed_line(
+    loop_id: uuid::Uuid,
+    formatted_line: String,
+    emitted_lines: &mut Vec<String>,
+    replay_index: &mut usize,
+    event_tx: &mpsc::UnboundedSender<AppEvent>,
+) -> Result<()> {
+    if *replay_index < emitted_lines.len() && emitted_lines[*replay_index] == formatted_line {
+        *replay_index += 1;
+        return Ok(());
+    }
+
+    emitted_lines.push(formatted_line.clone());
+    event_tx
+        .send(AppEvent::LogLine(loop_id, formatted_line))
+        .map_err(|_| anyhow::anyhow!("helm event channel closed"))
+}
+
+fn format_log_json(value: &serde_json::Value) -> Option<String> {
+    let stage = value.get("stage")?.as_str()?;
+    let round = value.get("round")?.as_i64()?;
+    let line = value.get("line")?.as_str()?;
+    Some(format!("[{stage}/r{round}] {line}"))
+}
+
+fn render(frame: &mut ratatui::Frame<'_>, app: &mut App) {
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(frame.area());
+    let content = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
+        .split(root[0]);
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(9), Constraint::Min(0)])
+        .split(content[1]);
+
+    frame.render_widget(render_details(app), right[0]);
+    frame.render_widget(render_logs(app, right[1]), right[1]);
+    frame.render_stateful_widget(render_loop_selector(app), content[0], &mut app.list_state);
+    frame.render_widget(render_footer(app), root[1]);
+}
+
+fn render_loop_selector(app: &App) -> List<'static> {
+    let items = if app.loops.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "No active loops",
+            Style::default().fg(MUTED),
+        )))]
+    } else {
+        app.loops
+            .iter()
+            .map(|loop_item| {
+                let stage = loop_item.current_stage.as_deref().unwrap_or("-");
+                let line = format!(
+                    "{: <10} {: <18} {: <8} r{: <3} {}",
+                    loop_item.engineer,
+                    state_label(loop_item),
+                    stage,
+                    loop_item.round,
+                    loop_item.spec_path
+                );
+                ListItem::new(Line::from(Span::styled(line, Style::default().fg(TEXT))))
+            })
+            .collect()
+    };
+
+    List::new(items)
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    format!(" helm {} ", app.status_line),
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(BORDER).bg(SURFACE))
+                .style(Style::default().bg(SURFACE)),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(TEXT)
+                .bg(Color::Rgb(36, 35, 34))
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ")
+}
+
+fn render_details(app: &App) -> Paragraph<'static> {
+    let body = if let Some(loop_item) = app.selected_loop() {
+        Text::from(vec![
+            detail_line("engineer", &loop_item.engineer),
+            Line::from(vec![
+                Span::styled(
+                    format!("{:>8} ", "state"),
+                    Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    state_label(loop_item),
+                    Style::default()
+                        .fg(state_color(&loop_item.state))
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            detail_line("stage", loop_item.current_stage.as_deref().unwrap_or("-")),
+            detail_line("round", &loop_item.round.to_string()),
+            detail_line("job", loop_item.active_job_name.as_deref().unwrap_or("-")),
+            detail_line("branch", &loop_item.branch),
+            detail_line("loop", &loop_item.loop_id.to_string()),
+            detail_line("spec", &loop_item.spec_path),
+        ])
+    } else {
+        Text::from(vec![Line::from(Span::styled(
+            "Waiting for an active loop selection",
+            Style::default().fg(MUTED),
+        ))])
+    };
+
+    Paragraph::new(body)
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    " overview ",
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(BORDER).bg(SURFACE))
+                .style(Style::default().bg(SURFACE)),
+        )
+        .style(Style::default().fg(TEXT).bg(SURFACE))
+        .wrap(Wrap { trim: false })
+}
+
+fn render_logs(app: &App, area: Rect) -> Paragraph<'static> {
+    let lines: Vec<Line<'static>> = if app.logs.is_empty() {
+        vec![Line::from(Span::styled(
+            app.log_status.clone(),
+            Style::default().fg(MUTED),
+        ))]
+    } else {
+        app.logs
+            .iter()
+            .map(|line| Line::from(Span::styled(line.clone(), Style::default().fg(TEXT))))
+            .collect()
+    };
+
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let scroll = lines.len().saturating_sub(inner_height) as u16;
+
+    Paragraph::new(Text::from(lines))
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    " logs ",
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(BORDER).bg(SURFACE))
+                .style(Style::default().bg(BG)),
+        )
+        .style(Style::default().fg(TEXT).bg(BG))
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0))
+}
+
+fn render_footer(app: &App) -> Paragraph<'static> {
+    let mode = if app.team_view { "team" } else { "engineer" };
+    Paragraph::new(Line::from(vec![
+        Span::styled("mode ", Style::default().fg(MUTED)),
+        Span::styled(mode, Style::default().fg(BLUE).add_modifier(Modifier::BOLD)),
+        Span::raw("   "),
+        Span::styled("keys ", Style::default().fg(MUTED)),
+        Span::styled("q", Style::default().fg(TEAL).add_modifier(Modifier::BOLD)),
+        Span::styled(" quit  ", Style::default().fg(MUTED)),
+        Span::styled(
+            "j/k",
+            Style::default().fg(TEAL).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" move  ", Style::default().fg(MUTED)),
+        Span::styled(
+            "g/G",
+            Style::default().fg(TEAL).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" top/bottom  ", Style::default().fg(MUTED)),
+        Span::styled("r", Style::default().fg(AMBER).add_modifier(Modifier::BOLD)),
+        Span::styled(" reconnect logs", Style::default().fg(MUTED)),
+    ]))
+    .style(Style::default().fg(TEXT).bg(BG))
+}
+
+fn detail_line(label: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{label:>8} "),
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(value.to_string(), Style::default().fg(TEXT)),
+    ])
+}
+
+fn state_label(loop_item: &LoopSummary) -> String {
+    match &loop_item.sub_state {
+        Some(sub_state) => format!("{}/{}", loop_item.state, sub_state),
+        None => loop_item.state.clone(),
+    }
+}
+
+fn state_color(state: &str) -> Color {
+    if matches!(state, "CONVERGED" | "HARDENED" | "SHIPPED") {
+        GREEN
+    } else if matches!(state, "FAILED" | "CANCELLED") {
+        RED
+    } else if matches!(state, "PAUSED" | "AWAITING_REAUTH" | "AWAITING_APPROVAL") {
+        AMBER
+    } else {
+        TEAL
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn loop_summary(id: uuid::Uuid, engineer: &str, updated_at: &str) -> LoopSummary {
+        LoopSummary {
+            loop_id: id,
+            engineer: engineer.to_string(),
+            spec_path: "specs/test.md".to_string(),
+            branch: format!("agent/{engineer}/test"),
+            state: "IMPLEMENTING".to_string(),
+            sub_state: Some("RUNNING".to_string()),
+            round: 2,
+            current_stage: Some("implement".to_string()),
+            active_job_name: Some("job-1".to_string()),
+            created_at: updated_at.to_string(),
+            updated_at: updated_at.to_string(),
+        }
+    }
+
+    #[test]
+    fn replay_dedupe_skips_replayed_prefix() {
+        let loop_id = uuid::Uuid::new_v4();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut emitted_lines = vec!["[implement/r1] first".to_string()];
+        let mut replay_index = 0;
+
+        emit_or_skip_replayed_line(
+            loop_id,
+            "[implement/r1] first".to_string(),
+            &mut emitted_lines,
+            &mut replay_index,
+            &event_tx,
+        )
+        .unwrap();
+        emit_or_skip_replayed_line(
+            loop_id,
+            "[implement/r1] second".to_string(),
+            &mut emitted_lines,
+            &mut replay_index,
+            &event_tx,
+        )
+        .unwrap();
+
+        let received = event_rx.try_recv().unwrap();
+        match received {
+            AppEvent::LogLine(received_loop_id, line) => {
+                assert_eq!(received_loop_id, loop_id);
+                assert_eq!(line, "[implement/r1] second");
+            }
+            _ => panic!("expected log line event"),
+        }
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn set_loops_preserves_selected_loop_when_still_present() {
+        let first_id = uuid::Uuid::new_v4();
+        let second_id = uuid::Uuid::new_v4();
+        let mut app = App::new(false);
+        app.set_loops(vec![
+            loop_summary(first_id, "alice", "2026-04-10T10:00:00Z"),
+            loop_summary(second_id, "bob", "2026-04-10T09:00:00Z"),
+        ]);
+        app.selected_loop_id = Some(second_id);
+
+        app.set_loops(vec![
+            loop_summary(second_id, "bob", "2026-04-10T11:00:00Z"),
+            loop_summary(first_id, "alice", "2026-04-10T10:00:00Z"),
+        ]);
+
+        assert_eq!(app.selected_loop_id, Some(second_id));
+        assert_eq!(app.list_state.selected(), Some(0));
+    }
+}
