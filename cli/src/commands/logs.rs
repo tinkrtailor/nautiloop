@@ -3,6 +3,48 @@ use futures::StreamExt;
 
 use crate::client::NemoClient;
 
+/// One-shot dump of the active pod's container logs (#99).
+///
+/// Hits the /pod-logs/{id} endpoint which reads kubernetes pod logs
+/// directly, bypassing the Postgres log stream. Works mid-run and
+/// gives an operator the same information `kubectl logs -c agent`
+/// would, without requiring kubectl access.
+/// Result of `run_tail`: either real pod logs were printed, or an
+/// informational "no pod" banner was received (the caller may want
+/// to fall back to historical logs in that case).
+pub enum TailResult {
+    /// Real log output was printed.
+    Ok,
+    /// Server returned a benign "no pod yet" or similar info banner.
+    /// The caller should fall back to /logs/{id}.
+    NoPod,
+}
+
+pub async fn run_tail(
+    client: &NemoClient,
+    loop_id: &str,
+    tail_lines: u32,
+    container: &str,
+) -> Result<TailResult> {
+    let path = format!("/pod-logs/{loop_id}?tail={tail_lines}&container={container}");
+    let resp = client.get_stream(&path).await?;
+    let status = resp.status();
+    let text = resp.text().await?;
+    // Server returns 204 No Content for benign "no pod" states.
+    // 4xx/5xx are real errors. 200 = real log output.
+    if status == reqwest::StatusCode::NO_CONTENT {
+        return Ok(TailResult::NoPod);
+    }
+    if !status.is_success() {
+        anyhow::bail!("pod-logs returned {status}: {text}");
+    }
+    print!("{text}");
+    if !text.ends_with('\n') {
+        println!();
+    }
+    Ok(TailResult::Ok)
+}
+
 pub async fn run(
     client: &NemoClient,
     loop_id: &str,

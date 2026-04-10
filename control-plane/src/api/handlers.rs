@@ -267,6 +267,184 @@ pub async fn logs(
     )
 }
 
+/// GET /pod-logs/:id?tail=N&container=agent - Live pod logs for a running loop (#99).
+///
+/// Unlike `/logs/{id}`, this bypasses the Postgres logs table and reads the
+/// active pod's container logs directly from the kubernetes API. It's the
+/// fastest path to "what is the agent actually printing right now" without
+/// requiring kubectl access. Returns 200 with a plain-text body or 404 if
+/// the loop has no active pod (terminated, cancelled, between-stage).
+///
+/// Query params:
+/// - `tail`: max lines to return (default 500, max 10000)
+/// - `container`: container name to read from (default "agent"; "auth-sidecar"
+///   is the other interesting one for egress debugging)
+pub async fn pod_logs(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Result<axum::response::Response, NautiloopError> {
+    use axum::http::header;
+    use axum::response::IntoResponse;
+
+    let record = state
+        .store
+        .get_loop(id)
+        .await?
+        .ok_or(NautiloopError::LoopNotFound { id })?;
+
+    // Helper: build a 200 OK informational text body so the CLI
+    // doesn't treat the benign "pod not ready yet" race condition
+    // like an error. The control plane persists active_job_name
+    // before the pod exists, so nemo logs --tail can land here
+    // right after a dispatch and succeed a few seconds later. A
+    // 4xx here would trigger unnecessary alerting.
+    fn info_response(msg: String) -> axum::response::Response {
+        use axum::http::header;
+        use axum::response::IntoResponse;
+        // Custom header so the CLI can detect "info, no real logs"
+        // without guessing from body content (codex round 6 on #99).
+        (
+            axum::http::StatusCode::NO_CONTENT,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            msg,
+        )
+            .into_response()
+    }
+
+    // Terminal loops with no active pod: there's nothing to tail.
+    // Return an appropriate error so the CLI can fall back to the
+    // historical /logs/{id} endpoint. Only non-terminal loops with
+    // no active_job_name (between-stage gap, just-dispatched) get
+    // the benign 200 info_response.
+    let Some(job_name) = record.active_job_name.clone() else {
+        if record.state.is_terminal() {
+            return Err(NautiloopError::BadRequest(format!(
+                "loop {id} is {}: use `nemo logs {}` (without --tail) for historical logs",
+                record.state, id,
+            )));
+        }
+        return Ok(info_response(format!(
+            "# loop {id} is between stages (state={}), no active pod right now\n",
+            record.state,
+        )));
+    };
+
+    let tail_lines: i64 = query
+        .get("tail")
+        .and_then(|s| s.parse().ok())
+        .map(|n: i64| n.clamp(1, 10_000))
+        .unwrap_or(500);
+    let container = query
+        .get("container")
+        .cloned()
+        .unwrap_or_else(|| "agent".to_string());
+    if container != "agent" && container != "auth-sidecar" {
+        return Err(NautiloopError::BadRequest(format!(
+            "container must be 'agent' or 'auth-sidecar', got {container}"
+        )));
+    }
+
+    let kube_client = state.kube_client.as_ref().ok_or_else(|| {
+        NautiloopError::Internal("K8s client not available — pod logs disabled".to_string())
+    })?;
+    let namespace = &state.config.cluster.jobs_namespace;
+    let pods_api: kube::Api<k8s_openapi::api::core::v1::Pod> =
+        kube::Api::namespaced(kube_client.clone(), namespace);
+    let lp = kube::api::ListParams::default().labels(&format!("job-name={job_name}"));
+    let pod_list = pods_api.list(&lp).await.map_err(|e| {
+        NautiloopError::Internal(format!("Failed to list pods for {job_name}: {e}"))
+    })?;
+
+    if pod_list.items.is_empty() {
+        return Ok(info_response(format!(
+            "# no pod yet for job {job_name} (pre-creation race or TTL cleanup)\n"
+        )));
+    }
+
+    // Sort matching pods: Running > Pending > rest, newest first within
+    // each phase. After eviction/node loss a Job can have multiple pods
+    // and list order is not guaranteed, so without this sort we'd risk
+    // returning stale output from an older terminated pod. The sort key
+    // is (phase_rank, negated creation timestamp) so `first()` after
+    // sort is the best candidate.
+    let mut sorted_pods = pod_list.items.clone();
+    sorted_pods.sort_by(|a, b| {
+        let phase_rank = |p: &k8s_openapi::api::core::v1::Pod| -> u8 {
+            match p.status.as_ref().and_then(|s| s.phase.as_deref()) {
+                Some("Running") => 0,
+                Some("Pending") => 1,
+                _ => 2,
+            }
+        };
+        let ts = |p: &k8s_openapi::api::core::v1::Pod| -> i64 {
+            p.metadata
+                .creation_timestamp
+                .as_ref()
+                .map(|t| t.0.timestamp())
+                .unwrap_or(0)
+        };
+        phase_rank(a)
+            .cmp(&phase_rank(b))
+            .then_with(|| ts(b).cmp(&ts(a)))
+    });
+
+    let log_params = kube::api::LogParams {
+        container: Some(container),
+        tail_lines: Some(tail_lines),
+        ..Default::default()
+    };
+    let mut logs: Option<String> = None;
+    for pod in &sorted_pods {
+        if let Some(pod_name) = &pod.metadata.name {
+            match pods_api.logs(pod_name, &log_params).await {
+                Ok(l) => {
+                    logs = Some(l);
+                    break;
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        pod = %pod_name,
+                        error = %e,
+                        "Failed to read logs from pod (trying next)"
+                    );
+                }
+            }
+        }
+    }
+    let logs = match logs {
+        Some(l) => l,
+        None => {
+            // All pods' logs() calls failed. This is normal right
+            // after dispatch when the container is still creating.
+            // Check if any pod is Pending — if so, return the
+            // benign 200 hint instead of a 500.
+            let any_pending = pod_list.items.iter().any(|p| {
+                p.status
+                    .as_ref()
+                    .and_then(|s| s.phase.as_deref())
+                    .is_none_or(|ph| ph == "Pending")
+            });
+            if any_pending {
+                return Ok(info_response(format!(
+                    "# pod for job {job_name} is still initializing (container creating)\n"
+                )));
+            }
+            return Err(NautiloopError::Internal(format!(
+                "All {} matching pods failed to return logs for job {job_name}",
+                pod_list.items.len()
+            )));
+        }
+    };
+
+    Ok((
+        axum::http::StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        logs,
+    )
+        .into_response())
+}
+
 /// DELETE /cancel/:id - Cancel a running loop.
 pub async fn cancel(
     State(state): State<AppState>,

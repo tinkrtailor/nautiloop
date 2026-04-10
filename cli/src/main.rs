@@ -100,6 +100,19 @@ enum Commands {
         /// Filter by stage (implement/test/review)
         #[arg(long)]
         stage: Option<String>,
+
+        /// Dump live stdout from the active pod container instead of
+        /// the Postgres log stream. Works mid-run without kubectl.
+        #[arg(long)]
+        tail: bool,
+
+        /// Max lines to return with --tail (default 500, max 10000)
+        #[arg(long, default_value_t = 500)]
+        tail_lines: u32,
+
+        /// Container to read from with --tail ("agent" or "auth-sidecar")
+        #[arg(long, default_value = "agent")]
+        container: String,
     },
 
     /// Cancel a running loop
@@ -314,8 +327,48 @@ async fn main() -> anyhow::Result<()> {
             loop_id,
             round,
             stage,
+            tail,
+            tail_lines,
+            container,
         } => {
-            commands::logs::run(&http_client, &loop_id, round, stage).await?;
+            if tail {
+                // --tail reads raw pod container stdout, which has
+                // no round/stage structure to filter on. Fail loud
+                // instead of silently ignoring the flags.
+                if round.is_some() || stage.is_some() {
+                    anyhow::bail!(
+                        "--round / --stage are not supported with --tail (pod stdout is unstructured); \
+                         run without --tail for filtered historical logs"
+                    );
+                }
+                // If --tail fails because the loop is terminal or has
+                // no active pod, fall back to historical logs. Other
+                // errors (bad container name, control plane down, etc.)
+                // should surface directly to the operator.
+                match commands::logs::run_tail(&http_client, &loop_id, tail_lines, &container).await
+                {
+                    Ok(commands::logs::TailResult::Ok) => {}
+                    Ok(commands::logs::TailResult::NoPod) => {
+                        // Don't fall back to the SSE stream here — that
+                        // would block forever if the loop is paused or
+                        // awaiting approval/auth. Just inform and exit.
+                        eprintln!(
+                            "No active pod. The loop may be between stages, paused, or awaiting auth. Try again shortly or use `nemo logs {loop_id}` (without --tail) for historical logs."
+                        );
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("use `nemo logs") {
+                            eprintln!("--tail: {msg}; falling back to historical logs");
+                            commands::logs::run(&http_client, &loop_id, None, None).await?;
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                }
+            } else {
+                commands::logs::run(&http_client, &loop_id, round, stage).await?;
+            }
         }
         Commands::Cancel { loop_id } => {
             commands::cancel::run(&http_client, &loop_id).await?;
