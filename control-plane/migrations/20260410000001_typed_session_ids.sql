@@ -21,4 +21,8 @@ UPDATE loops SET
         ELSE NULL
     END;
 
-ALTER TABLE loops DROP COLUMN session_id;
+-- DO NOT drop session_id in this migration. During a rolling deploy,
+-- old pods still SELECT/INSERT/UPDATE against session_id and would
+-- fail with SQL errors. Drop it in a future migration after all
+-- replicas have been updated to the new code (expand/contract pattern).
+-- ALTER TABLE loops DROP COLUMN session_id;

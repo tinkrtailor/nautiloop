@@ -1661,10 +1661,24 @@ impl ConvergentLoopDriver {
     /// (audit, review) get the opencode session; claude stages (implement,
     /// revise) get the claude session. Callers set ctx.session_id after
     /// build_context using this helper.
+    ///
+    /// Session IDs are NOT forwarded across phase boundaries:
+    /// - audit ↔ revise (same harden phase): shared opencode + claude sessions
+    /// - audit → review, revise → implement: different phases, fresh sessions
+    /// A `review` or `implement` stage at the START of its phase must NOT
+    /// inherit a session from the harden phase that preceded it. The helper
+    /// uses `record.state` to determine the current phase and only returns
+    /// a session ID if the stage matches the phase.
     fn session_id_for_stage(record: &LoopRecord, stage: &str) -> Option<String> {
+        let in_harden_phase = matches!(record.state, LoopState::Hardening);
         match stage {
-            "audit" | "review" => record.opencode_session_id.clone(),
-            "implement" | "revise" => record.claude_session_id.clone(),
+            "audit" if in_harden_phase => record.opencode_session_id.clone(),
+            "revise" if in_harden_phase => record.claude_session_id.clone(),
+            "implement" if !in_harden_phase => record.claude_session_id.clone(),
+            "review" if !in_harden_phase => record.opencode_session_id.clone(),
+            // Cross-phase transitions (audit → implement, revise → review, etc.)
+            // start fresh sessions. This matches the pre-#100 behavior where the
+            // bash filter in agent-entry would drop the wrong-format ID.
             _ => None,
         }
     }
