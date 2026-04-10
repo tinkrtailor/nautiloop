@@ -341,7 +341,15 @@ async fn main() -> anyhow::Result<()> {
                          run without --tail for filtered historical logs"
                     );
                 }
-                commands::logs::run_tail(&http_client, &loop_id, tail_lines, &container).await?;
+                // If --tail fails (e.g. loop is terminal), fall back
+                // to the historical /logs/{id} stream so the user
+                // doesn't have to retype without --tail.
+                if let Err(e) =
+                    commands::logs::run_tail(&http_client, &loop_id, tail_lines, &container).await
+                {
+                    eprintln!("--tail: {e}; falling back to historical logs");
+                    commands::logs::run(&http_client, &loop_id, None, None).await?;
+                }
             } else {
                 commands::logs::run(&http_client, &loop_id, round, stage).await?;
             }

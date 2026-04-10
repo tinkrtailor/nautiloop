@@ -388,12 +388,30 @@ pub async fn pod_logs(
             }
         }
     }
-    let logs = logs.ok_or_else(|| {
-        NautiloopError::Internal(format!(
-            "All {} matching pods failed to return logs for job {job_name}",
-            pod_list.items.len()
-        ))
-    })?;
+    let logs = match logs {
+        Some(l) => l,
+        None => {
+            // All pods' logs() calls failed. This is normal right
+            // after dispatch when the container is still creating.
+            // Check if any pod is Pending — if so, return the
+            // benign 200 hint instead of a 500.
+            let any_pending = pod_list.items.iter().any(|p| {
+                p.status
+                    .as_ref()
+                    .and_then(|s| s.phase.as_deref())
+                    .is_none_or(|ph| ph == "Pending")
+            });
+            if any_pending {
+                return Ok(info_response(format!(
+                    "# pod for job {job_name} is still initializing (container creating)\n"
+                )));
+            }
+            return Err(NautiloopError::Internal(format!(
+                "All {} matching pods failed to return logs for job {job_name}",
+                pod_list.items.len()
+            )));
+        }
+    };
 
     Ok((
         axum::http::StatusCode::OK,
