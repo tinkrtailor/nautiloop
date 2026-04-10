@@ -4,6 +4,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 )
 
@@ -72,6 +73,21 @@ func TestParseCIDRPanic(t *testing.T) {
 		}
 	}()
 	parseCIDR("invalid")
+}
+
+func TestPrivateListenerBindHostDefaultsToLoopback(t *testing.T) {
+	t.Setenv(bindAllInterfacesEnv, "")
+	if got := privateListenerBindHost(); got != "127.0.0.1" {
+		t.Fatalf("privateListenerBindHost() = %q, want loopback", got)
+	}
+	_ = os.Unsetenv(bindAllInterfacesEnv)
+}
+
+func TestPrivateListenerBindHostUsesAllInterfacesWhenEnabled(t *testing.T) {
+	t.Setenv(bindAllInterfacesEnv, "true")
+	if got := privateListenerBindHost(); got != "0.0.0.0" {
+		t.Fatalf("privateListenerBindHost() = %q, want all interfaces", got)
+	}
 }
 
 // FR-22: /healthz must gate on the global `ready` flag, not just whether

@@ -152,7 +152,7 @@ enum Commands {
         #[arg(long)]
         claude: bool,
 
-        /// Push OpenAI credentials only
+        /// Push OpenAI credentials only (API key or local Codex/Opencode OAuth bundle)
         #[arg(long)]
         openai: bool,
 

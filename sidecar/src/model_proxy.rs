@@ -26,19 +26,27 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::graceful::GracefulShutdown;
 use rustls::ClientConfig;
+use serde::Deserialize;
 use thiserror::Error;
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{Mutex, watch};
 
 use crate::logging;
 use crate::ssrf_connector::SsrfConnector;
 
 const OPENAI_HOST: &str = "api.openai.com";
+const CHATGPT_CODEX_HOST: &str = "chatgpt.com";
 const ANTHROPIC_HOST: &str = "api.anthropic.com";
+const OPENAI_OAUTH_ISSUER: &str = "https://auth.openai.com";
+const OPENAI_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const CHATGPT_CODEX_RESPONSES_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 const OPENAI_CRED_PATH: &str = "/secrets/model-credentials/openai";
 const ANTHROPIC_CRED_PATH: &str = "/secrets/model-credentials/anthropic";
+const OPENAI_OAUTH_REFRESH_MARGIN_MS: i64 = 60_000;
 const FORBIDDEN_BODY: &[u8] =
     br#"{"error":"only /openai/* and /anthropic/* routes are supported"}"#;
+
+type SharedOpenAiOauthCache = Arc<Mutex<Option<CodexOauthCredential>>>;
 
 /// Errors produced by the server. These are surfaced to the caller in
 /// `main.rs`; per-request errors are turned into HTTP responses.
@@ -53,6 +61,65 @@ pub enum ModelProxyError {
 pub enum UpstreamKind {
     OpenAi,
     Anthropic,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenAiCredential {
+    ApiKey(String),
+    CodexOauth(CodexOauthCredential),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexOauthCredential {
+    pub access: String,
+    pub refresh: String,
+    pub expires_ms: i64,
+    pub account_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CodexOauthCredentialWire {
+    #[serde(default)]
+    #[allow(dead_code)]
+    r#type: Option<String>,
+    #[serde(default, alias = "access_token", alias = "accessToken")]
+    access: Option<String>,
+    #[serde(default, alias = "refresh_token", alias = "refreshToken")]
+    refresh: Option<String>,
+    #[serde(
+        default,
+        alias = "expires_at",
+        alias = "expiresAt",
+        alias = "expires_in"
+    )]
+    expires: Option<i64>,
+    #[serde(
+        default,
+        alias = "account_id",
+        alias = "accountId",
+        alias = "chatgpt_account_id",
+        alias = "chatgptAccountId"
+    )]
+    account_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexOauthRefreshResponse {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default, alias = "expires_at", alias = "expiresAt")]
+    expires: Option<i64>,
+    #[serde(default)]
+    expires_in: Option<i64>,
+    #[serde(
+        default,
+        alias = "account_id",
+        alias = "accountId",
+        alias = "chatgpt_account_id",
+        alias = "chatgptAccountId"
+    )]
+    account_id: Option<String>,
 }
 
 impl UpstreamKind {
@@ -109,9 +176,39 @@ pub fn route_target(path: &str) -> Option<RouteTarget> {
     None
 }
 
+fn is_codex_responses_path(path: &str) -> bool {
+    path.contains("/v1/responses") || path.contains("/chat/completions")
+}
+
+fn upstream_host(
+    target: &RouteTarget,
+    openai_credential: Option<&OpenAiCredential>,
+) -> &'static str {
+    if matches!(openai_credential, Some(OpenAiCredential::CodexOauth(_)))
+        && is_codex_responses_path(&target.upstream_path)
+    {
+        CHATGPT_CODEX_HOST
+    } else {
+        target.kind.host()
+    }
+}
+
 /// Build the upstream URI for a routed request, including the original
 /// query string.
-pub fn upstream_uri(target: &RouteTarget, query: Option<&str>) -> String {
+pub fn upstream_uri(
+    target: &RouteTarget,
+    query: Option<&str>,
+    openai_credential: Option<&OpenAiCredential>,
+) -> String {
+    if matches!(openai_credential, Some(OpenAiCredential::CodexOauth(_)))
+        && is_codex_responses_path(&target.upstream_path)
+    {
+        return match query {
+            Some(q) if !q.is_empty() => format!("{CHATGPT_CODEX_RESPONSES_ENDPOINT}?{q}"),
+            _ => CHATGPT_CODEX_RESPONSES_ENDPOINT.to_string(),
+        };
+    }
+
     let host = target.kind.host();
     match query {
         Some(q) if !q.is_empty() => format!("https://{host}{}?{q}", target.upstream_path),
@@ -152,6 +249,7 @@ pub async fn serve(
     let connector = SsrfConnector::new(tls_config);
     let client: UpstreamClient = Client::builder(TokioExecutor::new()).build(connector);
     let client = Arc::new(client);
+    let openai_oauth_cache: SharedOpenAiOauthCache = Arc::new(Mutex::new(None));
 
     let graceful = GracefulShutdown::new();
 
@@ -166,10 +264,16 @@ pub async fn serve(
             accept = listener.accept() => {
                 let (stream, _) = accept.map_err(ModelProxyError::Accept)?;
                 let client = Arc::clone(&client);
+                let openai_oauth_cache = Arc::clone(&openai_oauth_cache);
                 let io = TokioIo::new(stream);
                 let svc = service_fn(move |req: Request<Incoming>| {
                     let client = Arc::clone(&client);
-                    async move { Ok::<_, Infallible>(handle(req, client.as_ref()).await) }
+                    let openai_oauth_cache = Arc::clone(&openai_oauth_cache);
+                    async move {
+                        Ok::<_, Infallible>(
+                            handle(req, client.as_ref(), openai_oauth_cache.as_ref()).await,
+                        )
+                    }
                 });
                 // HTTP/1 only, matching Go parity. `http1::Builder` wires
                 // into GracefulShutdown via the impl in hyper-util.
@@ -196,6 +300,7 @@ pub async fn serve(
 async fn handle(
     req: Request<Incoming>,
     client: &UpstreamClient,
+    openai_oauth_cache: &Mutex<Option<CodexOauthCredential>>,
 ) -> Response<BoxBody<Bytes, hyper::Error>> {
     let path = req.uri().path().to_string();
     let query = req.uri().query().map(|s| s.to_string());
@@ -206,18 +311,46 @@ async fn handle(
         return forbidden_response();
     };
 
-    let cred = match read_credential(target.kind.credential_path()).await {
-        Ok(c) => c,
-        Err(e) => {
-            logging::error(&format!(
-                "failed to read credentials from {}: {e}",
-                target.kind.credential_path()
-            ));
-            return error_response(500, "credential read failed");
+    let openai_credential = if target.kind == UpstreamKind::OpenAi {
+        let credential = match read_openai_credential(target.kind.credential_path()).await {
+            Ok(credential) => credential,
+            Err(e) => {
+                logging::error(&format!(
+                    "failed to read credentials from {}: {e}",
+                    target.kind.credential_path()
+                ));
+                return error_response(500, "credential read failed");
+            }
+        };
+        let credential =
+            maybe_resolve_cached_oauth_credential(credential, openai_oauth_cache).await;
+        match ensure_fresh_oauth_credential(client, credential, openai_oauth_cache).await {
+            Ok(credential) => Some(credential),
+            Err(e) => {
+                logging::error(&format!("failed to refresh OpenAI OAuth credentials: {e}"));
+                return error_response(502, "openai oauth refresh failed");
+            }
         }
+    } else {
+        None
     };
 
-    let uri_string = upstream_uri(&target, query.as_deref());
+    let raw_credential = if target.kind == UpstreamKind::Anthropic {
+        match read_credential(target.kind.credential_path()).await {
+            Ok(credential) => Some(credential),
+            Err(e) => {
+                logging::error(&format!(
+                    "failed to read credentials from {}: {e}",
+                    target.kind.credential_path()
+                ));
+                return error_response(500, "credential read failed");
+            }
+        }
+    } else {
+        None
+    };
+
+    let uri_string = upstream_uri(&target, query.as_deref(), openai_credential.as_ref());
     let uri: hyper::Uri = match uri_string.parse() {
         Ok(u) => u,
         Err(_) => return error_response(500, "invalid upstream URI"),
@@ -245,8 +378,13 @@ async fn handle(
         // loopback bind (e.g. `127.0.0.1:9090`). Forwarding that verbatim
         // would poison upstream virtual-host routing and break TLS-SNI
         // audit expectations. Rewrite it to the upstream hostname.
-        rewrite_host_header(h, target.kind.host());
-        inject_auth_header(h, target.kind, &cred);
+        rewrite_host_header(h, upstream_host(&target, openai_credential.as_ref()));
+        inject_auth_header(
+            h,
+            target.kind,
+            openai_credential.as_ref(),
+            raw_credential.as_deref(),
+        );
     }
     let upstream_req = match builder.body(body) {
         Ok(r) => r,
@@ -290,6 +428,185 @@ pub async fn read_credential(path: &str) -> std::io::Result<String> {
     Ok(data.trim().to_string())
 }
 
+pub async fn read_openai_credential(path: &str) -> std::io::Result<OpenAiCredential> {
+    let data = read_credential(path).await?;
+    Ok(parse_openai_credential(&data))
+}
+
+fn parse_openai_credential(raw: &str) -> OpenAiCredential {
+    let trimmed = raw.trim();
+    let parsed_json = serde_json::from_str::<serde_json::Value>(trimmed).ok();
+
+    if let Some(value) = parsed_json.as_ref() {
+        if let Some(oauth) = parse_codex_oauth_credential_value(value) {
+            return OpenAiCredential::CodexOauth(oauth);
+        }
+        if let Some(api_key) = extract_api_key(value) {
+            return OpenAiCredential::ApiKey(api_key);
+        }
+    }
+
+    OpenAiCredential::ApiKey(trimmed.to_string())
+}
+
+fn parse_codex_oauth_credential_value(value: &serde_json::Value) -> Option<CodexOauthCredential> {
+    for candidate in [
+        Some(value),
+        value.get("openai"),
+        value.get("chatgptAuthTokens"),
+        value.get("chatgpt_auth_tokens"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let Ok(parsed) = serde_json::from_value::<CodexOauthCredentialWire>(candidate.clone())
+        else {
+            continue;
+        };
+        let (Some(access), Some(refresh)) = (parsed.access, parsed.refresh) else {
+            continue;
+        };
+        return Some(CodexOauthCredential {
+            access,
+            refresh,
+            expires_ms: normalize_expires_ms(parsed.expires),
+            account_id: parsed.account_id,
+        });
+    }
+    None
+}
+
+fn extract_api_key(value: &serde_json::Value) -> Option<String> {
+    let candidate = value.get("openai").unwrap_or(value);
+    candidate
+        .get("api_key")
+        .or_else(|| candidate.get("key"))
+        .or_else(|| candidate.get("apiKey"))
+        .or_else(|| candidate.get("OPENAI_API_KEY"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+fn normalize_expires_ms(expires: Option<i64>) -> i64 {
+    match expires {
+        Some(value) if value >= 10_000_000_000 => value,
+        Some(value) if value > 0 => value.saturating_mul(1000),
+        _ => 0,
+    }
+}
+
+fn oauth_needs_refresh(credential: &CodexOauthCredential) -> bool {
+    credential.expires_ms <= chrono::Utc::now().timestamp_millis() + OPENAI_OAUTH_REFRESH_MARGIN_MS
+}
+
+async fn maybe_resolve_cached_oauth_credential(
+    credential: OpenAiCredential,
+    openai_oauth_cache: &Mutex<Option<CodexOauthCredential>>,
+) -> OpenAiCredential {
+    let OpenAiCredential::CodexOauth(file_credential) = credential else {
+        return credential;
+    };
+
+    let cached = openai_oauth_cache.lock().await.clone();
+    let effective = match cached {
+        Some(cached_credential)
+            if cached_credential.account_id == file_credential.account_id
+                && cached_credential.expires_ms > file_credential.expires_ms =>
+        {
+            cached_credential
+        }
+        _ => file_credential,
+    };
+
+    OpenAiCredential::CodexOauth(effective)
+}
+
+async fn ensure_fresh_oauth_credential(
+    client: &UpstreamClient,
+    credential: OpenAiCredential,
+    openai_oauth_cache: &Mutex<Option<CodexOauthCredential>>,
+) -> Result<OpenAiCredential, String> {
+    let OpenAiCredential::CodexOauth(oauth) = credential else {
+        return Ok(credential);
+    };
+
+    if !oauth_needs_refresh(&oauth) {
+        return Ok(OpenAiCredential::CodexOauth(oauth));
+    }
+
+    let refreshed = refresh_codex_oauth_credential(client, &oauth).await?;
+    *openai_oauth_cache.lock().await = Some(refreshed.clone());
+    Ok(OpenAiCredential::CodexOauth(refreshed))
+}
+
+async fn refresh_codex_oauth_credential(
+    client: &UpstreamClient,
+    credential: &CodexOauthCredential,
+) -> Result<CodexOauthCredential, String> {
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "refresh_token")
+        .append_pair("refresh_token", &credential.refresh)
+        .append_pair("client_id", OPENAI_OAUTH_CLIENT_ID)
+        .finish();
+    let uri: hyper::Uri = format!("{OPENAI_OAUTH_ISSUER}/oauth/token")
+        .parse()
+        .map_err(|e| format!("invalid oauth token URI: {e}"))?;
+    let request = Request::builder()
+        .method(http::Method::POST)
+        .uri(uri)
+        .header(http::header::HOST, "auth.openai.com")
+        .header(
+            http::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .header(http::header::ACCEPT, "application/json")
+        .body(BoxBody::new(
+            Full::new(Bytes::from(body)).map_err(|never| match never {}),
+        ))
+        .map_err(|e| format!("failed to build oauth refresh request: {e}"))?;
+
+    let response = client
+        .request(request)
+        .await
+        .map_err(|e| format!("oauth token exchange transport failure: {e}"))?;
+    let status = response.status();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| format!("failed to read oauth refresh body: {e}"))?
+        .to_bytes();
+
+    if !status.is_success() {
+        let body = String::from_utf8_lossy(&body);
+        return Err(format!(
+            "oauth token exchange returned non-success status {status}: {body}"
+        ));
+    }
+
+    let parsed: CodexOauthRefreshResponse = serde_json::from_slice(&body)
+        .map_err(|e| format!("failed to parse oauth refresh response: {e}"))?;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let expires_ms = parsed
+        .expires
+        .map(|value| normalize_expires_ms(Some(value)))
+        .or_else(|| {
+            parsed
+                .expires_in
+                .map(|value| now_ms.saturating_add(value.saturating_mul(1000)))
+        })
+        .unwrap_or_else(|| now_ms.saturating_add(55 * 60 * 1000));
+
+    Ok(CodexOauthCredential {
+        access: parsed.access_token,
+        refresh: parsed
+            .refresh_token
+            .unwrap_or_else(|| credential.refresh.clone()),
+        expires_ms,
+        account_id: parsed.account_id.or_else(|| credential.account_id.clone()),
+    })
+}
+
 /// Rewrite the outgoing request's `Host` header to the upstream
 /// hostname. Exposed for unit testing. The inbound request's Host
 /// header is whatever the client sent to the sidecar (almost always
@@ -315,18 +632,39 @@ pub fn rewrite_host_header(headers: &mut hyper::HeaderMap, upstream_host: &str) 
 
 /// Pure function: inject the right auth header based on the target.
 /// Exposed for unit testing.
-pub fn inject_auth_header(headers: &mut hyper::HeaderMap, kind: UpstreamKind, credential: &str) {
+pub fn inject_auth_header(
+    headers: &mut hyper::HeaderMap,
+    kind: UpstreamKind,
+    openai_credential: Option<&OpenAiCredential>,
+    raw_credential: Option<&str>,
+) {
     match kind {
         UpstreamKind::OpenAi => {
             // Always overwrite — a client-supplied Authorization must
             // not reach upstream.
-            let value = format!("Bearer {credential}");
+            let Some(credential) = openai_credential else {
+                return;
+            };
+            let value = match credential {
+                OpenAiCredential::ApiKey(api_key) => format!("Bearer {api_key}"),
+                OpenAiCredential::CodexOauth(oauth) => format!("Bearer {}", oauth.refresh),
+            };
             if let Ok(v) = http::HeaderValue::from_str(&value) {
                 headers.remove(http::header::AUTHORIZATION);
                 headers.insert(http::header::AUTHORIZATION, v);
             }
+            headers.remove("chatgpt-account-id");
+            if let OpenAiCredential::CodexOauth(oauth) = credential
+                && let Some(account_id) = oauth.account_id.as_deref()
+                && let Ok(v) = http::HeaderValue::from_str(account_id)
+            {
+                headers.insert("chatgpt-account-id", v);
+            }
         }
         UpstreamKind::Anthropic => {
+            let Some(credential) = raw_credential else {
+                return;
+            };
             if let Ok(v) = http::HeaderValue::from_str(credential) {
                 headers.remove("x-api-key");
                 headers.insert("x-api-key", v);
@@ -428,14 +766,38 @@ mod tests {
     #[test]
     fn test_upstream_uri_preserves_query() {
         let rt = route_target("/openai/v1/models").expect("routed");
-        assert_eq!(upstream_uri(&rt, None), "https://api.openai.com/v1/models");
         assert_eq!(
-            upstream_uri(&rt, Some("limit=10")),
+            upstream_uri(&rt, None, None),
+            "https://api.openai.com/v1/models"
+        );
+        assert_eq!(
+            upstream_uri(&rt, Some("limit=10"), None),
             "https://api.openai.com/v1/models?limit=10"
         );
         assert_eq!(
-            upstream_uri(&rt, Some("")),
+            upstream_uri(&rt, Some(""), None),
             "https://api.openai.com/v1/models"
+        );
+    }
+
+    #[test]
+    fn test_upstream_uri_rewrites_codex_oauth_requests() {
+        let oauth = OpenAiCredential::CodexOauth(CodexOauthCredential {
+            access: "access-token".to_string(),
+            refresh: "refresh-token".to_string(),
+            expires_ms: 1,
+            account_id: Some("acct-123".to_string()),
+        });
+        let target = route_target("/openai/v1/responses").expect("routed");
+        assert_eq!(
+            upstream_uri(&target, None, Some(&oauth)),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+
+        let target = route_target("/openai/v1/chat/completions").expect("routed");
+        assert_eq!(
+            upstream_uri(&target, Some("stream=true"), Some(&oauth)),
+            "https://chatgpt.com/backend-api/codex/responses?stream=true"
         );
     }
 
@@ -448,7 +810,12 @@ mod tests {
             http::header::AUTHORIZATION,
             http::HeaderValue::from_static("Bearer client-forged"),
         );
-        inject_auth_header(&mut h, UpstreamKind::OpenAi, "secret-key");
+        inject_auth_header(
+            &mut h,
+            UpstreamKind::OpenAi,
+            Some(&OpenAiCredential::ApiKey("secret-key".to_string())),
+            None,
+        );
         assert_eq!(
             h.get(http::header::AUTHORIZATION)
                 .expect("auth header present")
@@ -462,7 +829,7 @@ mod tests {
     fn test_anthropic_x_api_key_overwrites_client_value() {
         let mut h = HeaderMap::new();
         h.insert("x-api-key", http::HeaderValue::from_static("client-forged"));
-        inject_auth_header(&mut h, UpstreamKind::Anthropic, "secret-key");
+        inject_auth_header(&mut h, UpstreamKind::Anthropic, None, Some("secret-key"));
         assert_eq!(
             h.get("x-api-key")
                 .expect("x-api-key present")
@@ -475,7 +842,7 @@ mod tests {
     #[test]
     fn test_anthropic_sets_default_version_when_missing() {
         let mut h = HeaderMap::new();
-        inject_auth_header(&mut h, UpstreamKind::Anthropic, "k");
+        inject_auth_header(&mut h, UpstreamKind::Anthropic, None, Some("k"));
         assert_eq!(
             h.get("anthropic-version")
                 .expect("version present")
@@ -492,7 +859,7 @@ mod tests {
             "anthropic-version",
             http::HeaderValue::from_static("2024-01-01"),
         );
-        inject_auth_header(&mut h, UpstreamKind::Anthropic, "k");
+        inject_auth_header(&mut h, UpstreamKind::Anthropic, None, Some("k"));
         assert_eq!(
             h.get("anthropic-version")
                 .expect("version present")
@@ -562,14 +929,19 @@ mod tests {
         let target = route_target("/openai/v1/chat/completions").expect("routed");
         let mut builder = Request::builder()
             .method(http::Method::POST)
-            .uri(upstream_uri(&target, None));
+            .uri(upstream_uri(&target, None, None));
         {
             let h = builder.headers_mut().expect("builder headers");
             for (k, v) in client_headers.iter() {
                 h.append(k.clone(), v.clone());
             }
-            rewrite_host_header(h, target.kind.host());
-            inject_auth_header(h, target.kind, "sk-server-key");
+            rewrite_host_header(h, upstream_host(&target, None));
+            inject_auth_header(
+                h,
+                target.kind,
+                Some(&OpenAiCredential::ApiKey("sk-server-key".to_string())),
+                None,
+            );
         }
         // Build with an empty streamed body so we can inspect the
         // parts without bringing in hyper::Incoming.
@@ -621,14 +993,14 @@ mod tests {
         let target = route_target("/anthropic/v1/messages").expect("routed");
         let mut builder = Request::builder()
             .method(http::Method::POST)
-            .uri(upstream_uri(&target, None));
+            .uri(upstream_uri(&target, None, None));
         {
             let h = builder.headers_mut().expect("builder headers");
             for (k, v) in client_headers.iter() {
                 h.append(k.clone(), v.clone());
             }
-            rewrite_host_header(h, target.kind.host());
-            inject_auth_header(h, target.kind, "anthropic-key");
+            rewrite_host_header(h, upstream_host(&target, None));
+            inject_auth_header(h, target.kind, None, Some("anthropic-key"));
         }
         let req = builder
             .body(BoxBody::new(
@@ -653,7 +1025,12 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("x-trace-id", http::HeaderValue::from_static("abc"));
         h.insert("user-agent", http::HeaderValue::from_static("nautiloop/1"));
-        inject_auth_header(&mut h, UpstreamKind::OpenAi, "k");
+        inject_auth_header(
+            &mut h,
+            UpstreamKind::OpenAi,
+            Some(&OpenAiCredential::ApiKey("k".to_string())),
+            None,
+        );
         assert_eq!(
             h.get("x-trace-id")
                 .expect("x-trace-id present")
@@ -667,6 +1044,36 @@ mod tests {
                 .to_str()
                 .expect("valid utf8"),
             "nautiloop/1"
+        );
+    }
+
+    #[test]
+    fn test_codex_oauth_injects_account_header() {
+        let mut h = HeaderMap::new();
+        inject_auth_header(
+            &mut h,
+            UpstreamKind::OpenAi,
+            Some(&OpenAiCredential::CodexOauth(CodexOauthCredential {
+                access: "access-token".to_string(),
+                refresh: "refresh-token".to_string(),
+                expires_ms: 1,
+                account_id: Some("acct-123".to_string()),
+            })),
+            None,
+        );
+        assert_eq!(
+            h.get(http::header::AUTHORIZATION)
+                .expect("auth header present")
+                .to_str()
+                .expect("utf8"),
+            "Bearer refresh-token"
+        );
+        assert_eq!(
+            h.get("chatgpt-account-id")
+                .expect("account header present")
+                .to_str()
+                .expect("utf8"),
+            "acct-123"
         );
     }
 
@@ -701,5 +1108,28 @@ mod tests {
             .await
             .expect("read");
         assert_eq!(c, "sk-abc");
+    }
+
+    #[tokio::test]
+    async fn test_read_openai_credential_parses_opencode_oauth_bundle() {
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(
+            tmp.path(),
+            r#"{"openai":{"type":"oauth","access":"access-token","refresh":"refresh-token","expires":1776698155357,"accountId":"acct-123"}}"#,
+        )
+        .expect("write");
+
+        let credential = read_openai_credential(tmp.path().to_str().expect("utf8"))
+            .await
+            .expect("read");
+        assert_eq!(
+            credential,
+            OpenAiCredential::CodexOauth(CodexOauthCredential {
+                access: "access-token".to_string(),
+                refresh: "refresh-token".to_string(),
+                expires_ms: 1776698155357,
+                account_id: Some("acct-123".to_string()),
+            })
+        );
     }
 }

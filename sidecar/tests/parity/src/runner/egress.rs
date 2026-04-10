@@ -144,8 +144,11 @@ async fn run_connect(proxy_port: u16, target: &str, payload_hex: &str) -> Result
     let response_head = String::from_utf8_lossy(&buf).to_string();
     let status = parse_status_code(&response_head).unwrap_or(0);
 
-    // If status indicates tunnel open, echo a few bytes.
-    let mut body = response_head.clone();
+    // CONNECT parity only cares that the tunnel opened and the bytes
+    // round-tripped. Ignore the exact reason phrase (`200 OK` vs
+    // `200 Connection Established`) because that is transport framing,
+    // not tunnel behavior.
+    let mut body = String::new();
     if status == 200 && !payload_hex.is_empty() {
         let bytes = hex_decode(payload_hex)?;
         stream.write_all(&bytes).await.context("tunnel write")?;
@@ -155,7 +158,7 @@ async fn run_connect(proxy_port: u16, target: &str, payload_hex: &str) -> Result
             .context("tunnel echo timeout")?
             .context("tunnel echo read")?;
         body = format!(
-            "{response_head}ECHO_BYTES={}",
+            "ECHO_BYTES={}",
             hex_encode(&echo[..bytes.len().min(n + bytes.len())])
         );
     }
@@ -216,7 +219,6 @@ async fn run_raw_proxy_request(proxy_port: u16, raw_request: &str) -> Result<Sid
         .write_all(raw_request.as_bytes())
         .await
         .context("write raw request")?;
-    stream.shutdown().await.ok(); // client is done writing
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 4096];
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -231,8 +233,13 @@ async fn run_raw_proxy_request(proxy_port: u16, raw_request: &str) -> Result<Sid
             Ok(Err(_)) | Err(_) => break,
         }
     }
-    let body = String::from_utf8_lossy(&buf).to_string();
-    let status = parse_status_code(&body).unwrap_or(0);
+    let body = if let Some(split) = find_crlf_crlf(&buf) {
+        String::from_utf8_lossy(&buf[split + 4..]).to_string()
+    } else {
+        String::from_utf8_lossy(&buf).to_string()
+    };
+    let _ = stream.shutdown().await;
+    let status = parse_status_code(&String::from_utf8_lossy(&buf)).unwrap_or(0);
     Ok(SideOutput::http(status, BTreeMap::new(), body))
 }
 

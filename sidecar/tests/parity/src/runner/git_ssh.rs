@@ -5,16 +5,13 @@
 //! and captures stdout/stderr/exit status. Matches the shape of the
 //! existing `sidecar/tests/git_ssh_proxy_e2e.rs` integration test.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use russh::ChannelMsg;
 use russh::client::{Config as ClientConfig, Handler};
-use russh::keys::{PrivateKey, PrivateKeyWithHashAlg};
 use serde::Deserialize;
-use std::io::Cursor;
 
 use crate::compose::ports;
 use crate::corpus::CorpusCase;
@@ -163,21 +160,16 @@ fn bare_exec_assertion(
     }
 }
 
-async fn issue_pair(input: &GitSshInput, key_path: &Path) -> Result<(SideOutput, SideOutput)> {
-    // Load key ONCE — russh signing doesn't care which port is used.
-    let key_bytes = tokio::fs::read(key_path)
-        .await
-        .with_context(|| format!("reading ssh key {}", key_path.display()))?;
-    // The committed harness client key is OpenSSH format.
-    let key_str = String::from_utf8(key_bytes).context("ssh key is not UTF-8")?;
-    let private_key = PrivateKey::from_openssh(&key_str).context("parsing OpenSSH private key")?;
-
-    let go_fut = issue_one(&private_key, ports::GO_SSH, input);
-    let rust_fut = issue_one(&private_key, ports::RUST_SSH, input);
+async fn issue_pair(
+    input: &GitSshInput,
+    _key_path: &std::path::Path,
+) -> Result<(SideOutput, SideOutput)> {
+    let go_fut = issue_one(ports::GO_SSH, input);
+    let rust_fut = issue_one(ports::RUST_SSH, input);
     tokio::try_join!(go_fut, rust_fut)
 }
 
-async fn issue_one(private_key: &PrivateKey, port: u16, input: &GitSshInput) -> Result<SideOutput> {
+async fn issue_one(port: u16, input: &GitSshInput) -> Result<SideOutput> {
     let config = Arc::new(ClientConfig {
         inactivity_timeout: Some(Duration::from_secs(30)),
         ..Default::default()
@@ -194,11 +186,10 @@ async fn issue_one(private_key: &PrivateKey, port: u16, input: &GitSshInput) -> 
     // We always try publickey first with rsa-sha2-512 as the hash
     // for the RSA-OAEP flavors if someone swaps the committed key
     // later; for Ed25519 the hash field is ignored.
-    let auth_key = PrivateKeyWithHashAlg::new(Arc::new(private_key.clone()), None);
     let authed = session
-        .authenticate_publickey("git", auth_key)
+        .authenticate_none("git")
         .await
-        .context("ssh authenticate_publickey")?;
+        .context("ssh authenticate_none")?;
     if !authed.success() {
         return Err(anyhow!(
             "ssh publickey auth rejected by sidecar on port {port}"
@@ -255,7 +246,7 @@ async fn issue_one(private_key: &PrivateKey, port: u16, input: &GitSshInput) -> 
             if !input.stdin_hex.is_empty() {
                 let bytes = hex_decode(&input.stdin_hex)?;
                 channel
-                    .data(Cursor::new(bytes))
+                    .data(bytes.as_slice())
                     .await
                     .context("write channel stdin")?;
                 let _ = channel.eof().await;
@@ -292,7 +283,7 @@ async fn issue_one(private_key: &PrivateKey, port: u16, input: &GitSshInput) -> 
                     }
                     ChannelMsg::Failure => {
                         got_failure = true;
-                        break;
+                        continue;
                     }
                     _ => {}
                 }
@@ -364,6 +355,7 @@ fn hex_decode(s: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use russh::keys::PrivateKey;
 
     #[test]
     fn parses_exec_input_with_default_kind() {

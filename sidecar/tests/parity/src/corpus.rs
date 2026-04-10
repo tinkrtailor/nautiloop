@@ -62,6 +62,8 @@ pub struct NormalizeConfig {
     pub body_strip_fields: Vec<String>,
     #[serde(default)]
     pub extra_header_strip: Vec<String>,
+    #[serde(default)]
+    pub ignore_http_body: bool,
 }
 
 /// Category-specific input descriptor. Kept as opaque `serde_json::Value`

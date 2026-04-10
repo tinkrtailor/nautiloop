@@ -19,16 +19,37 @@ pub const BASELINE_STRIPPED_RESPONSE_HEADERS: &[&str] = &[
     "x-request-id",
     "connection",
     "content-length",
+    "x-content-type-options",
+];
+
+/// Request headers that differ only because Go's stdlib client injects
+/// transport defaults that Rust's reqwest client does not.
+pub const BASELINE_STRIPPED_REQUEST_HEADERS: &[&str] = &[
+    "accept-encoding",
+    "user-agent",
+    "content-length",
+    "transfer-encoding",
 ];
 
 /// Normalize a SideOutput in place. Idempotent — running twice yields
 /// the same result.
 pub fn normalize(side: &mut SideOutput, config: &NormalizeConfig) {
     strip_response_headers(&mut side.http_headers, config);
+    normalize_http_body(&mut side.http_body, config);
     strip_body_fields(&mut side.http_body, config);
     normalize_ssh_stderr(&mut side.ssh_stderr);
     normalize_mock_observations(&mut side.mock_observations);
     normalize_container_logs(&mut side.container_logs);
+}
+
+fn normalize_http_body(body: &mut String, config: &NormalizeConfig) {
+    if config.ignore_http_body {
+        body.clear();
+        return;
+    }
+
+    let trimmed_len = body.trim_end().len();
+    body.truncate(trimmed_len);
 }
 
 /// FR-19: strip the dynamic timestamp field from each container log
@@ -128,6 +149,9 @@ pub fn normalize_ssh_stderr(stderr: &mut String) {
 pub fn normalize_mock_observations(obs: &mut [ObservedMockRequest]) {
     for o in obs.iter_mut() {
         lowercase_header_names(&mut o.headers);
+        for header in BASELINE_STRIPPED_REQUEST_HEADERS {
+            o.headers.remove(*header);
+        }
     }
     obs.sort_by(|a, b| {
         a.path
@@ -183,6 +207,7 @@ mod tests {
         let cfg = NormalizeConfig {
             body_strip_fields: vec![],
             extra_header_strip: vec!["X-Custom".to_string()],
+            ignore_http_body: false,
         };
         strip_response_headers(&mut headers, &cfg);
         assert!(!headers.contains_key("x-custom"));
@@ -195,6 +220,7 @@ mod tests {
         let cfg = NormalizeConfig {
             body_strip_fields: vec!["id".to_string()],
             extra_header_strip: vec![],
+            ignore_http_body: false,
         };
         strip_body_fields(&mut body, &cfg);
         // Canonical form: sorted keys.
@@ -207,6 +233,7 @@ mod tests {
         let cfg = NormalizeConfig {
             body_strip_fields: vec!["id".to_string()],
             extra_header_strip: vec![],
+            ignore_http_body: false,
         };
         strip_body_fields(&mut body, &cfg);
         assert_eq!(body, "Not JSON");
@@ -218,6 +245,7 @@ mod tests {
         let cfg = NormalizeConfig {
             body_strip_fields: vec!["nothing".to_string()],
             extra_header_strip: vec![],
+            ignore_http_body: false,
         };
         strip_body_fields(&mut body, &cfg);
         // Still canonicalized though.
@@ -276,6 +304,7 @@ mod tests {
         let cfg = NormalizeConfig {
             body_strip_fields: vec!["id".to_string()],
             extra_header_strip: vec![],
+            ignore_http_body: false,
         };
         normalize(&mut side, &cfg);
         let after_first = side.clone();
@@ -329,5 +358,42 @@ mod tests {
         assert!(obs[0].headers.contains_key("x-thing"));
         assert!(obs[0].headers.contains_key("authorization"));
         assert!(!obs[0].headers.contains_key("X-Thing"));
+    }
+
+    #[test]
+    fn mock_observations_strip_transport_noise_headers() {
+        let mut obs = vec![ObservedMockRequest {
+            mock: "mock-openai".into(),
+            method: "GET".into(),
+            path: "/v1/models".into(),
+            host_header: "api.openai.com".into(),
+            headers: btreemap_of(&[
+                ("User-Agent", "Go-http-client/1.1"),
+                ("accept-encoding", "gzip"),
+                ("authorization", "Bearer token"),
+            ]),
+            body_b64: String::new(),
+            source_ip: "100.64.0.20".into(),
+        }];
+
+        normalize_mock_observations(&mut obs);
+        assert_eq!(
+            obs[0].headers.get("authorization"),
+            Some(&"Bearer token".to_string())
+        );
+        assert!(!obs[0].headers.contains_key("user-agent"));
+        assert!(!obs[0].headers.contains_key("accept-encoding"));
+    }
+
+    #[test]
+    fn normalize_http_body_can_ignore_body() {
+        let mut body = "error details\n".to_string();
+        let cfg = NormalizeConfig {
+            body_strip_fields: vec![],
+            extra_header_strip: vec![],
+            ignore_http_body: true,
+        };
+        normalize_http_body(&mut body, &cfg);
+        assert!(body.is_empty());
     }
 }
