@@ -4,6 +4,25 @@ pub struct StatusResponse {
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct InspectResponse {
+    pub loop_id: uuid::Uuid,
+    pub engineer: String,
+    pub branch: String,
+    pub state: String,
+    pub rounds: Vec<RoundSummary>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct RoundSummary {
+    pub round: i32,
+    pub implement: Option<serde_json::Value>,
+    pub test: Option<serde_json::Value>,
+    pub review: Option<serde_json::Value>,
+    pub audit: Option<serde_json::Value>,
+    pub revise: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct LoopSummary {
     pub loop_id: uuid::Uuid,
     pub engineer: String,

@@ -17,9 +17,9 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use tokio::sync::{mpsc, watch};
 
-use crate::api_types::LoopSummary;
+use crate::api_types::{InspectResponse, LoopSummary, RoundSummary};
 use crate::client::NemoClient;
-use crate::commands::status;
+use crate::commands::{inspect, status};
 
 const BG: Color = Color::Rgb(15, 15, 14);
 const SURFACE: Color = Color::Rgb(26, 25, 24);
@@ -32,6 +32,7 @@ const GREEN: Color = Color::Rgb(45, 122, 79);
 const RED: Color = Color::Rgb(196, 57, 45);
 const BLUE: Color = Color::Rgb(59, 123, 192);
 const MAX_LOG_LINES: usize = 500;
+const POD_TAIL_LINES: u32 = 200;
 
 #[derive(Debug)]
 enum AppEvent {
@@ -41,6 +42,19 @@ enum AppEvent {
     StatusError(String),
     LogLine(uuid::Uuid, String),
     LogStatus(uuid::Uuid, String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogSource {
+    Persisted,
+    AgentPod,
+    SidecarPod,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LogSelection {
+    loop_id: uuid::Uuid,
+    source: LogSource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +69,7 @@ enum AppAction {
     None,
     Quit,
     SelectionChanged,
+    SourceChanged,
     ReconnectLogs,
     Trigger(LoopCommand),
 }
@@ -86,8 +101,11 @@ struct App {
     list_state: ListState,
     selected_loop_id: Option<uuid::Uuid>,
     logs: VecDeque<String>,
+    log_source: LogSource,
     status_line: String,
     log_status: String,
+    inspect_status: String,
+    inspect: Option<InspectResponse>,
     team_view: bool,
 }
 
@@ -98,8 +116,11 @@ impl App {
             list_state: ListState::default(),
             selected_loop_id: None,
             logs: VecDeque::new(),
+            log_source: LogSource::Persisted,
             status_line: "Loading active loops...".to_string(),
             log_status: "Select a loop to tail persisted logs".to_string(),
+            inspect_status: "Loading inspect data...".to_string(),
+            inspect: None,
             team_view,
         }
     }
@@ -112,6 +133,18 @@ impl App {
         })
     }
 
+    fn current_log_selection(&self) -> Option<LogSelection> {
+        self.selected_loop_id.map(|loop_id| LogSelection {
+            loop_id,
+            source: self.log_source,
+        })
+    }
+
+    fn selected_branch(&self) -> Option<String> {
+        self.selected_loop()
+            .map(|loop_item| loop_item.branch.clone())
+    }
+
     fn set_loops(&mut self, mut loops: Vec<LoopSummary>) {
         loops.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
         self.loops = loops;
@@ -119,6 +152,8 @@ impl App {
         if self.loops.is_empty() {
             self.selected_loop_id = None;
             self.list_state.select(None);
+            self.inspect = None;
+            self.inspect_status = "No selected loop".to_string();
             self.status_line = if self.team_view {
                 "No active loops across the team".to_string()
             } else {
@@ -189,10 +224,34 @@ impl App {
 
     fn reset_logs(&mut self) {
         self.logs.clear();
-        self.log_status = self
+        self.log_status = match self.selected_loop() {
+            Some(loop_item) => match self.log_source {
+                LogSource::Persisted => {
+                    format!("Connecting persisted logs for {}", loop_item.loop_id)
+                }
+                LogSource::AgentPod => format!("Polling agent pod logs for {}", loop_item.loop_id),
+                LogSource::SidecarPod => {
+                    format!("Polling auth-sidecar logs for {}", loop_item.loop_id)
+                }
+            },
+            None => "Select a loop to tail logs".to_string(),
+        };
+    }
+
+    fn reset_inspect(&mut self) {
+        self.inspect = None;
+        self.inspect_status = self
             .selected_loop()
-            .map(|loop_item| format!("Connecting log stream for {}", loop_item.loop_id))
-            .unwrap_or_else(|| "Select a loop to tail persisted logs".to_string());
+            .map(|loop_item| format!("Loading inspect data for {}", loop_item.branch))
+            .unwrap_or_else(|| "Select a loop to inspect".to_string());
+    }
+
+    fn cycle_log_source(&mut self) {
+        self.log_source = match self.log_source {
+            LogSource::Persisted => LogSource::AgentPod,
+            LogSource::AgentPod => LogSource::SidecarPod,
+            LogSource::SidecarPod => LogSource::Persisted,
+        };
     }
 
     fn push_log_line(&mut self, line: String) {
@@ -240,6 +299,10 @@ impl App {
                     AppAction::None
                 }
             }
+            KeyCode::Char('l') => {
+                self.cycle_log_source();
+                AppAction::SourceChanged
+            }
             KeyCode::Char('a') => AppAction::Trigger(LoopCommand::Approve),
             KeyCode::Char('u') => AppAction::Trigger(LoopCommand::Resume),
             KeyCode::Char('c') => AppAction::Trigger(LoopCommand::Cancel),
@@ -279,7 +342,7 @@ async fn run_app(
     team: bool,
 ) -> Result<()> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-    let (selection_tx, selection_rx) = watch::channel(None::<uuid::Uuid>);
+    let (selection_tx, selection_rx) = watch::channel(None::<LogSelection>);
 
     spawn_input_task(event_tx.clone());
     spawn_status_task(client.clone(), engineer.clone(), team, event_tx.clone());
@@ -298,9 +361,14 @@ async fn run_app(
         match event {
             AppEvent::Input(key) => match app.handle_input(key) {
                 AppAction::Quit => break,
-                AppAction::SelectionChanged | AppAction::ReconnectLogs => {
+                AppAction::SelectionChanged => {
                     app.reset_logs();
-                    let _ = selection_tx.send(app.selected_loop_id);
+                    app.reset_inspect();
+                    let _ = selection_tx.send(app.current_log_selection());
+                }
+                AppAction::ReconnectLogs | AppAction::SourceChanged => {
+                    app.reset_logs();
+                    let _ = selection_tx.send(app.current_log_selection());
                 }
                 AppAction::Trigger(command) => {
                     if let Some(loop_id) = app.selected_loop_id {
@@ -320,8 +388,10 @@ async fn run_app(
                                 app.set_loops(response.loops);
                                 if app.selected_loop_id != previous_selection {
                                     app.reset_logs();
-                                    let _ = selection_tx.send(app.selected_loop_id);
+                                    app.reset_inspect();
+                                    let _ = selection_tx.send(app.current_log_selection());
                                 }
+                                refresh_selected_inspect(&client, &mut app).await;
                             }
                             Err(error) => {
                                 app.status_line =
@@ -339,8 +409,10 @@ async fn run_app(
                 app.set_loops(loops);
                 if app.selected_loop_id != previous_selection {
                     app.reset_logs();
-                    let _ = selection_tx.send(app.selected_loop_id);
+                    app.reset_inspect();
+                    let _ = selection_tx.send(app.current_log_selection());
                 }
+                refresh_selected_inspect(&client, &mut app).await;
             }
             AppEvent::StatusError(error) => {
                 app.status_line = format!("status refresh failed: {error}");
@@ -367,6 +439,16 @@ impl LoopCommand {
             Self::Approve => "approve",
             Self::Resume => "resume",
             Self::Cancel => "cancel",
+        }
+    }
+}
+
+impl LogSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Persisted => "persisted",
+            Self::AgentPod => "agent",
+            Self::SidecarPod => "sidecar",
         }
     }
 }
@@ -420,6 +502,25 @@ async fn perform_loop_action(
                     response.loop_id, response.state
                 )
             })
+        }
+    }
+}
+
+async fn refresh_selected_inspect(client: &NemoClient, app: &mut App) {
+    let Some(branch) = app.selected_branch() else {
+        app.inspect = None;
+        app.inspect_status = "Select a loop to inspect".to_string();
+        return;
+    };
+
+    match inspect::fetch(client, &branch).await {
+        Ok(response) => {
+            app.inspect = Some(response);
+            app.inspect_status = format!("inspect synced for {branch}");
+        }
+        Err(error) => {
+            app.inspect = None;
+            app.inspect_status = format!("inspect refresh failed: {error}");
         }
     }
 }
@@ -498,7 +599,7 @@ fn spawn_status_task(
 
 fn spawn_log_task(
     client: NemoClient,
-    mut selection_rx: watch::Receiver<Option<uuid::Uuid>>,
+    mut selection_rx: watch::Receiver<Option<LogSelection>>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
@@ -509,11 +610,11 @@ fn spawn_log_task(
                 task.abort();
             }
 
-            if let Some(loop_id) = *selection_rx.borrow() {
+            if let Some(selection) = *selection_rx.borrow() {
                 let client = client.clone();
                 let event_tx = event_tx.clone();
                 current_task = Some(tokio::spawn(async move {
-                    stream_logs_for_loop(client, loop_id, event_tx).await;
+                    stream_logs_for_selection(client, selection, event_tx).await;
                 }));
             }
 
@@ -527,7 +628,25 @@ fn spawn_log_task(
     });
 }
 
-async fn stream_logs_for_loop(
+async fn stream_logs_for_selection(
+    client: NemoClient,
+    selection: LogSelection,
+    event_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    match selection.source {
+        LogSource::Persisted => {
+            stream_persisted_logs(client, selection.loop_id, event_tx).await;
+        }
+        LogSource::AgentPod => {
+            stream_pod_logs(client, selection.loop_id, "agent", event_tx).await;
+        }
+        LogSource::SidecarPod => {
+            stream_pod_logs(client, selection.loop_id, "auth-sidecar", event_tx).await;
+        }
+    }
+}
+
+async fn stream_persisted_logs(
     client: NemoClient,
     loop_id: uuid::Uuid,
     event_tx: mpsc::UnboundedSender<AppEvent>,
@@ -616,6 +735,99 @@ async fn stream_logs_for_loop(
             }
         }
     }
+}
+
+async fn stream_pod_logs(
+    client: NemoClient,
+    loop_id: uuid::Uuid,
+    container: &'static str,
+    event_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let mut previous_lines: Vec<String> = Vec::new();
+
+    loop {
+        match fetch_pod_log_snapshot(&client, loop_id, container).await {
+            Ok(PodLogSnapshot::Lines(lines)) => {
+                if event_tx
+                    .send(AppEvent::LogStatus(
+                        loop_id,
+                        format!("Polling {container} pod logs"),
+                    ))
+                    .is_err()
+                {
+                    return;
+                }
+
+                let overlap = overlapping_suffix_len(&previous_lines, &lines);
+                for line in lines.iter().skip(overlap) {
+                    if event_tx
+                        .send(AppEvent::LogLine(loop_id, line.clone()))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                previous_lines = lines;
+            }
+            Ok(PodLogSnapshot::Info(message)) => {
+                if event_tx
+                    .send(AppEvent::LogStatus(loop_id, message))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(error) => {
+                if event_tx
+                    .send(AppEvent::LogStatus(
+                        loop_id,
+                        format!("{container} pod log polling failed: {error}"),
+                    ))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+enum PodLogSnapshot {
+    Lines(Vec<String>),
+    Info(String),
+}
+
+async fn fetch_pod_log_snapshot(
+    client: &NemoClient,
+    loop_id: uuid::Uuid,
+    container: &str,
+) -> Result<PodLogSnapshot> {
+    let path = format!("/pod-logs/{loop_id}?tail={POD_TAIL_LINES}&container={container}");
+    let response = client.get_stream(&path).await?;
+    let status = response.status();
+    let body = response.text().await?;
+
+    if status == reqwest::StatusCode::NO_CONTENT {
+        let message = body.trim();
+        return Ok(PodLogSnapshot::Info(if message.is_empty() {
+            format!("No {container} pod logs available yet")
+        } else {
+            message.to_string()
+        }));
+    }
+
+    let lines = body.lines().map(ToOwned::to_owned).collect();
+    Ok(PodLogSnapshot::Lines(lines))
+}
+
+fn overlapping_suffix_len(previous: &[String], current: &[String]) -> usize {
+    let max_overlap = previous.len().min(current.len());
+    (0..=max_overlap)
+        .rev()
+        .find(|count| previous[previous.len().saturating_sub(*count)..] == current[..*count])
+        .unwrap_or(0)
 }
 
 async fn stream_historical_logs(
@@ -733,7 +945,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         .split(root[0]);
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(9), Constraint::Min(0)])
+        .constraints([Constraint::Length(17), Constraint::Min(0)])
         .split(content[1]);
 
     frame.render_widget(render_details(app), right[0]);
@@ -788,7 +1000,7 @@ fn render_loop_selector(app: &App) -> List<'static> {
 
 fn render_details(app: &App) -> Paragraph<'static> {
     let body = if let Some(loop_item) = app.selected_loop() {
-        Text::from(vec![
+        let mut lines = vec![
             detail_line("engineer", &loop_item.engineer),
             Line::from(vec![
                 Span::styled(
@@ -808,7 +1020,26 @@ fn render_details(app: &App) -> Paragraph<'static> {
             detail_line("branch", &loop_item.branch),
             detail_line("loop", &loop_item.loop_id.to_string()),
             detail_line("spec", &loop_item.spec_path),
-        ])
+            Line::from(Span::styled("", Style::default())),
+            Line::from(vec![
+                Span::styled(
+                    format!("{:>8} ", "inspect"),
+                    Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(app.inspect_status.clone(), Style::default().fg(MUTED)),
+            ]),
+        ];
+
+        if let Some(inspect) = &app.inspect
+            && let Some(round) = latest_round(inspect)
+        {
+            lines.push(detail_line("latest", &format!("round {}", round.round)));
+            for (label, summary) in round_stage_summaries(round) {
+                lines.push(detail_line(label, &summary));
+            }
+        }
+
+        Text::from(lines)
     } else {
         Text::from(vec![Line::from(Span::styled(
             "Waiting for an active loop selection",
@@ -820,7 +1051,7 @@ fn render_details(app: &App) -> Paragraph<'static> {
         .block(
             Block::default()
                 .title(Span::styled(
-                    " overview ",
+                    " overview + inspect ",
                     Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
                 ))
                 .borders(Borders::ALL)
@@ -851,7 +1082,7 @@ fn render_logs(app: &App, area: Rect) -> Paragraph<'static> {
         .block(
             Block::default()
                 .title(Span::styled(
-                    " logs ",
+                    format!(" logs {} ", app.log_source.label()),
                     Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
                 ))
                 .borders(Borders::ALL)
@@ -861,6 +1092,121 @@ fn render_logs(app: &App, area: Rect) -> Paragraph<'static> {
         .style(Style::default().fg(TEXT).bg(BG))
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0))
+}
+
+fn latest_round(inspect: &InspectResponse) -> Option<&RoundSummary> {
+    inspect.rounds.iter().max_by_key(|round| round.round)
+}
+
+fn round_stage_summaries(round: &RoundSummary) -> Vec<(&'static str, String)> {
+    let mut summaries = Vec::new();
+
+    if let Some(summary) = summarize_impl_stage(round.implement.as_ref()) {
+        summaries.push(("impl", summary));
+    }
+    if let Some(summary) = summarize_test_stage(round.test.as_ref()) {
+        summaries.push(("test", summary));
+    }
+    if let Some(summary) = summarize_verdict_stage(round.review.as_ref(), "review") {
+        summaries.push(("review", summary));
+    }
+    if let Some(summary) = summarize_verdict_stage(round.audit.as_ref(), "audit") {
+        summaries.push(("audit", summary));
+    }
+    if let Some(summary) = summarize_revise_stage(round.revise.as_ref()) {
+        summaries.push(("revise", summary));
+    }
+
+    if summaries.is_empty() {
+        summaries.push(("round", "No persisted stage outputs yet".to_string()));
+    }
+
+    summaries
+}
+
+fn summarize_impl_stage(value: Option<&serde_json::Value>) -> Option<String> {
+    let value = value?;
+    value
+        .get("new_sha")
+        .and_then(|sha| sha.as_str())
+        .map(|sha| format!("new sha {}", short_sha(sha)))
+}
+
+fn summarize_revise_stage(value: Option<&serde_json::Value>) -> Option<String> {
+    let value = value?;
+    if let Some(path) = value
+        .get("revised_spec_path")
+        .and_then(|path| path.as_str())
+    {
+        return Some(format!("revised {path}"));
+    }
+    value
+        .get("new_sha")
+        .and_then(|sha| sha.as_str())
+        .map(|sha| format!("new sha {}", short_sha(sha)))
+}
+
+fn summarize_test_stage(value: Option<&serde_json::Value>) -> Option<String> {
+    let value = value?;
+    let all_passed = value.get("all_passed").and_then(|flag| flag.as_bool())?;
+    let ci_status = value
+        .get("ci_status")
+        .and_then(|status| status.as_str())
+        .unwrap_or("unknown");
+    let failing_services = value
+        .get("services")
+        .and_then(|services| services.as_array())
+        .map(|services| {
+            services
+                .iter()
+                .filter(|service| {
+                    service.get("passed").and_then(|passed| passed.as_bool()) == Some(false)
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    Some(if all_passed {
+        format!("pass ({ci_status})")
+    } else {
+        format!(
+            "fail ({ci_status}, {failing_services} service{})",
+            if failing_services == 1 { "" } else { "s" }
+        )
+    })
+}
+
+fn summarize_verdict_stage(value: Option<&serde_json::Value>, kind: &str) -> Option<String> {
+    let value = value?;
+    let verdict = value.get("verdict").unwrap_or(value);
+    let clean = verdict.get("clean").and_then(|flag| flag.as_bool())?;
+    let issue_count = verdict
+        .get("issues")
+        .and_then(|issues| issues.as_array())
+        .map(|issues| issues.len())
+        .unwrap_or(0);
+    let summary = verdict
+        .get("summary")
+        .and_then(|summary| summary.as_str())
+        .unwrap_or("")
+        .trim();
+
+    Some(match (clean, summary.is_empty()) {
+        (true, true) => format!("clean {kind}"),
+        (true, false) => format!("clean, {summary}"),
+        (false, true) => format!(
+            "{issue_count} issue{}",
+            if issue_count == 1 { "" } else { "s" }
+        ),
+        (false, false) => format!(
+            "{issue_count} issue{}, {summary}",
+            if issue_count == 1 { "" } else { "s" }
+        ),
+    })
+}
+
+fn short_sha(sha: &str) -> &str {
+    let len = sha.len().min(8);
+    &sha[..len]
 }
 
 fn render_footer(app: &App) -> Paragraph<'static> {
@@ -882,6 +1228,8 @@ fn render_footer(app: &App) -> Paragraph<'static> {
             Style::default().fg(TEAL).add_modifier(Modifier::BOLD),
         ),
         Span::styled(" top/bottom  ", Style::default().fg(MUTED)),
+        Span::styled("l", Style::default().fg(BLUE).add_modifier(Modifier::BOLD)),
+        Span::styled(" log source  ", Style::default().fg(MUTED)),
         Span::styled("r", Style::default().fg(AMBER).add_modifier(Modifier::BOLD)),
         Span::styled(" reconnect logs  ", Style::default().fg(MUTED)),
         Span::styled(
@@ -1013,5 +1361,35 @@ mod tests {
             app.handle_input(KeyEvent::from(KeyCode::Char('c'))),
             AppAction::Trigger(LoopCommand::Cancel)
         );
+    }
+
+    #[test]
+    fn log_source_hotkey_cycles_sources() {
+        let mut app = App::new(false);
+
+        assert_eq!(app.log_source, LogSource::Persisted);
+        assert_eq!(
+            app.handle_input(KeyEvent::from(KeyCode::Char('l'))),
+            AppAction::SourceChanged
+        );
+        assert_eq!(app.log_source, LogSource::AgentPod);
+        assert_eq!(
+            app.handle_input(KeyEvent::from(KeyCode::Char('l'))),
+            AppAction::SourceChanged
+        );
+        assert_eq!(app.log_source, LogSource::SidecarPod);
+        assert_eq!(
+            app.handle_input(KeyEvent::from(KeyCode::Char('l'))),
+            AppAction::SourceChanged
+        );
+        assert_eq!(app.log_source, LogSource::Persisted);
+    }
+
+    #[test]
+    fn overlapping_suffix_len_matches_appended_pod_logs() {
+        let previous = vec!["a".to_string(), "b".to_string()];
+        let current = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+
+        assert_eq!(overlapping_suffix_len(&previous, &current), 2);
     }
 }
