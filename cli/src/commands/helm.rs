@@ -44,11 +44,40 @@ enum AppEvent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopCommand {
+    Approve,
+    Resume,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppAction {
     None,
     Quit,
     SelectionChanged,
     ReconnectLogs,
+    Trigger(LoopCommand),
+}
+
+#[derive(serde::Deserialize)]
+struct ApproveActionResponse {
+    loop_id: uuid::Uuid,
+    state: String,
+    approve_requested: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct ResumeActionResponse {
+    loop_id: uuid::Uuid,
+    state: String,
+    resume_requested: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct CancelActionResponse {
+    loop_id: uuid::Uuid,
+    state: String,
+    cancel_requested: bool,
 }
 
 #[derive(Debug)]
@@ -211,6 +240,9 @@ impl App {
                     AppAction::None
                 }
             }
+            KeyCode::Char('a') => AppAction::Trigger(LoopCommand::Approve),
+            KeyCode::Char('u') => AppAction::Trigger(LoopCommand::Resume),
+            KeyCode::Char('c') => AppAction::Trigger(LoopCommand::Cancel),
             KeyCode::Char('r') => AppAction::ReconnectLogs,
             _ => AppAction::None,
         }
@@ -250,8 +282,8 @@ async fn run_app(
     let (selection_tx, selection_rx) = watch::channel(None::<uuid::Uuid>);
 
     spawn_input_task(event_tx.clone());
-    spawn_status_task(client.clone(), engineer, team, event_tx.clone());
-    spawn_log_task(client, selection_rx, event_tx.clone());
+    spawn_status_task(client.clone(), engineer.clone(), team, event_tx.clone());
+    spawn_log_task(client.clone(), selection_rx, event_tx.clone());
 
     let mut app = App::new(team);
 
@@ -269,6 +301,36 @@ async fn run_app(
                 AppAction::SelectionChanged | AppAction::ReconnectLogs => {
                     app.reset_logs();
                     let _ = selection_tx.send(app.selected_loop_id);
+                }
+                AppAction::Trigger(command) => {
+                    if let Some(loop_id) = app.selected_loop_id {
+                        app.status_line = format!("sending {} for {loop_id}", command.verb());
+                        match perform_loop_action(&client, command, loop_id).await {
+                            Ok(message) => {
+                                app.status_line = message;
+                            }
+                            Err(error) => {
+                                app.status_line =
+                                    format!("{} failed for {loop_id}: {error}", command.verb());
+                            }
+                        }
+
+                        match status::fetch(&client, &engineer, team).await {
+                            Ok(response) => {
+                                app.set_loops(response.loops);
+                                if app.selected_loop_id != previous_selection {
+                                    app.reset_logs();
+                                    let _ = selection_tx.send(app.selected_loop_id);
+                                }
+                            }
+                            Err(error) => {
+                                app.status_line =
+                                    format!("{} sent, but refresh failed: {error}", command.verb());
+                            }
+                        }
+                    } else {
+                        app.status_line = format!("No loop selected for {}", command.verb());
+                    }
                 }
                 AppAction::None => {}
             },
@@ -297,6 +359,69 @@ async fn run_app(
     }
 
     Ok(())
+}
+
+impl LoopCommand {
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Resume => "resume",
+            Self::Cancel => "cancel",
+        }
+    }
+}
+
+async fn perform_loop_action(
+    client: &NemoClient,
+    command: LoopCommand,
+    loop_id: uuid::Uuid,
+) -> Result<String> {
+    match command {
+        LoopCommand::Approve => {
+            let response: ApproveActionResponse = client
+                .post(&format!("/approve/{loop_id}"), &serde_json::json!({}))
+                .await?;
+            Ok(if response.approve_requested {
+                format!("approved {} ({})", response.loop_id, response.state)
+            } else {
+                format!(
+                    "approve not applicable for {} ({})",
+                    response.loop_id, response.state
+                )
+            })
+        }
+        LoopCommand::Resume => {
+            let response: ResumeActionResponse = client
+                .post(&format!("/resume/{loop_id}"), &serde_json::json!({}))
+                .await?;
+            Ok(if response.resume_requested {
+                format!(
+                    "resume requested for {} ({})",
+                    response.loop_id, response.state
+                )
+            } else {
+                format!(
+                    "resume not applicable for {} ({})",
+                    response.loop_id, response.state
+                )
+            })
+        }
+        LoopCommand::Cancel => {
+            let response: CancelActionResponse =
+                client.delete(&format!("/cancel/{loop_id}")).await?;
+            Ok(if response.cancel_requested {
+                format!(
+                    "cancel requested for {} ({})",
+                    response.loop_id, response.state
+                )
+            } else {
+                format!(
+                    "cancel not applicable for {} ({})",
+                    response.loop_id, response.state
+                )
+            })
+        }
+    }
 }
 
 fn spawn_input_task(event_tx: mpsc::UnboundedSender<AppEvent>) {
@@ -758,7 +883,12 @@ fn render_footer(app: &App) -> Paragraph<'static> {
         ),
         Span::styled(" top/bottom  ", Style::default().fg(MUTED)),
         Span::styled("r", Style::default().fg(AMBER).add_modifier(Modifier::BOLD)),
-        Span::styled(" reconnect logs", Style::default().fg(MUTED)),
+        Span::styled(" reconnect logs  ", Style::default().fg(MUTED)),
+        Span::styled(
+            "a/u/c",
+            Style::default().fg(TEAL).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" approve/resume/cancel", Style::default().fg(MUTED)),
     ]))
     .style(Style::default().fg(TEXT).bg(BG))
 }
@@ -865,5 +995,23 @@ mod tests {
 
         assert_eq!(app.selected_loop_id, Some(second_id));
         assert_eq!(app.list_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn action_hotkeys_map_to_loop_commands() {
+        let mut app = App::new(false);
+
+        assert_eq!(
+            app.handle_input(KeyEvent::from(KeyCode::Char('a'))),
+            AppAction::Trigger(LoopCommand::Approve)
+        );
+        assert_eq!(
+            app.handle_input(KeyEvent::from(KeyCode::Char('u'))),
+            AppAction::Trigger(LoopCommand::Resume)
+        );
+        assert_eq!(
+            app.handle_input(KeyEvent::from(KeyCode::Char('c'))),
+            AppAction::Trigger(LoopCommand::Cancel)
+        );
     }
 }
