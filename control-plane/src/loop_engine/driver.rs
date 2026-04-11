@@ -12,7 +12,7 @@ use crate::types::verdict::{
     TestResultData,
 };
 use crate::types::{
-    LoopContext, LoopKind, LoopRecord, LoopState, RoundRecord, StageConfig, SubState,
+    LogEvent, LoopContext, LoopKind, LoopRecord, LoopState, RoundRecord, StageConfig, SubState,
 };
 
 /// The convergent loop driver. Processes one tick per loop, advancing its state machine.
@@ -183,6 +183,8 @@ impl ConvergentLoopDriver {
                             return Ok(LoopState::Paused);
                         }
 
+                        self.sync_current_stage_logs(record).await;
+
                         Ok(record.state)
                     }
                     JobStatus::Succeeded => {
@@ -230,6 +232,8 @@ impl ConvergentLoopDriver {
     async fn handle_job_completed(&self, record: &LoopRecord) -> Result<LoopState> {
         let mut updated = record.clone();
         updated.sub_state = Some(SubState::Completed);
+
+        self.sync_current_stage_logs(record).await;
 
         // Ingest job output: read verdict from git, update round record, set current_sha
         self.ingest_job_output(&mut updated).await?;
@@ -420,6 +424,118 @@ impl ConvergentLoopDriver {
                 );
             }
         }
+    }
+
+    async fn sync_current_stage_logs(&self, record: &LoopRecord) {
+        let Some(job_name) = record.active_job_name.as_deref() else {
+            return;
+        };
+
+        let Some((round, stage)) = self.current_log_context(record).await else {
+            return;
+        };
+
+        let logs = match self
+            .dispatcher
+            .get_job_logs(job_name, &self.config.cluster.jobs_namespace)
+            .await
+        {
+            Ok(logs) => logs,
+            Err(error) => {
+                tracing::warn!(
+                    loop_id = %record.id,
+                    job_name,
+                    error = %error,
+                    "Failed to sync live stage logs"
+                );
+                return;
+            }
+        };
+
+        if let Err(error) = self
+            .append_new_log_lines(record.id, round, &stage, &logs)
+            .await
+        {
+            tracing::warn!(
+                loop_id = %record.id,
+                round,
+                stage,
+                error = %error,
+                "Failed to persist live stage logs"
+            );
+        }
+    }
+
+    async fn current_log_context(&self, record: &LoopRecord) -> Option<(i32, String)> {
+        if record.round <= 0 {
+            return None;
+        }
+
+        let rounds = match self.store.get_rounds(record.id).await {
+            Ok(rounds) => rounds,
+            Err(error) => {
+                tracing::warn!(
+                    loop_id = %record.id,
+                    error = %error,
+                    "Failed to load rounds for log sync"
+                );
+                return None;
+            }
+        };
+
+        rounds
+            .iter()
+            .rfind(|round| round.round == record.round && round.completed_at.is_none())
+            .or_else(|| rounds.iter().rfind(|round| round.round == record.round))
+            .map(|round| (round.round, round.stage.clone()))
+    }
+
+    async fn append_new_log_lines(
+        &self,
+        loop_id: Uuid,
+        round: i32,
+        stage: &str,
+        logs: &str,
+    ) -> Result<()> {
+        let existing = self
+            .store
+            .get_logs(loop_id, Some(round), Some(stage))
+            .await?;
+        let existing_lines: Vec<String> = existing.into_iter().map(|event| event.line).collect();
+        let new_lines: Vec<String> = logs
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.is_empty() && !line.starts_with("NAUTILOOP_RESULT:"))
+            .map(ToOwned::to_owned)
+            .collect();
+
+        if new_lines.is_empty() {
+            return Ok(());
+        }
+
+        let max_overlap = existing_lines.len().min(new_lines.len());
+        let overlap = (0..=max_overlap)
+            .rev()
+            .find(|count| {
+                existing_lines[existing_lines.len().saturating_sub(*count)..] == new_lines[..*count]
+            })
+            .unwrap_or(0);
+
+        let base_timestamp = chrono::Utc::now();
+        for (offset, line) in new_lines.into_iter().skip(overlap).enumerate() {
+            self.store
+                .append_log(&LogEvent {
+                    id: Uuid::new_v4(),
+                    loop_id,
+                    round,
+                    stage: stage.to_string(),
+                    timestamp: base_timestamp + chrono::Duration::milliseconds(offset as i64),
+                    line,
+                })
+                .await?;
+        }
+
+        Ok(())
     }
 
     /// Evaluate harden stage output (audit or revise).
@@ -1184,6 +1300,8 @@ impl ConvergentLoopDriver {
 
     /// Handle cancel request: kill job and transition to CANCELLED.
     async fn handle_cancel(&self, record: &LoopRecord) -> Result<LoopState> {
+        self.sync_current_stage_logs(record).await;
+
         // Delete active job if any (log failure but proceed — orphan cleanup handles stragglers)
         if let Some(ref job_name) = record.active_job_name
             && let Err(e) = self
@@ -1213,6 +1331,8 @@ impl ConvergentLoopDriver {
     /// Handle auth expiry (exit code 42 detected by K8s pod inspection).
     async fn handle_auth_expired(&self, record: &LoopRecord, reason: &str) -> Result<LoopState> {
         let mut updated = record.clone();
+
+        self.sync_current_stage_logs(record).await;
 
         if let Some(ref job_name) = record.active_job_name
             && let Err(e) = self
@@ -1263,6 +1383,8 @@ impl ConvergentLoopDriver {
         resumable_on_exhaustion: bool,
     ) -> Result<LoopState> {
         let mut updated = record.clone();
+
+        self.sync_current_stage_logs(record).await;
 
         // Detect credential expiry (FR-10): transition to AWAITING_REAUTH
         if is_auth_error(reason) && record.state.is_active_stage() {
@@ -2892,6 +3014,91 @@ mod tests {
             Some("aabbccdd11223344".to_string()),
             "current_sha should be populated from branch tip"
         );
+    }
+
+    #[tokio::test]
+    async fn test_running_job_syncs_live_logs_without_duplicates() {
+        let store = Arc::new(MemoryStateStore::new());
+        let dispatcher = Arc::new(MockJobDispatcher::new());
+        let git = Arc::new(MockGitOperations::new());
+        let driver = ConvergentLoopDriver::new(
+            store.clone(),
+            dispatcher.clone(),
+            git.clone(),
+            NautiloopConfig::default(),
+        );
+
+        git.set_branch_sha("agent/alice/test-abc12345", "aabbccdd11223344")
+            .await;
+
+        let mut record = make_pending_loop(true);
+        record.state = LoopState::Implementing;
+        record.sub_state = Some(SubState::Dispatched);
+        record.round = 1;
+        record.active_job_name = Some("impl-job".to_string());
+        record.current_sha = Some("aabbccdd11223344".to_string());
+        store.create_loop(&record).await.unwrap();
+
+        store
+            .create_round(&RoundRecord {
+                id: Uuid::new_v4(),
+                loop_id: record.id,
+                round: 1,
+                stage: "implement".to_string(),
+                input: None,
+                output: None,
+                started_at: Some(chrono::Utc::now() - chrono::Duration::seconds(30)),
+                completed_at: None,
+                duration_secs: None,
+                job_name: Some("impl-job".to_string()),
+            })
+            .await
+            .unwrap();
+
+        let job = k8s_openapi::api::batch::v1::Job {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                name: Some("impl-job".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        dispatcher.create_job(&job).await.unwrap();
+        dispatcher
+            .set_job_status("impl-job", JobStatus::Running)
+            .await;
+
+        dispatcher
+            .set_job_logs("impl-job", "first line\nsecond line\n")
+            .await;
+        let new_state = driver.tick(record.id).await.unwrap();
+        assert_eq!(new_state, LoopState::Implementing);
+
+        let logs = store
+            .get_logs(record.id, Some(1), Some("implement"))
+            .await
+            .unwrap();
+        let lines: Vec<&str> = logs.iter().map(|event| event.line.as_str()).collect();
+        assert_eq!(lines, vec!["first line", "second line"]);
+
+        driver.tick(record.id).await.unwrap();
+        let logs = store
+            .get_logs(record.id, Some(1), Some("implement"))
+            .await
+            .unwrap();
+        let lines: Vec<&str> = logs.iter().map(|event| event.line.as_str()).collect();
+        assert_eq!(lines, vec!["first line", "second line"]);
+
+        dispatcher
+            .set_job_logs("impl-job", "first line\nsecond line\nthird line\n")
+            .await;
+        driver.tick(record.id).await.unwrap();
+
+        let logs = store
+            .get_logs(record.id, Some(1), Some("implement"))
+            .await
+            .unwrap();
+        let lines: Vec<&str> = logs.iter().map(|event| event.line.as_str()).collect();
+        assert_eq!(lines, vec!["first line", "second line", "third line"]);
     }
 
     #[tokio::test]

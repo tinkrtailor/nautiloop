@@ -209,22 +209,71 @@ pub async fn status(
         )
         .await?;
 
-    let summaries = loops
-        .into_iter()
-        .map(|l| LoopSummary {
-            loop_id: l.id,
-            engineer: l.engineer,
-            spec_path: l.spec_path,
-            branch: l.branch,
-            state: l.state,
-            sub_state: l.sub_state,
-            round: l.round,
-            created_at: l.created_at,
-            updated_at: l.updated_at,
-        })
-        .collect();
+    let mut summaries = Vec::with_capacity(loops.len());
+    for loop_record in loops {
+        let current_stage = current_stage_for_loop(&state, &loop_record).await?;
+        let active_job_name = loop_record.active_job_name.clone();
+        summaries.push(LoopSummary {
+            loop_id: loop_record.id,
+            engineer: loop_record.engineer,
+            spec_path: loop_record.spec_path,
+            branch: loop_record.branch,
+            state: loop_record.state,
+            sub_state: loop_record.sub_state,
+            round: loop_record.round,
+            current_stage,
+            active_job_name,
+            created_at: loop_record.created_at,
+            updated_at: loop_record.updated_at,
+        });
+    }
 
     Ok(Json(StatusResponse { loops: summaries }))
+}
+
+fn current_stage_source_state(record: &LoopRecord) -> Option<LoopState> {
+    if record.state.is_active_stage() {
+        return Some(record.state);
+    }
+
+    match record.state {
+        LoopState::Paused => record.paused_from_state,
+        LoopState::AwaitingReauth => record.reauth_from_state,
+        LoopState::Failed => record.failed_from_state,
+        _ => None,
+    }
+}
+
+async fn current_stage_for_loop(
+    state: &AppState,
+    record: &LoopRecord,
+) -> Result<Option<String>, NautiloopError> {
+    let Some(source_state) = current_stage_source_state(record) else {
+        return Ok(None);
+    };
+
+    let direct_stage = match source_state {
+        LoopState::Implementing => Some("implement"),
+        LoopState::Testing => Some("test"),
+        LoopState::Reviewing => Some("review"),
+        _ => None,
+    };
+    if let Some(stage) = direct_stage {
+        return Ok(Some(stage.to_string()));
+    }
+
+    if source_state != LoopState::Hardening {
+        return Ok(None);
+    }
+
+    let rounds = state.store.get_rounds(record.id).await?;
+    Ok(Some(
+        rounds
+            .iter()
+            .rfind(|round| round.round == record.round)
+            .map(|round| round.stage.clone())
+            .unwrap_or_else(|| "audit".to_string()),
+    ))
 }
 
 /// GET /logs/:id - Stream logs via SSE.
@@ -921,7 +970,7 @@ mod tests {
             current_sha: None,
             opencode_session_id: None,
             claude_session_id: None,
-            active_job_name: None,
+            active_job_name: Some("implement-job".to_string()),
             retry_count: 0,
             model_implementor: None,
             model_reviewer: None,
@@ -983,7 +1032,7 @@ mod tests {
             current_sha: None,
             opencode_session_id: None,
             claude_session_id: None,
-            active_job_name: None,
+            active_job_name: Some("implement-job".to_string()),
             retry_count: 0,
             model_implementor: None,
             model_reviewer: None,
@@ -1039,7 +1088,7 @@ mod tests {
             current_sha: None,
             opencode_session_id: None,
             claude_session_id: None,
-            active_job_name: None,
+            active_job_name: Some("implement-job".to_string()),
             retry_count: 0,
             model_implementor: None,
             model_reviewer: None,
@@ -1071,6 +1120,11 @@ mod tests {
         let resp: StatusResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(resp.loops.len(), 1);
         assert_eq!(resp.loops[0].engineer, "alice");
+        assert_eq!(resp.loops[0].current_stage.as_deref(), Some("implement"));
+        assert_eq!(
+            resp.loops[0].active_job_name.as_deref(),
+            Some("implement-job")
+        );
     }
 
     #[tokio::test]

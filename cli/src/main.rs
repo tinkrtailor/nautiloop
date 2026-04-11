@@ -1,3 +1,4 @@
+mod api_types;
 mod claude_creds;
 mod client;
 mod commands;
@@ -86,6 +87,13 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+    },
+
+    /// K9s-style loop overview with live logs
+    Helm {
+        /// Show all engineers' loops
+        #[arg(long)]
+        team: bool,
     },
 
     /// Stream logs for a loop
@@ -219,6 +227,7 @@ async fn main() -> anyhow::Result<()> {
         | Commands::Start { .. }
         | Commands::Ship { .. }
         | Commands::Auth { .. } => true,
+        Commands::Helm { team } => !team,
         Commands::Status { team, .. } => !team,
         _ => false,
     };
@@ -322,6 +331,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Status { team, json } => {
             commands::status::run(&http_client, &eng_config.engineer, team, json).await?;
+        }
+        Commands::Helm { team } => {
+            commands::helm::run(&http_client, &eng_config.engineer, team).await?;
         }
         Commands::Logs {
             loop_id,

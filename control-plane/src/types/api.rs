@@ -58,6 +58,10 @@ pub struct LoopSummary {
     pub state: LoopState,
     pub sub_state: Option<SubState>,
     pub round: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_job_name: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

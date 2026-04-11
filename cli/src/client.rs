@@ -3,6 +3,7 @@ use reqwest::Client;
 use serde::de::DeserializeOwned;
 
 /// HTTP client wrapper for communicating with the Nemo API server.
+#[derive(Clone)]
 pub struct NemoClient {
     client: Client,
     base_url: String,
