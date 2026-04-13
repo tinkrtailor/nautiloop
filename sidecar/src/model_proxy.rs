@@ -356,12 +356,25 @@ async fn handle(
         Err(_) => return error_response(500, "invalid upstream URI"),
     };
 
-    // Stream the inbound body directly to the upstream request without
-    // buffering. Converting `Incoming` into a `BoxBody` preserves
-    // streaming semantics — each frame flows through hyper's client
-    // transport as it arrives. FR-28 "no body size limits" is honoured
-    // by memory: bytes are never fully materialized at our layer.
-    let body = req.into_body().boxed();
+    // For POST /v1/responses we must buffer the body to inject the required
+    // `instructions` field when the caller (opencode) omits it. The Responses
+    // API rejects requests without `instructions` even when the value is empty.
+    // All other requests stream through without buffering (FR-28).
+    let body = if method == hyper::Method::POST && path.contains("/v1/responses") {
+        match req.into_body().collect().await {
+            Ok(collected) => {
+                let bytes = collected.to_bytes();
+                let patched = inject_instructions_if_missing(bytes);
+                Full::new(patched).map_err(|e| match e {}).boxed()
+            }
+            Err(e) => {
+                logging::error(&format!("failed to read request body: {e}"));
+                return error_response(500, "failed to read request body");
+            }
+        }
+    } else {
+        req.into_body().boxed()
+    };
 
     // Build the outgoing request.
     let mut builder = Request::builder().method(method).uri(uri);
@@ -714,6 +727,27 @@ fn static_error_response(
         Err(_) => Response::new(BoxBody::new(
             Full::new(Bytes::new()).map_err(|never| match never {}),
         )),
+    }
+}
+
+/// Inject `"instructions": ""` into a Responses API JSON body if the field is
+/// absent. The OpenAI Responses API requires the field; opencode passes the
+/// prompt as `input` and never sets it.  Returns the original bytes unchanged
+/// if the body is not valid JSON or already contains `instructions`.
+fn inject_instructions_if_missing(bytes: Bytes) -> Bytes {
+    let Ok(mut payload) = serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&bytes) else {
+        return bytes;
+    };
+    if payload.contains_key("instructions") {
+        return bytes;
+    }
+    payload.insert(
+        "instructions".to_string(),
+        serde_json::Value::String(String::new()),
+    );
+    match serde_json::to_vec(&payload) {
+        Ok(v) => Bytes::from(v),
+        Err(_) => bytes,
     }
 }
 
@@ -1075,6 +1109,32 @@ mod tests {
                 .expect("utf8"),
             "acct-123"
         );
+    }
+
+    // --- inject_instructions_if_missing ---
+
+    #[test]
+    fn test_inject_instructions_adds_field_when_absent() {
+        let input = br#"{"model":"gpt-5.4","input":"do a review"}"#;
+        let result = inject_instructions_if_missing(Bytes::from_static(input));
+        let out: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(out["instructions"], serde_json::Value::String(String::new()));
+        assert_eq!(out["model"], "gpt-5.4");
+    }
+
+    #[test]
+    fn test_inject_instructions_preserves_existing_value() {
+        let input = br#"{"model":"gpt-5.4","input":"review","instructions":"be precise"}"#;
+        let result = inject_instructions_if_missing(Bytes::from_static(input));
+        let out: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(out["instructions"], "be precise");
+    }
+
+    #[test]
+    fn test_inject_instructions_passthrough_non_json() {
+        let input = b"not json at all";
+        let result = inject_instructions_if_missing(Bytes::from_static(input));
+        assert_eq!(result.as_ref(), input.as_slice());
     }
 
     // --- read_credential ---
