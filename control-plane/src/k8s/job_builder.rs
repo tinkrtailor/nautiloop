@@ -81,8 +81,9 @@ pub fn build_job(ctx: &LoopContext, stage: &StageConfig, cfg: &JobBuildConfig) -
         &cfg.ssh_known_hosts_configmap,
     );
 
-    // FR-25b: Claude session volume for IMPLEMENT/REVISE stages
-    if is_implement_or_revise {
+    // FR-25b: Claude session volume for IMPLEMENT/REVISE/REVIEW/AUDIT stages
+    // (review/audit may also use claude CLI when model-review is a claude-* model)
+    if is_implement_or_revise || is_review_or_audit {
         let safe_engineer: String = ctx.engineer.to_lowercase().replace('_', "-");
         volumes.push(Volume {
             name: "claude-session".to_string(),
@@ -533,8 +534,8 @@ fn build_agent_mounts(
         },
     ];
 
-    // FR-25b: Mount Claude session directory for IMPLEMENT/REVISE stages
-    if is_implement_or_revise {
+    // FR-25b: Mount Claude session directory for IMPLEMENT/REVISE/REVIEW/AUDIT stages
+    if is_implement_or_revise || is_review_or_audit {
         mounts.push(VolumeMount {
             name: "claude-session".to_string(),
             mount_path: "/home/agent/.claude".to_string(),
@@ -1066,8 +1067,8 @@ mod tests {
     }
 
     #[test]
-    fn test_build_job_review_no_claude_session() {
-        // Claude session NOT mounted for review stage
+    fn test_build_job_review_has_claude_session() {
+        // Claude session IS mounted for review stage (review may use claude CLI)
         let ctx = test_ctx();
         let stage = StageConfig {
             name: "review".to_string(),
@@ -1078,7 +1079,7 @@ mod tests {
         let job = build_job(&ctx, &stage, &cfg);
         let agent = &job.spec.unwrap().template.spec.unwrap().containers[0];
         let mounts = agent.volume_mounts.as_ref().unwrap();
-        assert!(mounts.iter().all(|m| m.mount_path != "/home/agent/.claude"));
+        assert!(mounts.iter().any(|m| m.mount_path == "/home/agent/.claude"));
     }
 
     #[test]
