@@ -50,15 +50,6 @@ if [ -z "$NAUTILOOP_OPENAI_KEY" ] && [ -z "$NAUTILOOP_ANTHROPIC_KEY" ]; then
     echo "      Agent jobs will fail at model calls. Set at least one."
 fi
 
-# ── k3d registry ──────────────────────────────────────────────────────────────
-
-if k3d registry list 2>/dev/null | grep -q "nautiloop-registry"; then
-    echo "==> Registry k3d-nautiloop-registry already exists, skipping."
-else
-    echo "==> Creating k3d registry nautiloop-registry on port 5001..."
-    k3d registry create nautiloop-registry --port 5001
-fi
-
 # ── k3d cluster ───────────────────────────────────────────────────────────────
 
 if k3d cluster list 2>/dev/null | grep -q "nautiloop-dev"; then
@@ -66,7 +57,6 @@ if k3d cluster list 2>/dev/null | grep -q "nautiloop-dev"; then
 else
     echo "==> Creating k3d cluster nautiloop-dev..."
     k3d cluster create nautiloop-dev \
-        --registry-use k3d-nautiloop-registry:5001 \
         --k3s-arg "--disable=traefik@server:0" \
         --agents 0 \
         -p "18080:80@loadbalancer"
@@ -155,8 +145,8 @@ kubectl -n nautiloop-system create configmap nautiloop-config \
     --from-literal=nemo.toml="$(cat <<TOML
 [cluster]
 git_repo_url = "${NAUTILOOP_GIT_REPO_URL}"
-agent_image = "k3d-nautiloop-registry:5001/nautiloop-agent-base:dev"
-sidecar_image = "k3d-nautiloop-registry:5001/nautiloop-sidecar:dev"
+agent_image = "nautiloop-agent-base:dev"
+sidecar_image = "nautiloop-sidecar:dev"
 skip_iptables = true
 database_url = "postgres://nautiloop:${POSTGRES_PASSWORD}@nautiloop-postgres:5432/nautiloop"
 TOML
@@ -188,13 +178,9 @@ metadata:
   name: nautiloop-repo-init
   namespace: nautiloop-system
 spec:
-  backoffLimit: 3
+  backoffLimit: 0
   template:
     spec:
-      securityContext:
-        runAsUser: 1000
-        runAsGroup: 1000
-        fsGroup: 1000
       containers:
         - name: repo-init
           image: alpine/git:latest
@@ -207,16 +193,15 @@ spec:
               fi
               git -C /bare-repo remote remove origin 2>/dev/null || true
               git -C /bare-repo remote add origin "\${GIT_REPO_URL}"
-              mkdir -p "\${HOME}/.ssh"
-              cp /secrets/ssh-key/id_ed25519 "\${HOME}/.ssh/id_ed25519"
-              chmod 600 "\${HOME}/.ssh/id_ed25519"
-              cp /secrets/ssh-known-hosts/known_hosts "\${HOME}/.ssh/known_hosts"
+              cp /secrets/ssh-key/id_ed25519 /tmp/id_ed25519
+              chmod 600 /tmp/id_ed25519
               git -C /bare-repo fetch --all || echo "WARN: git fetch failed (deploy key may not be configured yet)"
+              echo "repo-init complete"
           env:
-            - name: HOME
-              value: /tmp
             - name: GIT_REPO_URL
               value: "${NAUTILOOP_GIT_REPO_URL}"
+            - name: GIT_SSH_COMMAND
+              value: "ssh -i /tmp/id_ed25519 -o UserKnownHostsFile=/secrets/ssh-known-hosts/known_hosts -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
           volumeMounts:
             - name: bare-repo
               mountPath: /bare-repo
@@ -237,7 +222,7 @@ spec:
         - name: ssh-known-hosts
           configMap:
             name: nautiloop-ssh-known-hosts
-      restartPolicy: OnFailure
+      restartPolicy: Never
 EOF
 
 kubectl -n nautiloop-system wait --for=condition=complete job/nautiloop-repo-init --timeout=300s || {
