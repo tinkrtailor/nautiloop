@@ -1,0 +1,48 @@
+{
+  "round": 1,
+  "source": "audit",
+  "issues": [
+    {
+      "severity": "critical",
+      "category": "correctness",
+      "file": "specs/sidecar-followups.md",
+      "description": "All three problems described in the spec are already implemented in the codebase. The AgentData/AgentControl split with unbounded control channel already exists (git_ssh_proxy.rs:55-97), the feature is already named `__test_utils` (Cargo.toml:115-116), the lint script already exists at sidecar/scripts/lint-no-test-utils-in-prod.sh, and all four e2e reject-path tests plus the drive_ssh_proxy_with_command helper already exist in git_ssh_proxy_e2e.rs (lines 810-988). Implementing this spec as-is would either no-op or cause conflicts with existing code.",
+      "suggestion": "Verify whether this work already landed (possibly in PR #63 itself or a subsequent commit). If the work is done, close issues #68, #69, #70 and archive the spec. If the baseline commit is wrong, update it to reflect the actual starting point."
+    },
+    {
+      "severity": "high",
+      "category": "correctness",
+      "file": "specs/sidecar-followups.md",
+      "description": "FR-1 states the bounded data channel is `mpsc::channel(256)` but the actual codebase uses `AGENT_PUMP_CHANNEL_CAPACITY = 64` (git_ssh_proxy.rs:113). The spec's description of the existing code is factually wrong, which would mislead an implementer about what they're modifying.",
+      "suggestion": "Update all references to the bounded channel capacity from 256 to 64, matching the actual constant AGENT_PUMP_CHANNEL_CAPACITY."
+    },
+    {
+      "severity": "medium",
+      "category": "clarity",
+      "file": "specs/sidecar-followups.md",
+      "description": "Architecture code examples contain unfilled template placeholders `{{SPEC}}` in two places: `upstream_channel.data({{SPEC}}bytes[..])` and `command: {{SPEC}}str`. These are rendering artifacts that make the pseudocode ambiguous.",
+      "suggestion": "Replace `{{SPEC}}bytes[..]` with `&bytes[..]` and `{{SPEC}}str` with `&str` (or whatever the intended Rust types are)."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "specs/sidecar-followups.md",
+      "description": "NFR-4 asserts 5 integration tests (1 happy + 4 reject) but the actual e2e file contains 7 tests: 2 happy-path tests (bidirectional bytes, accept with exit 0), 1 starvation test (no_starvation), and 4 reject tests. The test count is wrong and would cause confusion during verification.",
+      "suggestion": "Update NFR-4 to reflect the actual expected test count after implementation, accounting for all existing tests in the file."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "specs/sidecar-followups.md",
+      "description": "Problem Statement line references are stale. E.g., `git_ssh_proxy.rs:83` for channel_close (actual: ~line 592), `:557` for channel_eof (actual: ~line 556), `:636` (no match), `:861` for pump loop (actual: ~line 879). The e2e file references `:28`, `:139`, `:360` also don't match current line numbers.",
+      "suggestion": "Either remove specific line-number citations (they go stale quickly) or update them to match the current codebase at the stated baseline commit."
+    },
+    {
+      "severity": "low",
+      "category": "consistency",
+      "file": "specs/sidecar-followups.md",
+      "description": "The spec references the existing happy-path test as something like `test_e2e_git_proxy_pipes_bytes_bidirectionally_and_propagates_exit_status` but the actual test name is `test_git_ssh_proxy_pipes_bidirectional_bytes`. The 'e2e' prefix and wording differ.",
+      "suggestion": "Use the exact existing test name to avoid implementer confusion."
+    }
+  ]
+}
