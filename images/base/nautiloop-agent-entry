@@ -384,27 +384,14 @@ case "$STAGE" in
         if [ -n "${MODEL:-}" ]; then
             CLAUDE_ARGS+=(--model "$MODEL")
         fi
-        # Session IDs do not cross tool boundaries. opencode emits
-        # `ses_<20-char>` IDs; Claude Code v2.x requires UUIDs. When the
-        # loop transitions audit (opencode) -> revise (claude) and
-        # the loop engine dispatches with SESSION_ID still pointing at
-        # the audit's opencode ID, claude rejects it with:
-        #
-        #   Error: --resume requires a valid session ID when used with
-        #   --print. Session IDs must be in UUID format
-        #   (e.g., 550e8400-e29b-41d4-a716-446655440000).
-        #   Provided value "ses_28dede965ffejFSu1XlxxAiqx0" is not a
-        #   valid UUID
-        #
-        # exit 1, revise does zero work, three retries, BackoffLimitExceeded.
-        # Only pass --resume when SESSION_ID is a valid UUID (previous
-        # claude session); silently drop otherwise so the revise starts
-        # a fresh claude session, which is the right behavior for the
-        # first claude stage after an audit.
-        if [ -n "${SESSION_ID:-}" ] && \
-           printf '%s' "$SESSION_ID" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
-            CLAUDE_ARGS+=(--resume "$SESSION_ID")
-        fi
+        # NOTE: We intentionally do NOT pass --resume here.
+        # Claude Code sessions are stored in the container's emptyDir volume
+        # (/home/agent/.claude) which is NOT persistent across pod boundaries.
+        # Passing --resume <uuid> from a previous pod always fails with
+        # "No conversation found with session ID: <uuid>" which causes the
+        # K8s job to hit BackoffLimitExceeded. Each implement/revise pod
+        # starts a fresh Claude session. Session persistence via PVC is a
+        # future enhancement tracked separately.
         STDIN_FILE="$PROMPT_FILE" run_and_emit_result "$STAGE" claude "${CLAUDE_ARGS[@]}"
         ;;
 
@@ -417,11 +404,8 @@ case "$STAGE" in
                 # Use Claude Code CLI for Claude models (same as implement/revise).
                 CLAUDE_ARGS=(--print --output-format stream-json --verbose --dangerously-skip-permissions)
                 CLAUDE_ARGS+=(--model "$REVIEW_MODEL")
-                # Only resume a Claude UUID session, not an opencode ses_ ID.
-                if [ -n "${SESSION_ID:-}" ] && \
-                   printf '%s' "$SESSION_ID" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
-                    CLAUDE_ARGS+=(--resume "$SESSION_ID")
-                fi
+                # No --resume: same reason as implement/revise — claude sessions
+                # live in the pod's emptyDir and don't survive across pods.
                 STDIN_FILE="$PROMPT_FILE" run_and_emit_result "$STAGE" claude "${CLAUDE_ARGS[@]}"
                 ;;
             *)
