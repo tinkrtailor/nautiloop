@@ -639,9 +639,9 @@ impl ConvergentLoopDriver {
                             Ok(LoopState::AwaitingApproval)
                         }
                     }
-                    Some(_v) => {
-                        // Audit found issues: dispatch revise
-                        self.dispatch_revise(record).await
+                    Some(v) => {
+                        // Audit found issues: dispatch revise with findings as feedback
+                        self.dispatch_revise(record, &v).await
                     }
                     None => {
                         // Verdict parse failure: retry per FR-9
@@ -1535,9 +1535,34 @@ impl ConvergentLoopDriver {
     }
 
     /// Dispatch a revise job (harden loop).
-    async fn dispatch_revise(&self, record: &mut LoopRecord) -> Result<LoopState> {
+    async fn dispatch_revise(
+        &self,
+        record: &mut LoopRecord,
+        audit_verdict: &AuditVerdict,
+    ) -> Result<LoopState> {
         record.sub_state = Some(SubState::Dispatched);
         record.retry_count = 0;
+
+        // Write audit findings as a feedback file so the revise agent
+        // receives the {{FEEDBACK}} substitution in spec-revise.md.
+        let feedback = FeedbackFile {
+            round: record.round as u32,
+            source: FeedbackSource::Audit,
+            issues: Some(audit_verdict.issues.clone()),
+            failures: None,
+        };
+        let feedback_path = format!(".agent/audit-feedback-round-{}.json", record.round);
+        let feedback_json = serde_json::to_string_pretty(&feedback).map_err(|e| {
+            crate::error::NautiloopError::Internal(format!(
+                "Failed to serialize audit feedback: {e}"
+            ))
+        })?;
+        self.git
+            .write_file(&record.branch, &feedback_path, &feedback_json)
+            .await?;
+        if let Some(new_sha) = self.git.get_branch_sha(&record.branch).await? {
+            record.current_sha = Some(new_sha);
+        }
 
         // #98: Claude credential preflight. If it blocks, write a
         // sentinel `revise` round record ONLY in that case so that
@@ -1561,9 +1586,17 @@ impl ConvergentLoopDriver {
         let stage_config = self.revise_stage_config(record);
         let mut ctx = self.build_context(record).await?;
         ctx.session_id = Self::session_id_for_stage(record, "revise");
+        ctx.feedback_path = Some(feedback_path.clone());
         let job = job_builder::build_job(&ctx, &stage_config, &self.job_build_config());
         self.persist_then_dispatch(record, "revise", &job).await?;
 
+        tracing::info!(
+            loop_id = %record.id,
+            round = record.round,
+            feedback = %feedback_path,
+            issues = audit_verdict.issues.len(),
+            "Dispatching revise with audit feedback"
+        );
         Ok(LoopState::Hardening)
     }
 
