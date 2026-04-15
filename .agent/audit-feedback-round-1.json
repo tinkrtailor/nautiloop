@@ -1,0 +1,62 @@
+{
+  "round": 1,
+  "source": "audit",
+  "issues": [
+    {
+      "severity": "high",
+      "category": "correctness",
+      "file": "specs/sidecar-followups.md",
+      "description": "All three problems described in this spec appear to already be implemented in the current codebase. AgentData/AgentControl split with unbounded control channel already exists, __test_utils feature rename is already done, lint script already exists, and all 7 e2e tests (including 4 reject-path tests and the drive_ssh_proxy_with_command helper) are already present. If this spec is intended for fresh implementation against the PR #63 baseline, the executor will find nothing to do — or worse, will attempt to re-implement and create conflicts.",
+      "suggestion": "Verify whether this spec has already been executed. If so, mark it as completed/closed. If the baseline commit 8c4753d is the intended starting point, the spec should only be executed in a worktree checked out to that commit, and this should be explicitly stated as a prerequisite."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "specs/sidecar-followups.md",
+      "description": "Architecture pseudocode contains template rendering artifacts: `upstream_channel.data({{SPEC}}bytes[..]).await` and `drive_ssh_proxy_with_command(command: {{SPEC}}str)`. These `{{SPEC}}` placeholders are unresolved and would confuse an implementer.",
+      "suggestion": "Replace `{{SPEC}}bytes[..]` with `&bytes[..]` and `{{SPEC}}str` with `&str` (standard Rust reference syntax)."
+    },
+    {
+      "severity": "medium",
+      "category": "clarity",
+      "file": "specs/sidecar-followups.md",
+      "description": "Architecture pump loop pseudocode uses `if !control_closed` as a guard on the data branch, but `control_closed` is never declared, initialized, or set anywhere in the pseudocode. This is semantically confusing — Close breaks the loop (so the guard is irrelevant), and Eof doesn't set any flag.",
+      "suggestion": "Rename to `if !agent_eof_sent` or `if !data_channel_closed` and show where the flag is set (e.g., when the data_rx returns None). Alternatively, use `if !agent_closed` to match what the actual implementation would likely use."
+    },
+    {
+      "severity": "medium",
+      "category": "completeness",
+      "file": "specs/sidecar-followups.md",
+      "description": "FR-1 says the bounded data channel capacity should be 256 (matching the described current state: 'bounded mpsc::channel(256)'), but the actual codebase uses a constant AGENT_PUMP_CHANNEL_CAPACITY set to 64. The spec does not explicitly specify what capacity to use for the new data channel.",
+      "suggestion": "Either specify the capacity explicitly (e.g., 'bounded mpsc::channel(64)') or state that the existing capacity constant should be preserved."
+    },
+    {
+      "severity": "medium",
+      "category": "completeness",
+      "file": "specs/sidecar-followups.md",
+      "description": "FR-13 lint script is significantly simpler than what exists in the repo. The actual lint-no-test-utils-in-prod.sh (132 lines) also checks for env var leaks (NEMO_SIDECAR_EXTRA_CA_BUNDLE, parity bind override), restricts grep to specific file types, and has multiple validation passes. The spec describes only a basic grep for the feature name in CI workflows.",
+      "suggestion": "Either expand FR-13 to cover the additional checks, or note that the script should also validate that test-only environment variables don't leak into production Dockerfiles/workflows."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "specs/sidecar-followups.md",
+      "description": "NFR-4 states integration tests should show '5 passed' (1 existing + 4 new), but the current codebase has 7 tests in git_ssh_proxy_e2e.rs including a starvation test and an explicit accept test. If the baseline truly has only 1 test, this is fine, but the spec should account for any other tests that may exist at the baseline.",
+      "suggestion": "Verify the exact test count at the baseline commit and adjust NFR-4 accordingly, or use 'at least 5 passed' to be forward-compatible."
+    },
+    {
+      "severity": "low",
+      "category": "clarity",
+      "file": "specs/sidecar-followups.md",
+      "description": "The backpressure-under-close unit test (Migration Plan, Commit 1) requires asserting upstream_channel.close() is called 'within 50ms'. Timing-based assertions in unit tests are inherently flaky in CI environments under load. The Test Plan section lists this test but doesn't discuss the timing concern.",
+      "suggestion": "Use a deterministic assertion instead of a timing-based one: e.g., assert that close() is called before any Data message is forwarded, rather than within 50ms wall-clock time. If timing is necessary, use a generous timeout (e.g., 1s) with a note that the 50ms is the expected case."
+    },
+    {
+      "severity": "low",
+      "category": "completeness",
+      "file": "specs/sidecar-followups.md",
+      "description": "SR-1 requires verifying release binary symbol absence via `nm -a target/release/nautiloop-sidecar | grep test_override_addr`. This verification is manual and not automated in any test or script. The lint script (FR-13) only checks CI workflows, not binary symbols.",
+      "suggestion": "Consider adding the symbol-absence check to the lint script or as a separate verification script, so SR-1 is mechanically enforced rather than relying on manual inspection during review."
+    }
+  ]
+}
