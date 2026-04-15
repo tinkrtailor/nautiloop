@@ -154,6 +154,9 @@ database_url = "postgres://nautiloop:${POSTGRES_PASSWORD}@nautiloop-postgres:543
 [models]
 implementor = "${NAUTILOOP_IMPL_MODEL:-claude-opus-4-6}"
 reviewer = "${NAUTILOOP_REVIEW_MODEL:-claude-opus-4-6}"
+
+[harden]
+auto_merge_spec_pr = false
 TOML
 )" \
     --dry-run=client -o yaml | kubectl apply -f -
