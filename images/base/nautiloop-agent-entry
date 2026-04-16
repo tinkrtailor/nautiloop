@@ -450,6 +450,15 @@ case "$STAGE" in
             exit 1
         fi
 
+        # If no services to test (empty array), emit a passed result immediately.
+        # This handles repos with no [services] configured in nemo.toml.
+        if [ "$(echo "$AFFECTED_SERVICES" | jq 'length')" -eq 0 ]; then
+            RESULT_ENVELOPE='{"stage":"test","data":{"services":[],"all_passed":true,"ci_status":"passed","token_usage":{"input":0,"output":0}}}'
+            echo "$RESULT_ENVELOPE" > /output/result.json
+            echo "NAUTILOOP_RESULT:$RESULT_ENVELOPE"
+            exit 0
+        fi
+
         # FR-42b: Read test commands from nemo.toml
         TOML_FILE="/work/nemo.toml"
         if [ ! -f "$TOML_FILE" ]; then

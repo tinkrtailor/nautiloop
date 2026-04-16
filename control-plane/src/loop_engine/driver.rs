@@ -729,9 +729,19 @@ impl ConvergentLoopDriver {
 
         let stage_config = self.test_stage_config();
         let mut ctx = self.build_context(record).await?;
+        self.inject_test_services(record, &mut ctx).await;
 
-        // Inject affected_services for the TEST stage (FR-42a).
-        // Compute from git diff: only services whose path prefix matches changed files.
+        let job = job_builder::build_job(&ctx, &stage_config, &self.job_build_config());
+        self.persist_then_dispatch(record, "test", &job).await?;
+
+        tracing::info!(loop_id = %record.id, round = record.round, "IMPLEMENTING -> TESTING/DISPATCHED");
+        Ok(LoopState::Testing)
+    }
+
+    /// Compute affected services from git diff and inject AFFECTED_SERVICES +
+    /// service_tags into the loop context credentials for the TEST stage.
+    /// Called from both advance_to_testing and redispatch_current_stage.
+    async fn inject_test_services(&self, record: &LoopRecord, ctx: &mut LoopContext) {
         let diff_files = self
             .git
             .changed_files(&record.branch, &self.default_branch_for(record))
@@ -739,16 +749,12 @@ impl ConvergentLoopDriver {
             .unwrap_or_default();
 
         let affected: Vec<String> = if diff_files.is_empty() {
-            // Can't determine diff — test all services
             self.config.services.keys().cloned().collect()
         } else {
             self.config
                 .services
                 .iter()
                 .filter(|(_, svc)| {
-                    // Use path + "/" for prefix matching to prevent false positives
-                    // (e.g., "cli" matching "client", "api" matching "api-gateway").
-                    // Root service (".") matches everything.
                     let prefix = if svc.path == "." {
                         String::new()
                     } else if svc.path.ends_with('/') {
@@ -764,8 +770,7 @@ impl ConvergentLoopDriver {
                 .collect()
         };
 
-        // If no services matched, still test all (safety net)
-        let service_names = if affected.is_empty() {
+        let service_names: Vec<String> = if affected.is_empty() {
             self.config.services.keys().cloned().collect()
         } else {
             affected
@@ -776,7 +781,6 @@ impl ConvergentLoopDriver {
         ctx.credentials
             .push(("affected_services".to_string(), services_json));
 
-        // Inject service_tags for JVM resource escalation (FR-28) — only from affected services
         let all_tags: Vec<String> = self
             .config
             .services
@@ -789,12 +793,6 @@ impl ConvergentLoopDriver {
             ctx.credentials
                 .push(("service_tags".to_string(), tags_json));
         }
-
-        let job = job_builder::build_job(&ctx, &stage_config, &self.job_build_config());
-        self.persist_then_dispatch(record, "test", &job).await?;
-
-        tracing::info!(loop_id = %record.id, round = record.round, "IMPLEMENTING -> TESTING/DISPATCHED");
-        Ok(LoopState::Testing)
     }
 
     /// Evaluate test stage output.
@@ -1760,6 +1758,11 @@ impl ConvergentLoopDriver {
 
         let mut ctx = self.build_context(&updated).await?;
         ctx.session_id = Self::session_id_for_stage(record, stage_name);
+
+        // Inject affected_services for test stage retries (same as advance_to_testing)
+        if stage_name == "test" {
+            self.inject_test_services(record, &mut ctx).await;
+        }
 
         // Restore feedback_path for implementing redispatch (N30):
         // look at the prior round's stage to determine review vs test feedback
