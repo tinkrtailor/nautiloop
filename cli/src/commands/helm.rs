@@ -916,9 +916,10 @@ async fn stream_pod_logs(
 
                 let overlap = overlapping_suffix_len(&previous_lines, &lines);
                 for line in lines.iter().skip(overlap) {
+                    let display_line = compress_nautiloop_result(line);
                     let entry = LogEntry {
                         timestamp: Utc::now(),
-                        line: line.clone(),
+                        line: display_line,
                     };
                     if event_tx
                         .send(AppEvent::LogLine(loop_id, entry))
@@ -1134,24 +1135,26 @@ fn compress_nautiloop_result(line: &str) -> String {
 
     // Extract round from the prefix "[stage/rN] " if present
     let round_str = line
-        .strip_prefix('[')
-        .and_then(|s| s.find("/r"))
-        .and_then(|pos| {
-            let after = &line[pos + 3..]; // skip "[" prefix + "/r"
-            after.find(']').map(|end| &after[..end])
-        })
+        .find("/r")
+        .map(|pos| &line[pos + 2..]) // skip "/r"
+        .and_then(|after| after.find(']').map(|end| &after[..end]))
         .unwrap_or("?");
 
     match stage {
         "implement" | "revise" => {
-            let output_tokens = parsed
-                .get("data")
+            let data = parsed.get("data");
+            let output_tokens = data
                 .and_then(|d| d.get("token_usage"))
                 .and_then(|t| t.get("output"))
                 .and_then(|o| o.as_u64())
                 .map(format_token_count)
                 .unwrap_or_else(|| "?".to_string());
-            format!("\u{2713} {stage} r{round_str} \u{00b7} {output_tokens} tokens")
+            let exit_code = data
+                .and_then(|d| d.get("exit_code"))
+                .and_then(|e| e.as_i64())
+                .unwrap_or(0);
+            let check = if exit_code == 0 { "\u{2713}" } else { "\u{2717}" };
+            format!("{check} {stage} r{round_str} \u{00b7} {output_tokens} tokens")
         }
         "test" => {
             let data = parsed.get("data");
@@ -1365,12 +1368,12 @@ fn render_logs(app: &mut App, area: Rect) -> Paragraph<'static> {
             .collect()
     };
 
-    let paused = !app.is_scrolled_to_bottom();
-    // Clamp scroll offset to valid range
+    // Clamp scroll offset to valid range before computing paused state
     let max_offset = app.max_scroll_offset();
     if app.log_scroll_offset > max_offset {
         app.log_scroll_offset = max_offset;
     }
+    let paused = !app.is_scrolled_to_bottom();
 
     // scroll position: bottom-anchored with offset
     let total = lines.len();
@@ -1406,38 +1409,27 @@ fn render_logs(app: &mut App, area: Rect) -> Paragraph<'static> {
 fn render_log_line(entry: &LogEntry) -> Line<'static> {
     let local_time: DateTime<Local> = entry.timestamp.with_timezone(&Local);
     let time_str = local_time.format("%H:%M:%S").to_string();
+    let time_span = Span::styled(format!("{time_str}  "), Style::default().fg(MUTED));
 
     let line = &entry.line;
 
-    // Color the check/cross marks for NAUTILOOP_RESULT compressed lines
-    if line.starts_with('\u{2713}') {
-        // ✓ line - green check
-        let rest = &line['\u{2713}'.len_utf8()..];
+    // Detect leading check/cross mark for NAUTILOOP_RESULT compressed lines
+    let (mark_char, mark_color) =
+        if line.starts_with('\u{2713}') {
+            (Some("\u{2713}"), Some(GREEN))
+        } else if line.starts_with('\u{2717}') {
+            (Some("\u{2717}"), Some(RED))
+        } else {
+            (None, None)
+        };
+
+    if let (Some(mark), Some(color)) = (mark_char, mark_color) {
+        let rest = &line[mark.len()..];
         Line::from(vec![
+            time_span,
             Span::styled(
-                format!("{time_str}  "),
-                Style::default().fg(MUTED),
-            ),
-            Span::styled(
-                "\u{2713}".to_string(),
-                Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                rest.to_string(),
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-            ),
-        ])
-    } else if line.starts_with('\u{2717}') {
-        // ✗ line - red cross
-        let rest = &line['\u{2717}'.len_utf8()..];
-        Line::from(vec![
-            Span::styled(
-                format!("{time_str}  "),
-                Style::default().fg(MUTED),
-            ),
-            Span::styled(
-                "\u{2717}".to_string(),
-                Style::default().fg(RED).add_modifier(Modifier::BOLD),
+                mark.to_string(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 rest.to_string(),
@@ -1446,10 +1438,7 @@ fn render_log_line(entry: &LogEntry) -> Line<'static> {
         ])
     } else {
         Line::from(vec![
-            Span::styled(
-                format!("{time_str}  "),
-                Style::default().fg(MUTED),
-            ),
+            time_span,
             Span::styled(line.clone(), Style::default().fg(TEXT)),
         ])
     }
@@ -1838,6 +1827,13 @@ mod tests {
         let line = r#"[revise/r2] NAUTILOOP_RESULT:{"stage":"revise","data":{"token_usage":{"input":10,"output":500},"exit_code":0}}"#;
         let result = compress_nautiloop_result(line);
         assert_eq!(result, "\u{2713} revise r2 \u{00b7} 500 tokens");
+    }
+
+    #[test]
+    fn compress_implement_stage_nonzero_exit_code() {
+        let line = r#"[implement/r1] NAUTILOOP_RESULT:{"stage":"implement","data":{"token_usage":{"input":5,"output":800},"exit_code":1,"session_id":"abc"}}"#;
+        let result = compress_nautiloop_result(line);
+        assert_eq!(result, "\u{2717} implement r1 \u{00b7} 800 tokens");
     }
 
     #[test]
