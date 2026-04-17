@@ -2,6 +2,7 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use anyhow::Result;
+use crossterm::{cursor::MoveTo, execute, terminal::{Clear, ClearType}};
 
 use crate::api_types::PodIntrospectResponse;
 use crate::client::NemoClient;
@@ -138,8 +139,8 @@ async fn run_watch_loop(client: &NemoClient, loop_id: &str) -> Result<()> {
             }
         }
 
-        // Clear screen and move to top
-        print!("\x1b[2J\x1b[H");
+        // Clear screen and move cursor to top
+        execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0))?;
 
         match fetch(client, loop_id).await {
             Ok(FetchResult::Ok(snapshot)) => {

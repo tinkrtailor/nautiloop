@@ -243,18 +243,22 @@ async fn exec_introspect_script(
     };
 
     // The script has `timeout 2` internally; the exec handshake gets 1.5s.
-    // The read timeout is 1s since the script output arrives in a single burst
-    // once the 2s script completes. Total budget (1.5s handshake + 1s read) = 2.5s,
-    // which is strictly less than the outer 3s handler timeout. This ensures the
-    // inner timeout always fires first, producing a deterministic partial-result
-    // path instead of a non-deterministic 503-vs-partial race.
+    // Output arrives incrementally via NDJSON: processes are emitted first
+    // (immediately), then worktree data (can be slow on large projects). The
+    // 1s read timeout may capture only the first line (processes) if worktree
+    // collection is slow. Total budget (1.5s handshake + 1s read) = 2.5s,
+    // which is strictly less than the outer 3s handler timeout. This ensures
+    // the inner timeout always fires first, producing a deterministic
+    // partial-result path instead of a non-deterministic 503-vs-partial race.
     let cmd = vec![
         "/bin/sh",
         "-c",
         // The script emits NDJSON (processes line first, then worktree). On
         // timeout, partial output (processes only) is preserved. The || fallback
-        // fires only when the script is entirely absent or crashes at startup.
-        "timeout 2 /usr/local/bin/nautiloop-introspect 2>/dev/null || echo '{\"processes\":[],\"worktree\":{\"path\":\"/work\",\"target_dir_bytes\":null,\"target_dir_artifacts\":null,\"uncommitted_files\":null,\"head_sha\":null}}'",
+        // fires only when the script is entirely absent or crashes at startup —
+        // it provides only worktree defaults (no processes key) so it cannot
+        // overwrite real process data already emitted before a timeout.
+        "timeout 2 /usr/local/bin/nautiloop-introspect 2>/dev/null || echo '{\"worktree\":{\"path\":\"/work\",\"target_dir_bytes\":null,\"target_dir_artifacts\":null,\"uncommitted_files\":null,\"head_sha\":null}}'",
     ];
 
     let result = tokio::time::timeout(
@@ -265,8 +269,9 @@ async fn exec_introspect_script(
 
     match result {
         Ok(Ok(mut attached)) => {
-            // 1s read timeout: script output arrives as a single burst after the
-            // 2s internal timeout, so 1s is generous for reading buffered output.
+            // 1s read timeout: script emits NDJSON incrementally (processes first,
+            // worktree second). This timeout may capture only the first line if
+            // worktree collection is slow — the parser handles partial NDJSON.
             let read_result = tokio::time::timeout(
                 std::time::Duration::from_secs(1),
                 async {
@@ -851,10 +856,10 @@ mod tests {
 
     #[test]
     fn test_parse_introspect_output_partial_worktree() {
-        // Matches the fallback JSON emitted when the script is absent:
-        // all worktree fields are null so callers render "unavailable" instead of
-        // misleading zeros (e.g. "0 artifacts" implying empty target dir).
-        let output = r#"{"processes":[],"worktree":{"path":"/work","target_dir_bytes":null,"target_dir_artifacts":null,"uncommitted_files":null,"head_sha":null}}"#;
+        // Matches the fallback JSON emitted when the script is absent or crashes:
+        // only worktree defaults (no processes key), so it cannot overwrite real
+        // process data already emitted before a timeout.
+        let output = r#"{"worktree":{"path":"/work","target_dir_bytes":null,"target_dir_artifacts":null,"uncommitted_files":null,"head_sha":null}}"#;
         let (processes, worktree) = parse_introspect_output(output);
         assert!(processes.is_empty());
         assert_eq!(worktree.path, "/work");
@@ -862,5 +867,23 @@ mod tests {
         assert_eq!(worktree.target_dir_artifacts, None);
         assert_eq!(worktree.uncommitted_files, None); // null → None (unknown)
         assert_eq!(worktree.head_sha, None);
+    }
+
+    #[test]
+    fn test_parse_ndjson_fallback_does_not_overwrite_processes() {
+        // When timeout kills the script mid-worktree, the script emits real
+        // processes on line 1, and the || fallback appends worktree-only JSON
+        // on line 2. The parser must keep real processes from line 1.
+        let output = concat!(
+            r#"{"processes":[{"pid":12,"ppid":1,"user":"agent","cpu_percent":3.2,"cmd":"claude","age_seconds":100}]}"#,
+            "\n",
+            r#"{"worktree":{"path":"/work","target_dir_bytes":null,"target_dir_artifacts":null,"uncommitted_files":null,"head_sha":null}}"#,
+        );
+        let (processes, worktree) = parse_introspect_output(output);
+        assert_eq!(processes.len(), 1, "real processes from line 1 must be preserved");
+        assert_eq!(processes[0].pid, 12);
+        assert_eq!(processes[0].cmd, "claude");
+        assert_eq!(worktree.path, "/work");
+        assert_eq!(worktree.target_dir_bytes, None);
     }
 }

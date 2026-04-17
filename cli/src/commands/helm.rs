@@ -266,8 +266,20 @@ impl App {
         self.inspect = None;
         self.inspect_status = self
             .selected_loop()
-            .map(|loop_item| format!("Loading inspect data for {}", loop_item.branch))
-            .unwrap_or_else(|| "Select a loop to inspect".to_string());
+            .and_then(|loop_item| {
+                if loop_item.branch.is_empty() {
+                    None
+                } else {
+                    Some(format!("Loading inspect data for {}", loop_item.branch))
+                }
+            })
+            .unwrap_or_else(|| {
+                if self.selected_loop().is_some() {
+                    "No branch available for this loop".to_string()
+                } else {
+                    "Select a loop to inspect".to_string()
+                }
+            });
     }
 
     fn cycle_log_source(&mut self) {
