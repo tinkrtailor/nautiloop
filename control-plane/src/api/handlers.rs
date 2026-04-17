@@ -56,27 +56,35 @@ pub async fn start(
     let default_ref = state.config.default_remote_ref();
     let spec_from_local = req.spec_content.is_some();
 
-    // FR-3c: validate spec_path when spec_content is provided (local upload).
-    // Legacy callers (FR-2b) are not subject to new validation per NFR-1 backward compat;
-    // they rely on the existing git read_file call which naturally rejects invalid paths.
+    // Defense-in-depth: apply traversal and absolute-path checks to ALL requests,
+    // not just local uploads. While git.read_file limits blast radius to the repo,
+    // rejecting malicious paths early is safer. The .md extension and stem checks
+    // remain gated behind spec_from_local for NFR-1 backward compat.
+    if req.spec_path.contains('\\') {
+        return Err(NautiloopError::BadRequest(
+            "spec_path must not contain backslashes".to_string(),
+        ));
+    }
+    if req.spec_path.starts_with('/') {
+        return Err(NautiloopError::BadRequest(
+            "spec_path must not start with '/'".to_string(),
+        ));
+    }
+    // Check for ".." as a path component (traversal), not as a substring.
+    // This allows legitimate filenames containing ".." (e.g. "v2..final.md").
+    if req.spec_path.split('/').any(|seg| seg == ".." || seg == "." || seg.is_empty()) {
+        return Err(NautiloopError::BadRequest(
+            "spec_path must not contain '..', '.', or empty path segments".to_string(),
+        ));
+    }
+    if req.spec_path.bytes().any(|b| b < 0x20) {
+        return Err(NautiloopError::BadRequest(
+            "spec_path must not contain control characters".to_string(),
+        ));
+    }
+
+    // Additional checks for local uploads only (NFR-1 backward compat for legacy callers).
     if spec_from_local {
-        if req.spec_path.contains('\\') {
-            return Err(NautiloopError::BadRequest(
-                "spec_path must not contain backslashes".to_string(),
-            ));
-        }
-        if req.spec_path.starts_with('/') {
-            return Err(NautiloopError::BadRequest(
-                "spec_path must not start with '/'".to_string(),
-            ));
-        }
-        // Check for ".." as a path component (traversal), not as a substring.
-        // This allows legitimate filenames containing ".." (e.g. "v2..final.md").
-        if req.spec_path.split('/').any(|seg| seg == ".." || seg == "." || seg.is_empty()) {
-            return Err(NautiloopError::BadRequest(
-                "spec_path must not contain '..', '.', or empty path segments".to_string(),
-            ));
-        }
         if !req.spec_path.ends_with(".md") {
             return Err(NautiloopError::BadRequest(
                 "spec_path must end with '.md'".to_string(),
@@ -98,11 +106,6 @@ pub async fn start(
         if stem.ends_with(".md") {
             return Err(NautiloopError::BadRequest(
                 "spec_path filename must not have a double '.md' extension".to_string(),
-            ));
-        }
-        if req.spec_path.bytes().any(|b| b < 0x20) {
-            return Err(NautiloopError::BadRequest(
-                "spec_path must not contain control characters".to_string(),
             ));
         }
     }
@@ -241,128 +244,13 @@ pub async fn start(
 
     // FR-2a: If spec was uploaded locally, commit it onto the agent branch as the first commit.
     // FR-3d: Use the engineer's identity for the spec commit, not the control-plane default.
-    // After committing, push the branch to the remote so the spec content is durable before
-    // returning 201 to the client.
+    // Track whether push succeeded so cleanup can delete the remote branch if a later step fails.
+    let mut pushed_to_remote = false;
     if spec_from_local {
-        // Look up engineer identity from stored credentials (same as loop engine driver).
-        // Failure here means the DB row exists in Pending state with a git branch but
-        // no spec commit — mark the loop as Failed to prevent the loop engine from
-        // picking up a broken loop.
-        let all_creds = match state.store.get_credentials(&req.engineer).await {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = state.git.delete_branch(&branch).await;
-                let _ = state
-                    .store
-                    .update_loop_state(loop_id, LoopState::Failed, None)
-                    .await;
-                return Err(e);
-            }
-        };
-        // Extract engineer name and email in a single pass over credentials,
-        // preferring the most recently updated valid entry for each provider.
-        let (mut engineer_name, mut engineer_email): (Option<String>, Option<String>) =
-            (None, None);
-        let mut best_name_ts = None;
-        let mut best_email_ts = None;
-        for c in &all_creds {
-            if !c.valid {
-                continue;
-            }
-            if c.provider == "_name"
-                && best_name_ts.is_none_or(|ts| c.updated_at > ts)
-            {
-                engineer_name = Some(c.credential_ref.clone());
-                best_name_ts = Some(c.updated_at);
-            }
-            if c.provider == "_email"
-                && best_email_ts.is_none_or(|ts| c.updated_at > ts)
-            {
-                engineer_email = Some(c.credential_ref.clone());
-                best_email_ts = Some(c.updated_at);
-            }
-        }
-        if engineer_name.is_none() || engineer_email.is_none() {
-            tracing::warn!(
-                loop_id = %loop_id,
-                engineer = %req.engineer,
-                has_name = engineer_name.is_some(),
-                has_email = engineer_email.is_some(),
-                "Engineer credentials incomplete; falling back to synthetic identity for spec commit. \
-                 Run `nemo auth` to set name/email."
-            );
-        }
-        let engineer_name = engineer_name.unwrap_or_else(|| req.engineer.clone());
-        let engineer_email =
-            engineer_email.unwrap_or_else(|| format!("{}@nautiloop.dev", req.engineer));
-
-        let commit_message = format!("chore(spec): add {}", req.spec_path);
-
-        match state
-            .git
-            .write_file_as(
-                &branch,
-                &req.spec_path,
-                &spec_content,
-                &engineer_name,
-                &engineer_email,
-                &commit_message,
-            )
-            .await
-        {
-            Ok(()) => {
-                // FR-2a: current_sha must reflect the spec commit, not the default-branch tip.
-                // Treat get_branch_sha failure as an error — the SHA must be correct.
-                match state.git.get_branch_sha(&branch).await {
-                    Ok(Some(new_sha)) => {
-                        branch_sha = new_sha;
-                        // Push the branch to the remote so the spec content is durable
-                        // before returning 201 to the client (round-8 feedback).
-                        if let Err(e) = state.git.push_branch(&branch).await {
-                            tracing::error!(
-                                loop_id = %loop_id,
-                                branch = %branch,
-                                error = %e,
-                                "Failed to push agent branch after spec commit"
-                            );
-                            let _ = state.git.delete_branch(&branch).await;
-                            let _ = state
-                                .store
-                                .update_loop_state(loop_id, LoopState::Failed, None)
-                                .await;
-                            return Err(e);
-                        }
-                    }
-                    Ok(None) => {
-                        tracing::error!(
-                            loop_id = %loop_id,
-                            branch = %branch,
-                            "Branch SHA not found after spec commit"
-                        );
-                        let _ = state.git.delete_branch(&branch).await;
-                        let _ = state
-                            .store
-                            .update_loop_state(loop_id, LoopState::Failed, None)
-                            .await;
-                        return Err(NautiloopError::Git(
-                            "Branch not found after spec commit".to_string(),
-                        ));
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            loop_id = %loop_id,
-                            branch = %branch,
-                            error = %e,
-                            "Failed to get branch SHA after spec commit"
-                        );
-                        let _ = state.git.delete_branch(&branch).await;
-                        let _ = state
-                            .store
-                            .update_loop_state(loop_id, LoopState::Failed, None)
-                            .await;
-                        return Err(e);
-                    }
-                }
+        match commit_spec_to_branch(&state, &req.engineer, &req.spec_path, &spec_content, &branch, loop_id).await {
+            Ok(new_sha) => {
+                branch_sha = new_sha;
+                pushed_to_remote = true;
             }
             Err(e) => {
                 let _ = state.git.delete_branch(&branch).await;
@@ -377,16 +265,18 @@ pub async fn start(
 
     // Persist the SHA via a narrow SQL update — never use update_loop() from /start
     // because the reconciler may have already advanced the record.
-    match state.store.set_current_sha(loop_id, &branch_sha).await {
-        Ok(()) => {}
-        Err(e) => {
-            let _ = state
-                .store
-                .update_loop_state(loop_id, LoopState::Failed, None)
-                .await;
-            return Err(e);
+    if let Err(e) = state.store.set_current_sha(loop_id, &branch_sha).await {
+        // Clean up: delete local branch, and remote branch if it was already pushed.
+        let _ = state.git.delete_branch(&branch).await;
+        if pushed_to_remote {
+            let _ = state.git.delete_remote_branch(&branch).await;
         }
-    };
+        let _ = state
+            .store
+            .update_loop_state(loop_id, LoopState::Failed, None)
+            .await;
+        return Err(e);
+    }
 
     let spec_source = if spec_from_local {
         "local"
@@ -1088,6 +978,89 @@ pub async fn list_credentials(
         engineer: query.engineer,
         providers,
     }))
+}
+
+/// Commit the local spec content onto the agent branch and push it to the remote.
+///
+/// Returns the new branch SHA on success. On failure, the caller is responsible for
+/// cleaning up the local branch and marking the loop as failed.
+async fn commit_spec_to_branch(
+    state: &AppState,
+    engineer: &str,
+    spec_path: &str,
+    spec_content: &str,
+    branch: &str,
+    loop_id: Uuid,
+) -> Result<String, NautiloopError> {
+    // Look up engineer identity from stored credentials (same as loop engine driver).
+    let all_creds = state.store.get_credentials(engineer).await?;
+
+    // Extract engineer name and email in a single pass over credentials,
+    // preferring the most recently updated valid entry for each provider.
+    let (mut engineer_name, mut engineer_email): (Option<String>, Option<String>) = (None, None);
+    let mut best_name_ts = None;
+    let mut best_email_ts = None;
+    for c in &all_creds {
+        if !c.valid {
+            continue;
+        }
+        if c.provider == "_name" && best_name_ts.is_none_or(|ts| c.updated_at > ts) {
+            engineer_name = Some(c.credential_ref.clone());
+            best_name_ts = Some(c.updated_at);
+        }
+        if c.provider == "_email" && best_email_ts.is_none_or(|ts| c.updated_at > ts) {
+            engineer_email = Some(c.credential_ref.clone());
+            best_email_ts = Some(c.updated_at);
+        }
+    }
+    if engineer_name.is_none() || engineer_email.is_none() {
+        tracing::warn!(
+            loop_id = %loop_id,
+            engineer = %engineer,
+            has_name = engineer_name.is_some(),
+            has_email = engineer_email.is_some(),
+            "Engineer credentials incomplete; falling back to synthetic identity for spec commit. \
+             Run `nemo auth` to set name/email."
+        );
+    }
+    let engineer_name = engineer_name.unwrap_or_else(|| engineer.to_string());
+    let engineer_email =
+        engineer_email.unwrap_or_else(|| format!("{engineer}@nautiloop.dev"));
+
+    let commit_message = format!("chore(spec): add {spec_path}");
+
+    state
+        .git
+        .write_file_as(
+            branch,
+            spec_path,
+            spec_content,
+            &engineer_name,
+            &engineer_email,
+            &commit_message,
+        )
+        .await?;
+
+    // FR-2a: current_sha must reflect the spec commit, not the default-branch tip.
+    let new_sha = state
+        .git
+        .get_branch_sha(branch)
+        .await?
+        .ok_or_else(|| NautiloopError::Git("Branch not found after spec commit".to_string()))?;
+
+    // Push the branch to the remote so the spec content is durable
+    // before returning 201 to the client.
+    state.git.push_branch(branch).await.map_err(|e| {
+        tracing::error!(
+            loop_id = %loop_id,
+            branch = %branch,
+            error = %e,
+            "Failed to push agent branch after spec commit"
+        );
+        e
+    })?;
+
+    Ok(new_sha)
 }
 
 /// Check if a sqlx error is a unique constraint violation.
@@ -2001,6 +1974,56 @@ mod tests {
 
         // Legacy path: no spec_content → validation skipped → succeeds if file exists in git
         assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_start_legacy_path_traversal_rejected() {
+        // Path traversal checks now apply to ALL requests, not just local uploads.
+        let (app, _store, git) = test_app();
+        git.add_file("../../etc/passwd.md", "# evil\n").await;
+
+        let body = serde_json::json!({
+            "spec_path": "../../etc/passwd.md",
+            "engineer": "alice"
+        });
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .method(http::Method::POST)
+                .uri("/start")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_start_legacy_absolute_path_rejected() {
+        // Absolute path checks now apply to ALL requests, not just local uploads.
+        let (app, _store, git) = test_app();
+        git.add_file("/etc/passwd.md", "# evil\n").await;
+
+        let body = serde_json::json!({
+            "spec_path": "/etc/passwd.md",
+            "engineer": "alice"
+        });
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .method(http::Method::POST)
+                .uri("/start")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

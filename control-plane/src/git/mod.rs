@@ -79,6 +79,10 @@ pub trait GitOperations: Send + Sync + 'static {
     /// Push a branch to the remote. Used after the initial spec commit so the
     /// agent branch exists on the remote before returning 201.
     async fn push_branch(&self, branch: &str) -> Result<()>;
+
+    /// Delete a branch from the remote. Used to clean up orphaned remote branches
+    /// when a post-push step (e.g., set_current_sha) fails.
+    async fn delete_remote_branch(&self, branch: &str) -> Result<()>;
 }
 
 /// Real git operations on a bare repository.
@@ -730,6 +734,17 @@ pub mod bare {
                 })?;
             Ok(())
         }
+
+        async fn delete_remote_branch(&self, branch: &str) -> Result<()> {
+            self.run_git(&["push", "origin", "--delete", branch])
+                .await
+                .map_err(|e| {
+                    crate::error::NautiloopError::Git(format!(
+                        "Failed to delete remote branch {branch}: {e}"
+                    ))
+                })?;
+            Ok(())
+        }
     }
 }
 
@@ -837,17 +852,18 @@ pub mod mock {
             files.insert(path.to_string(), content.to_string());
             drop(files);
 
-            // Generate a distinct mock SHA so that get_branch_sha returns a new
-            // value after the write, matching real git behavior (consistent with
-            // write_file_as).
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            branch.hash(&mut hasher);
-            path.hash(&mut hasher);
-            content.hash(&mut hasher);
-            "write_file".hash(&mut hasher);
-            let hash_val = hasher.finish() as u128;
-            let new_sha = format!("{:040x}", hash_val);
+            // Generate a realistic 40-hex-char mock SHA using SHA-256, truncated to
+            // 20 bytes (same length as a real git SHA-1). This avoids the artificial
+            // leading-zeros pattern that DefaultHasher::finish() u64→u128 produced.
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(b"write_file:");
+            hasher.update(branch.as_bytes());
+            hasher.update(b":");
+            hasher.update(path.as_bytes());
+            hasher.update(b":");
+            hasher.update(content.as_bytes());
+            let new_sha = hex::encode(&hasher.finalize()[..20]);
             let mut branches = self.branches.write().await;
             branches.insert(branch.to_string(), new_sha);
 
@@ -867,19 +883,23 @@ pub mod mock {
             files.insert(path.to_string(), content.to_string());
             drop(files);
 
-            // Generate a distinct mock SHA from the commit inputs so that
-            // get_branch_sha returns a new value after the write, matching
-            // real git behavior where each commit produces a new SHA.
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            branch.hash(&mut hasher);
-            path.hash(&mut hasher);
-            content.hash(&mut hasher);
-            commit_message.hash(&mut hasher);
-            author_name.hash(&mut hasher);
-            author_email.hash(&mut hasher);
-            let hash_val = hasher.finish() as u128;
-            let new_sha = format!("{:040x}", hash_val);
+            // Generate a realistic 40-hex-char mock SHA using SHA-256, truncated to
+            // 20 bytes. Includes all commit inputs for proper diversity.
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(b"write_file_as:");
+            hasher.update(branch.as_bytes());
+            hasher.update(b":");
+            hasher.update(path.as_bytes());
+            hasher.update(b":");
+            hasher.update(content.as_bytes());
+            hasher.update(b":");
+            hasher.update(commit_message.as_bytes());
+            hasher.update(b":");
+            hasher.update(author_name.as_bytes());
+            hasher.update(b":");
+            hasher.update(author_email.as_bytes());
+            let new_sha = hex::encode(&hasher.finalize()[..20]);
             let mut branches = self.branches.write().await;
             branches.insert(branch.to_string(), new_sha);
             drop(branches);
@@ -948,6 +968,10 @@ pub mod mock {
         }
 
         async fn push_branch(&self, _branch: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete_remote_branch(&self, _branch: &str) -> Result<()> {
             Ok(())
         }
     }
