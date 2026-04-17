@@ -420,6 +420,9 @@ async fn run_app(
                 AppAction::PanelToggle => {
                     // Update introspect polling based on panel state
                     if app.side_panel == SidePanel::Introspect {
+                        // Reset to clean state before starting to poll
+                        app.introspect = None;
+                        app.introspect_status = "Loading...".to_string();
                         let _ = introspect_tx.send(app.selected_loop_id);
                     } else {
                         let _ = introspect_tx.send(None);

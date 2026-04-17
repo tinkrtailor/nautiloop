@@ -403,7 +403,8 @@ async fn main() -> anyhow::Result<()> {
             if watch {
                 commands::ps::run_watch(&http_client, &loop_id).await?;
             } else {
-                commands::ps::run(&http_client, &loop_id).await?;
+                let exit_code = commands::ps::run(&http_client, &loop_id).await?;
+                std::process::exit(exit_code);
             }
         }
         Commands::Cancel { loop_id } => {

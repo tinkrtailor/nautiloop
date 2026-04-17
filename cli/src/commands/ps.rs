@@ -53,23 +53,24 @@ pub enum FetchResult {
 }
 
 /// Run `nemo ps <loop_id>` (one-shot mode).
-pub async fn run(client: &NemoClient, loop_id: &str) -> Result<()> {
+/// Returns the exit code (0 = success, 1 = error, 2 = terminal loop).
+pub async fn run(client: &NemoClient, loop_id: &str) -> Result<i32> {
     match fetch(client, loop_id).await? {
         FetchResult::Ok(snapshot) => {
             render_snapshot(&snapshot, &mut io::stdout())?;
-            std::process::exit(0);
+            Ok(0)
         }
         FetchResult::Terminal(msg) => {
             eprintln!("{msg}");
-            std::process::exit(2);
+            Ok(2)
         }
         FetchResult::NotReady(msg) => {
             eprintln!("{msg}");
-            std::process::exit(1);
+            Ok(1)
         }
         FetchResult::Timeout => {
             eprintln!("pod introspection timeout — retry shortly");
-            std::process::exit(1);
+            Ok(1)
         }
     }
 }

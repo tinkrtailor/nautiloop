@@ -110,6 +110,12 @@ pub async fn pod_introspect(
             .and_then(|s| s.phase.clone())
             .unwrap_or_else(|| "Unknown".to_string());
 
+        // NFR-4: Pending pods have no running containers — exec will always fail.
+        // Return 425 instead of attempting exec and producing a misleading empty snapshot.
+        if pod_phase == "Pending" {
+            return Ok::<_, NautiloopError>(None);
+        }
+
         // FR-2a + FR-2b: run exec and metrics fetch concurrently
         let (exec_result, container_stats) = tokio::join!(
             exec_introspect_script(kube_client, &pod_name, namespace),
@@ -360,7 +366,7 @@ pub fn parse_cpu_to_millicores(cpu: &str) -> u64 {
         // Round instead of truncate so e.g. 999999n → 1m, not 0m
         (nano.parse::<u64>().unwrap_or(0) + 500_000) / 1_000_000
     } else if let Some(micro) = cpu.strip_suffix('u') {
-        micro.parse::<u64>().unwrap_or(0) / 1_000
+        (micro.parse::<u64>().unwrap_or(0) + 500) / 1_000
     } else if let Some(milli) = cpu.strip_suffix('m') {
         milli.parse::<u64>().unwrap_or(0)
     } else {
@@ -371,18 +377,24 @@ pub fn parse_cpu_to_millicores(cpu: &str) -> u64 {
 
 /// Parse Kubernetes memory quantity to bytes.
 pub fn parse_memory_to_bytes(mem: &str) -> u64 {
-    if let Some(ki) = mem.strip_suffix("Ki") {
-        ki.parse::<u64>().unwrap_or(0) * 1024
-    } else if let Some(mi) = mem.strip_suffix("Mi") {
-        mi.parse::<u64>().unwrap_or(0) * 1024 * 1024
+    if let Some(ei) = mem.strip_suffix("Ei") {
+        ei.parse::<u64>().unwrap_or(0).saturating_mul(1024 * 1024 * 1024 * 1024 * 1024 * 1024)
+    } else if let Some(pi) = mem.strip_suffix("Pi") {
+        pi.parse::<u64>().unwrap_or(0).saturating_mul(1024 * 1024 * 1024 * 1024 * 1024)
+    } else if let Some(ti) = mem.strip_suffix("Ti") {
+        ti.parse::<u64>().unwrap_or(0).saturating_mul(1024 * 1024 * 1024 * 1024)
     } else if let Some(gi) = mem.strip_suffix("Gi") {
         gi.parse::<u64>().unwrap_or(0) * 1024 * 1024 * 1024
-    } else if let Some(k) = mem.strip_suffix('k') {
-        k.parse::<u64>().unwrap_or(0) * 1000
-    } else if let Some(m) = mem.strip_suffix('M') {
-        m.parse::<u64>().unwrap_or(0) * 1_000_000
+    } else if let Some(mi) = mem.strip_suffix("Mi") {
+        mi.parse::<u64>().unwrap_or(0) * 1024 * 1024
+    } else if let Some(ki) = mem.strip_suffix("Ki") {
+        ki.parse::<u64>().unwrap_or(0) * 1024
     } else if let Some(g) = mem.strip_suffix('G') {
         g.parse::<u64>().unwrap_or(0) * 1_000_000_000
+    } else if let Some(m) = mem.strip_suffix('M') {
+        m.parse::<u64>().unwrap_or(0) * 1_000_000
+    } else if let Some(k) = mem.strip_suffix('k') {
+        k.parse::<u64>().unwrap_or(0) * 1000
     } else {
         mem.parse::<u64>().unwrap_or(0)
     }
@@ -635,6 +647,10 @@ mod tests {
         assert_eq!(parse_cpu_to_millicores("499999n"), 0);
         // Rounding: 500000n → 1m (exactly half rounds up)
         assert_eq!(parse_cpu_to_millicores("500000n"), 1);
+        // Microcores use consistent rounding (999u → 1m with rounding)
+        assert_eq!(parse_cpu_to_millicores("999u"), 1);
+        assert_eq!(parse_cpu_to_millicores("499u"), 0);
+        assert_eq!(parse_cpu_to_millicores("500u"), 1);
     }
 
     #[test]
@@ -643,6 +659,60 @@ mod tests {
         assert_eq!(parse_memory_to_bytes("512Mi"), 512 * 1024 * 1024);
         assert_eq!(parse_memory_to_bytes("2Gi"), 2 * 1024 * 1024 * 1024);
         assert_eq!(parse_memory_to_bytes("1000000"), 1000000);
+        // Ti/Pi/Ei binary suffixes
+        assert_eq!(parse_memory_to_bytes("1Ti"), 1024 * 1024 * 1024 * 1024);
+        assert_eq!(parse_memory_to_bytes("1Pi"), 1024u64 * 1024 * 1024 * 1024 * 1024);
+        assert_eq!(parse_memory_to_bytes("1Ei"), 1024u64 * 1024 * 1024 * 1024 * 1024 * 1024);
+        // SI suffixes
+        assert_eq!(parse_memory_to_bytes("1k"), 1000);
+        assert_eq!(parse_memory_to_bytes("1M"), 1_000_000);
+        assert_eq!(parse_memory_to_bytes("1G"), 1_000_000_000);
+    }
+
+    #[test]
+    fn test_pod_metrics_deserialization() {
+        // Verify PodMetrics struct correctly deserializes a real metrics API response
+        let json = r#"{
+            "kind": "PodMetrics",
+            "apiVersion": "metrics.k8s.io/v1beta1",
+            "metadata": {
+                "name": "nautiloop-test-pod",
+                "namespace": "nautiloop-jobs",
+                "creationTimestamp": "2026-04-17T12:45:00Z"
+            },
+            "timestamp": "2026-04-17T12:45:00Z",
+            "window": "30s",
+            "containers": [
+                {
+                    "name": "agent",
+                    "usage": {
+                        "cpu": "508234567n",
+                        "memory": "937464Ki"
+                    }
+                },
+                {
+                    "name": "auth-sidecar",
+                    "usage": {
+                        "cpu": "1234567n",
+                        "memory": "32768Ki"
+                    }
+                }
+            ]
+        }"#;
+
+        let metrics: PodMetrics = serde_json::from_str(json).expect("PodMetrics should deserialize");
+        assert_eq!(metrics.containers.len(), 2);
+
+        let agent = &metrics.containers[0];
+        assert_eq!(agent.name, "agent");
+        assert_eq!(agent.usage.cpu, "508234567n");
+        assert_eq!(agent.usage.memory, "937464Ki");
+
+        // Verify end-to-end parsing produces expected values
+        let cpu = parse_cpu_to_millicores(&agent.usage.cpu);
+        let mem = parse_memory_to_bytes(&agent.usage.memory);
+        assert_eq!(cpu, 508); // 508234567n → 508m (with rounding)
+        assert_eq!(mem, 937464 * 1024); // 937464Ki → bytes
     }
 
     #[test]
