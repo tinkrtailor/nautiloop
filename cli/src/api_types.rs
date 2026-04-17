@@ -70,7 +70,7 @@ pub struct WorktreeInfo {
     pub path: String,
     pub target_dir_artifacts: Option<u64>,
     pub target_dir_bytes: Option<u64>,
-    pub uncommitted_files: u64,
+    pub uncommitted_files: Option<u64>,
     pub head_sha: Option<String>,
 }
 

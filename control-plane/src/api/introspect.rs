@@ -445,8 +445,7 @@ pub fn parse_introspect_output(output: &str) -> (Vec<ProcessInfo>, WorktreeInfo)
             target_dir_bytes: w.get("target_dir_bytes").and_then(|v| v.as_u64()),
             uncommitted_files: w
                 .get("uncommitted_files")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
+                .and_then(|v| v.as_u64()),
             head_sha: w
                 .get("head_sha")
                 .and_then(|v| v.as_str())
@@ -462,7 +461,7 @@ fn default_worktree() -> WorktreeInfo {
         path: "/work".to_string(),
         target_dir_artifacts: None,
         target_dir_bytes: None,
-        uncommitted_files: 0,
+        uncommitted_files: None,
         head_sha: None,
     }
 }
@@ -743,7 +742,7 @@ mod tests {
         assert_eq!(processes[1].pid, 126);
         assert_eq!(worktree.target_dir_artifacts, Some(1069));
         assert_eq!(worktree.target_dir_bytes, Some(3221225472));
-        assert_eq!(worktree.uncommitted_files, 2);
+        assert_eq!(worktree.uncommitted_files, Some(2));
         assert_eq!(worktree.head_sha.as_deref(), Some("42bffd9"));
     }
 
@@ -781,7 +780,7 @@ mod tests {
         assert_eq!(worktree.path, "/work");
         assert_eq!(worktree.target_dir_bytes, None);
         assert_eq!(worktree.target_dir_artifacts, None);
-        assert_eq!(worktree.uncommitted_files, 0); // null → default 0
+        assert_eq!(worktree.uncommitted_files, None); // null → None (unknown)
         assert_eq!(worktree.head_sha, None);
     }
 }

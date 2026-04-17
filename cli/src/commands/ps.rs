@@ -42,11 +42,11 @@ pub async fn fetch(client: &NemoClient, loop_id: &str) -> Result<FetchResult> {
     }
 
     let snapshot: PodIntrospectResponse = response.json().await?;
-    Ok(FetchResult::Ok(snapshot))
+    Ok(FetchResult::Ok(Box::new(snapshot)))
 }
 
 pub enum FetchResult {
-    Ok(PodIntrospectResponse),
+    Ok(Box<PodIntrospectResponse>),
     Terminal(String),
     NotReady(String),
     Timeout,
@@ -109,13 +109,19 @@ pub async fn run_watch(client: &NemoClient, loop_id: &str) -> Result<()> {
 
 async fn run_watch_loop(client: &NemoClient, loop_id: &str) -> Result<()> {
     loop {
-        // Check for 'q' key press (non-blocking)
-        if crossterm::event::poll(Duration::from_millis(0))?
-            && let crossterm::event::Event::Key(key) = crossterm::event::read()?
-            && key.kind == crossterm::event::KeyEventKind::Press
-            && key.code == crossterm::event::KeyCode::Char('q')
-        {
-            return Ok(());
+        // Check for 'q' key press (non-blocking). Ignore transient input errors
+        // (e.g. terminal resize events that fail to parse) to avoid killing the
+        // watch loop on benign I/O hiccups.
+        if crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
+            match crossterm::event::read() {
+                Ok(crossterm::event::Event::Key(key))
+                    if key.kind == crossterm::event::KeyEventKind::Press
+                        && key.code == crossterm::event::KeyCode::Char('q') =>
+                {
+                    return Ok(());
+                }
+                _ => {} // ignore non-key events and read errors
+            }
         }
 
         // Clear screen and move to top
@@ -183,10 +189,14 @@ pub fn render_snapshot(snapshot: &PodIntrospectResponse, w: &mut dyn Write) -> R
         (Some(bytes), None) => format!("target: {}", format_bytes(bytes)),
         _ => "target: -".to_string(),
     };
+    let dirty_str = match wt.uncommitted_files {
+        Some(n) => format!("dirty={n} files"),
+        None => "dirty=? files".to_string(),
+    };
     writeln!(
         w,
-        "Worktree: {}  HEAD: {}  dirty={} files  {}",
-        wt.path, head, wt.uncommitted_files, target_str
+        "Worktree: {}  HEAD: {}  {}  {}",
+        wt.path, head, dirty_str, target_str
     )?;
 
     writeln!(w)?;
@@ -292,7 +302,7 @@ mod tests {
                 path: "/work".to_string(),
                 target_dir_artifacts: Some(1069),
                 target_dir_bytes: Some(3221225472),
-                uncommitted_files: 2,
+                uncommitted_files: Some(2),
                 head_sha: Some("42bffd9abc".to_string()),
             },
         }

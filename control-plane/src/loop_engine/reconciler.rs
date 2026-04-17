@@ -58,6 +58,7 @@ impl Reconciler {
                 },
                 _ = cleanup_interval.tick() => {
                     self.sweep_old_pod_snapshots().await;
+                    continue;
                 },
                 _ = wait_for_cancel(&cancel) => {
                     tracing::info!("Reconciler shutting down");

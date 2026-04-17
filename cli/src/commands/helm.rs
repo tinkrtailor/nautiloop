@@ -738,7 +738,7 @@ async fn poll_introspect_for_loop(
         match ps::fetch(&client, &loop_id_str).await {
             Ok(ps::FetchResult::Ok(snapshot)) => {
                 if event_tx
-                    .send(AppEvent::IntrospectSnapshot(loop_id, snapshot))
+                    .send(AppEvent::IntrospectSnapshot(loop_id, *snapshot))
                     .is_err()
                 {
                     return;
@@ -1432,9 +1432,15 @@ fn render_introspect_pane(app: &App) -> Paragraph<'static> {
         lines.push(Line::from(vec![
             Span::styled("HEAD ", Style::default().fg(MUTED)),
             Span::styled(head.to_string(), Style::default().fg(TEXT)),
-            Span::styled(format!("  dirty={}", wt.uncommitted_files), Style::default().fg(
-                if wt.uncommitted_files > 0 { AMBER } else { TEXT }
-            )),
+            Span::styled(
+                match wt.uncommitted_files {
+                    Some(n) => format!("  dirty={n}"),
+                    None => "  dirty=?".to_string(),
+                },
+                Style::default().fg(
+                    if wt.uncommitted_files.unwrap_or(0) > 0 { AMBER } else { TEXT }
+                ),
+            ),
             Span::styled(format!("  target={target_info}"), Style::default().fg(MUTED)),
         ]));
 
