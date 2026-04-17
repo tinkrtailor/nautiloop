@@ -1,0 +1,70 @@
+{
+  "round": 4,
+  "source": "review",
+  "issues": [
+    {
+      "severity": "high",
+      "category": "correctness",
+      "file": "control-plane/src/loop_engine/driver.rs",
+      "line": 94,
+      "description": "FR-5b violation: cancel path bypasses judge decision backfill. `handle_cancel` at line 94 returns early before the backfill code at line 118. When a loop is cancelled, `handle_cancel` transitions to `LoopState::Cancelled` (a terminal state per `is_terminal()`), but the `return` exits `tick()` before the `!was_terminal && new_state.is_terminal()` backfill block ever runs. On subsequent ticks, the terminal early-return at line 80 fires, also skipping backfill. Result: `judge_decisions` rows for cancelled loops never get `loop_final_state` and `loop_terminated_at` populated, corrupting the Stage 2 training dataset. The spec explicitly lists `Cancelled` as a terminal state that should trigger backfill.",
+      "suggestion": "Move the backfill call into `handle_cancel` before returning, or restructure `tick()` so the cancel path flows through the backfill block. For example, instead of `return self.handle_cancel(&record).await;`, assign it to `new_state` and let execution continue to the backfill check."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/loop_engine/driver.rs",
+      "line": 1073,
+      "description": "The normal reviewer-clean path (`Some(v) if v.clean =>` at line 1074) is not refactored to use `review_converge_clean`, so ship-mode logic is duplicated across ~120 lines of the original path and another ~120 lines in `review_converge_clean`. The two copies handle the same ship-mode/CI/merge logic independently, creating divergence risk. Any future bug fix or behavior change to one path will likely miss the other.",
+      "suggestion": "Refactor the normal clean verdict path (`Some(v) if v.clean =>`) to also call `review_converge_clean`, eliminating the duplication. This was likely the intent given the method comment says 'Shared by the normal clean path and judge exit_clean.'"
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/loop_engine/driver.rs",
+      "line": 839,
+      "description": "At harden max_rounds in the revise evaluation path, when the judge returns `Continue`, execution falls through to the generic 'Max harden rounds exceeded' failure message (line ~870). The judge's reasoning is discarded. In contrast, `ExitFail` correctly preserves the judge reasoning. A judge returning Continue at max_rounds signals it analyzed the situation and decided continuation was the right call (but can't because of the limit) — its reasoning about *why* it wanted to continue would help the engineer understand the state.",
+      "suggestion": "Include the judge reasoning in the failure message for the Continue-at-max-rounds case, e.g., `format!(\"Max harden rounds ({}) exceeded. Judge wanted to continue: {}\", record.max_rounds, judge_output.reasoning)`."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/loop_engine/judge.rs",
+      "line": 322,
+      "description": "Every non-clean verdict invokes the judge (determine_trigger always returns Some), consuming the 10-call cost ceiling budget on early rounds with straightforward issues. A 10-round loop where the first 10 rounds have simple fixable issues will exhaust the budget, causing the critical max_rounds decision (round 11+) to fall back to heuristics — exactly the case where the judge adds the most value. The spec's cost ceiling (NFR-1) was designed to cap spend, but the indiscriminate triggering undermines its effectiveness.",
+      "suggestion": "Consider skipping the judge on early rounds (e.g., round < 3) when there are no recurring findings and the verdict is a clear not_clean with progress being made. This preserves budget for the ambiguous max_rounds and churn cases where the judge provides the most value."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/loop_engine/judge.rs",
+      "line": 186,
+      "description": "JudgeInput truncation budget math doesn't account for `current_verdict` and `recurring_findings` fields. MAX_SPEC_CHARS (12K) + MAX_ROUND_CHARS (8K) + MAX_VERDICT_CHARS (4K) = 24K chars before the prompt template, loop_id, spec_path, phase, round numbers. With a 32K char budget (~8K tokens), the remaining fields (prompt template ~2K, recurring_findings unbounded, JSON overhead) can push total input over the 8K token budget specified in FR-4b. The `recurring_findings` array is never truncated and could grow large in churn-heavy loops.",
+      "suggestion": "Add truncation for `recurring_findings` (e.g., keep at most 10 entries) and include all fields in the overall budget calculation. Reduce individual field budgets to ensure the total stays within ~28K chars (leaving headroom for overhead)."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/state/mod.rs",
+      "line": 100,
+      "description": "The `count_judge_decisions` method is defined in the `StateStore` trait, implemented in both `MemoryStateStore` and `PgStateStore`, but is never called anywhere. The actual code uses `judge_decision_stats` which combines the count with the exit_clean check. This is dead code adding maintenance burden to all StateStore implementors.",
+      "suggestion": "Remove `count_judge_decisions` from the trait and all implementations since `judge_decision_stats` subsumes its functionality."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "cli/src/commands/inspect.rs",
+      "line": 68,
+      "description": "The flat judge_decisions summary at the bottom of inspect output always prints, even when all decisions are already shown inline with their rounds. This creates redundant output — the same decisions appear twice. FR-6c asks for decisions 'inline with each round', not additionally as a separate section.",
+      "suggestion": "Either remove the flat summary section when all decisions are already nested inline, or add a `--verbose` flag to show the flat summary only when requested."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "control-plane/src/loop_engine/driver.rs",
+      "line": 1525,
+      "description": "The `review_converge_clean` final log message always says 'judge exit_clean' even though the method comment says it's 'Shared by the normal clean path and judge exit_clean.' If the normal clean path is later refactored to call this method, the log message would be misleading.",
+      "suggestion": "Use a generic log message like 'Loop CONVERGED' without 'judge exit_clean', or accept a parameter indicating the source."
+    }
+  ]
+}
