@@ -181,6 +181,10 @@ pub struct FeedbackFile {
     pub issues: Option<Vec<Issue>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failures: Option<Vec<TestFailure>>,
+    /// Orchestrator judge hint injected when the judge decides to continue
+    /// with guidance. Agents are instructed to weight these heavily.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orchestrator_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +193,112 @@ pub enum FeedbackSource {
     Review,
     Test,
     Audit,
+}
+
+// --- Orchestrator Judge types (FR-2, FR-3) ---
+
+/// Input context for the orchestrator judge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JudgeInput {
+    pub loop_id: uuid::Uuid,
+    pub spec_path: String,
+    pub spec_content: String,
+    pub phase: String,
+    pub round: i32,
+    pub max_rounds: i32,
+    pub rounds: Vec<JudgeRoundSummary>,
+    pub current_verdict: serde_json::Value,
+    pub recurring_findings: Vec<RecurringFinding>,
+}
+
+/// Summary of a round for the judge context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JudgeRoundSummary {
+    pub round: i32,
+    pub stage: String,
+    pub verdict: Option<serde_json::Value>,
+    pub duration_secs: Option<i64>,
+}
+
+/// A finding that recurs across multiple rounds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecurringFinding {
+    pub category: Option<String>,
+    pub file: Option<String>,
+    pub line: Option<u32>,
+    pub seen_in_rounds: Vec<i32>,
+}
+
+/// Structured decision returned by the orchestrator judge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JudgeOutput {
+    pub decision: JudgeDecision,
+    pub confidence: f64,
+    pub reasoning: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+/// The four possible judge decisions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgeDecision {
+    Continue,
+    ExitClean,
+    ExitEscalate,
+    ExitFail,
+}
+
+impl JudgeDecision {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Continue => "continue",
+            Self::ExitClean => "exit_clean",
+            Self::ExitEscalate => "exit_escalate",
+            Self::ExitFail => "exit_fail",
+        }
+    }
+
+    pub fn parse_decision(s: &str) -> Option<Self> {
+        match s {
+            "continue" => Some(Self::Continue),
+            "exit_clean" => Some(Self::ExitClean),
+            "exit_escalate" => Some(Self::ExitEscalate),
+            "exit_fail" => Some(Self::ExitFail),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for JudgeDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Trigger reason for a judge invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgeTrigger {
+    NotClean,
+    MaxRounds,
+    RecurringFindings,
+}
+
+impl JudgeTrigger {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NotClean => "not_clean",
+            Self::MaxRounds => "max_rounds",
+            Self::RecurringFindings => "recurring_findings",
+        }
+    }
+}
+
+impl std::fmt::Display for JudgeTrigger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
 }
 
 #[cfg(test)]
@@ -276,6 +386,7 @@ mod tests {
                 suggestion: "Add early return".to_string(),
             }]),
             failures: None,
+            orchestrator_hint: None,
         };
         let json = serde_json::to_string(&feedback).unwrap();
         assert!(json.contains("\"source\":\"review\""));
@@ -295,6 +406,7 @@ mod tests {
                 stdout: "panicked".to_string(),
                 stderr: "error".to_string(),
             }]),
+            orchestrator_hint: None,
         };
         let json = serde_json::to_string(&feedback).unwrap();
         assert!(json.contains("\"source\":\"test\""));

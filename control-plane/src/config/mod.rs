@@ -26,6 +26,8 @@ pub struct NautiloopConfig {
     pub ship: ShipConfig,
     #[serde(default)]
     pub harden: HardenMergeConfig,
+    #[serde(default)]
+    pub orchestrator: OrchestratorConfig,
     /// Service definitions: `[services.<name>]` with `path` and `test` fields.
     /// Used by the control plane to map changed file paths to services and
     /// look up test commands for the TEST stage (FR-42a, FR-42b).
@@ -158,6 +160,38 @@ impl Default for HardenMergeConfig {
             auto_merge_spec_pr: true,
         }
     }
+}
+
+/// Orchestrator judge configuration from `[orchestrator]` in nemo.toml.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrchestratorConfig {
+    /// Model for the orchestrator judge (default: claude-haiku-4-5).
+    #[serde(default = "default_judge_model")]
+    pub judge_model: String,
+    /// Enable orchestrator judge (default: true). When false, pure heuristic fallback.
+    #[serde(default = "default_true")]
+    pub judge_enabled: bool,
+    /// Max judge invocations per loop before falling back to heuristics (NFR-1).
+    #[serde(default = "default_max_judge_calls")]
+    pub max_judge_calls_per_loop: u32,
+}
+
+impl Default for OrchestratorConfig {
+    fn default() -> Self {
+        Self {
+            judge_model: default_judge_model(),
+            judge_enabled: true,
+            max_judge_calls_per_loop: default_max_judge_calls(),
+        }
+    }
+}
+
+fn default_judge_model() -> String {
+    "claude-haiku-4-5".to_string()
+}
+
+fn default_max_judge_calls() -> u32 {
+    10
 }
 
 fn default_true() -> bool {

@@ -8,8 +8,9 @@ use super::AppState;
 use crate::error::NautiloopError;
 use crate::state::LoopFlag;
 use crate::types::api::{
-    ApproveResponse, CancelResponse, CredentialRequest, InspectResponse, LogsQuery, LoopSummary,
-    ResumeResponse, RoundSummary, StartRequest, StartResponse, StatusQuery, StatusResponse,
+    ApproveResponse, CancelResponse, CredentialRequest, InspectResponse, JudgeDecisionSummary,
+    LogsQuery, LoopSummary, ResumeResponse, RoundSummary, StartRequest, StartResponse,
+    StatusQuery, StatusResponse,
 };
 use crate::types::{LoopKind, LoopRecord, LoopState, generate_branch_name};
 
@@ -672,12 +673,32 @@ pub async fn inspect(
         }
     }
 
+    // Fetch judge decisions for this loop (FR-6c)
+    let judge_decisions = state
+        .store
+        .get_judge_decisions(record.id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|d| JudgeDecisionSummary {
+            round: d.round,
+            phase: d.phase,
+            trigger: d.trigger,
+            decision: d.decision,
+            confidence: d.confidence,
+            reasoning: d.reasoning,
+            hint: d.hint,
+            duration_ms: d.duration_ms,
+        })
+        .collect();
+
     Ok(Json(InspectResponse {
         loop_id: record.id,
         engineer: record.engineer,
         branch: record.branch,
         state: record.state,
         rounds: round_summaries.into_values().collect(),
+        judge_decisions,
     }))
 }
 

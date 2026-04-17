@@ -6,10 +6,11 @@ use crate::error::{NautiloopError, Result};
 use crate::git::GitOperations;
 use crate::k8s::job_builder;
 use crate::k8s::{JobDispatcher, JobStatus};
+use crate::loop_engine::judge::OrchestratorJudge;
 use crate::state::StateStore;
 use crate::types::verdict::{
-    AuditVerdict, FeedbackFile, FeedbackSource, ReviewResultData, ReviewVerdict, TestOutput,
-    TestResultData,
+    AuditVerdict, FeedbackFile, FeedbackSource, JudgeDecision, ReviewResultData, ReviewVerdict,
+    TestOutput, TestResultData,
 };
 use crate::types::{
     LogEvent, LoopContext, LoopKind, LoopRecord, LoopState, RoundRecord, StageConfig, SubState,
@@ -21,6 +22,7 @@ pub struct ConvergentLoopDriver {
     dispatcher: Arc<dyn JobDispatcher>,
     git: Arc<dyn GitOperations>,
     config: NautiloopConfig,
+    judge: Option<Arc<OrchestratorJudge>>,
 }
 
 impl ConvergentLoopDriver {
@@ -35,7 +37,14 @@ impl ConvergentLoopDriver {
             dispatcher,
             git,
             config,
+            judge: None,
         }
+    }
+
+    /// Set the orchestrator judge for LLM-driven transition decisions.
+    pub fn with_judge(mut self, judge: Arc<OrchestratorJudge>) -> Self {
+        self.judge = Some(judge);
+        self
     }
 
     /// Build the K8s job configuration from cluster config.
@@ -63,6 +72,8 @@ impl ConvergentLoopDriver {
             .await?
             .ok_or(NautiloopError::LoopNotFound { id: loop_id })?;
 
+        let was_terminal = record.state.is_terminal();
+
         // Terminal states: clear stale flags and return, EXCEPT for
         // FAILED with a pending resume_requested flag — issue #96 lets
         // `nemo resume` bring a transient-failed loop back into the loop.
@@ -84,7 +95,7 @@ impl ConvergentLoopDriver {
             return self.handle_cancel(&record).await;
         }
 
-        match record.state {
+        let new_state = match record.state {
             LoopState::Pending => self.handle_pending(&record).await,
             LoopState::Hardening => self.handle_active_stage(&record).await,
             LoopState::AwaitingApproval => self.handle_awaiting_approval(&record).await,
@@ -95,7 +106,26 @@ impl ConvergentLoopDriver {
             LoopState::AwaitingReauth => self.handle_awaiting_reauth(&record).await,
             // Terminal states handled above; this arm is unreachable but required for exhaustiveness
             _ => Ok(record.state),
+        }?;
+
+        // FR-5b: When a loop reaches a terminal state, back-fill loop_final_state
+        // on all judge_decisions rows for this loop.
+        if !was_terminal && new_state.is_terminal() {
+            let now = chrono::Utc::now();
+            if let Err(e) = self
+                .store
+                .backfill_judge_outcomes(loop_id, &new_state.to_string(), now)
+                .await
+            {
+                tracing::warn!(
+                    loop_id = %loop_id,
+                    error = %e,
+                    "Failed to backfill judge decision outcomes (non-fatal)"
+                );
+            }
         }
+
+        Ok(new_state)
     }
 
     /// Handle PENDING state: determine first stage and dispatch.
@@ -639,9 +669,67 @@ impl ConvergentLoopDriver {
                             Ok(LoopState::AwaitingApproval)
                         }
                     }
-                    Some(_v) => {
-                        // Audit found issues: dispatch revise
-                        self.dispatch_revise(record).await
+                    Some(v) => {
+                        // Audit found issues: invoke judge before deciding
+                        let verdict_json = last_round
+                            .and_then(|r| r.output.clone())
+                            .unwrap_or(serde_json::json!({}));
+
+                        if let Some(judge_output) = self
+                            .invoke_judge_for_stage(
+                                record, "harden", &verdict_json, &v.issues, &rounds,
+                            )
+                            .await
+                        {
+                            match judge_output.decision {
+                                JudgeDecision::Continue => {
+                                    // Continue with revise as normal
+                                    self.dispatch_revise(record).await
+                                }
+                                JudgeDecision::ExitClean => {
+                                    // Override: treat as clean, same as v.clean == true path
+                                    if record.harden_only {
+                                        self.harden_converge_clean(record).await
+                                    } else if record.auto_approve {
+                                        self.start_implementing(record).await
+                                    } else {
+                                        record.state = LoopState::AwaitingApproval;
+                                        record.sub_state = None;
+                                        record.active_job_name = None;
+                                        self.store.update_loop(record).await?;
+                                        tracing::info!(loop_id = %record.id, "Judge exit_clean -> AWAITING_APPROVAL");
+                                        Ok(LoopState::AwaitingApproval)
+                                    }
+                                }
+                                JudgeDecision::ExitEscalate => {
+                                    record.state = LoopState::AwaitingApproval;
+                                    record.sub_state = None;
+                                    record.active_job_name = None;
+                                    record.failure_reason = Some(format!(
+                                        "Judge escalated: {}",
+                                        judge_output.reasoning
+                                    ));
+                                    self.store.update_loop(record).await?;
+                                    tracing::info!(loop_id = %record.id, "Judge exit_escalate -> AWAITING_APPROVAL");
+                                    Ok(LoopState::AwaitingApproval)
+                                }
+                                JudgeDecision::ExitFail => {
+                                    record.state = LoopState::Failed;
+                                    record.sub_state = None;
+                                    record.active_job_name = None;
+                                    record.failure_reason = Some(format!(
+                                        "Judge failed: {}",
+                                        judge_output.reasoning
+                                    ));
+                                    self.store.update_loop(record).await?;
+                                    tracing::info!(loop_id = %record.id, "Judge exit_fail -> FAILED");
+                                    Ok(LoopState::Failed)
+                                }
+                            }
+                        } else {
+                            // No judge (disabled/error/timeout): use heuristic
+                            self.dispatch_revise(record).await
+                        }
                     }
                     None => {
                         // Verdict parse failure: retry per FR-9
@@ -679,8 +767,47 @@ impl ConvergentLoopDriver {
                     record.spec_path = new_path.clone();
                 }
 
-                // After revise: check max rounds, then re-audit
+                // After revise: invoke judge if near max rounds or recurring findings
                 if record.round >= record.max_rounds {
+                    // At max rounds: invoke judge for final disposition
+                    let verdict_json = last_round
+                        .and_then(|r| r.output.clone())
+                        .unwrap_or(serde_json::json!({}));
+
+                    if let Some(judge_output) = self
+                        .invoke_judge_for_stage(record, "harden", &verdict_json, &[], &rounds)
+                        .await
+                    {
+                        match judge_output.decision {
+                            JudgeDecision::ExitClean => {
+                                if record.harden_only {
+                                    return self.harden_converge_clean(record).await;
+                                } else if record.auto_approve {
+                                    return self.start_implementing(record).await;
+                                } else {
+                                    record.state = LoopState::AwaitingApproval;
+                                    record.sub_state = None;
+                                    record.active_job_name = None;
+                                    self.store.update_loop(record).await?;
+                                    return Ok(LoopState::AwaitingApproval);
+                                }
+                            }
+                            JudgeDecision::ExitEscalate => {
+                                record.state = LoopState::AwaitingApproval;
+                                record.sub_state = None;
+                                record.active_job_name = None;
+                                record.failure_reason = Some(format!(
+                                    "Judge escalated at max rounds: {}",
+                                    judge_output.reasoning
+                                ));
+                                self.store.update_loop(record).await?;
+                                return Ok(LoopState::AwaitingApproval);
+                            }
+                            // continue or exit_fail: fall through to existing max-rounds failure
+                            _ => {}
+                        }
+                    }
+
                     record.state = LoopState::Failed;
                     record.sub_state = None;
                     record.failure_reason = Some(format!(
@@ -845,6 +972,7 @@ impl ConvergentLoopDriver {
                     source: FeedbackSource::Test,
                     issues: None,
                     failures,
+                    orchestrator_hint: None,
                 };
 
                 record.round += 1;
@@ -1016,7 +1144,86 @@ impl ConvergentLoopDriver {
                 }
             }
             Some(v) => {
-                // Review found issues: feed back to implement
+                // Review found issues: invoke judge before deciding
+                let verdict_json = review_round
+                    .and_then(|r| r.output.clone())
+                    .unwrap_or(serde_json::json!({}));
+
+                if let Some(judge_output) = self
+                    .invoke_judge_for_stage(
+                        record, "review", &verdict_json, &v.issues, &rounds,
+                    )
+                    .await
+                {
+                    match judge_output.decision {
+                        JudgeDecision::ExitClean => {
+                            // Override: treat as clean, create PR and converge
+                            return self.review_converge_clean(record).await;
+                        }
+                        JudgeDecision::ExitEscalate => {
+                            record.state = LoopState::AwaitingApproval;
+                            record.sub_state = None;
+                            record.active_job_name = None;
+                            record.failure_reason = Some(format!(
+                                "Judge escalated: {}",
+                                judge_output.reasoning
+                            ));
+                            self.store.update_loop(record).await?;
+                            tracing::info!(loop_id = %record.id, "Judge exit_escalate -> AWAITING_APPROVAL");
+                            return Ok(LoopState::AwaitingApproval);
+                        }
+                        JudgeDecision::ExitFail => {
+                            record.state = LoopState::Failed;
+                            record.sub_state = None;
+                            record.active_job_name = None;
+                            record.failure_reason = Some(format!(
+                                "Judge failed: {}",
+                                judge_output.reasoning
+                            ));
+                            self.store.update_loop(record).await?;
+                            tracing::info!(loop_id = %record.id, "Judge exit_fail -> FAILED");
+                            return Ok(LoopState::Failed);
+                        }
+                        JudgeDecision::Continue => {
+                            // Fall through to normal feedback dispatch,
+                            // but inject the hint if present
+                            if record.round >= record.max_rounds {
+                                record.state = LoopState::Failed;
+                                record.sub_state = None;
+                                record.failure_reason = Some(format!(
+                                    "Max implement rounds ({}) exceeded",
+                                    record.max_rounds
+                                ));
+                                record.active_job_name = None;
+                                self.store.update_loop(record).await?;
+                                return Ok(LoopState::Failed);
+                            }
+
+                            let feedback = FeedbackFile {
+                                round: record.round as u32,
+                                source: FeedbackSource::Review,
+                                issues: Some(v.issues),
+                                failures: None,
+                                orchestrator_hint: judge_output.hint,
+                            };
+
+                            record.round += 1;
+                            let feedback_path = format!(
+                                ".agent/review-feedback-round-{}.json",
+                                record.round - 1
+                            );
+                            return self
+                                .dispatch_implement_with_feedback(
+                                    record,
+                                    &feedback,
+                                    &feedback_path,
+                                )
+                                .await;
+                        }
+                    }
+                }
+
+                // No judge (disabled/error/timeout): use heuristic
                 if record.round >= record.max_rounds {
                     record.state = LoopState::Failed;
                     record.sub_state = None;
@@ -1034,6 +1241,7 @@ impl ConvergentLoopDriver {
                     source: FeedbackSource::Review,
                     issues: Some(v.issues),
                     failures: None,
+                    orchestrator_hint: None,
                 };
 
                 record.round += 1;
@@ -1047,6 +1255,127 @@ impl ConvergentLoopDriver {
                 self.handle_verdict_parse_failure(record).await
             }
         }
+    }
+
+    /// Invoke the orchestrator judge for a stage transition.
+    /// Returns None if the judge is disabled, not configured, or fails.
+    async fn invoke_judge_for_stage(
+        &self,
+        record: &LoopRecord,
+        phase: &str,
+        current_verdict: &serde_json::Value,
+        current_issues: &[crate::types::verdict::Issue],
+        rounds: &[RoundRecord],
+    ) -> Option<crate::types::verdict::JudgeOutput> {
+        let judge = self.judge.as_ref()?;
+
+        // FR-1c: Skip judge on clean verdicts at round 1 (handled by caller).
+        // Read spec content for the judge context.
+        let spec_content = self
+            .git
+            .read_file(&record.spec_path, &record.branch)
+            .await
+            .unwrap_or_else(|_| String::new());
+
+        judge
+            .evaluate(
+                record.id,
+                &record.spec_path,
+                &spec_content,
+                phase,
+                record.round,
+                record.max_rounds,
+                current_verdict,
+                current_issues,
+                rounds,
+            )
+            .await
+    }
+
+    /// Converge the harden loop as clean (shared by audit clean path and judge exit_clean).
+    async fn harden_converge_clean(&self, record: &mut LoopRecord) -> Result<LoopState> {
+        if let Err(e) = self.git.remove_path(&record.branch, ".agent").await {
+            tracing::warn!(loop_id = %record.id, error = %e, "Failed to clean up .agent/ artifacts, proceeding with PR");
+        }
+
+        let pr_title = format!(
+            "chore(spec): harden {} for {}",
+            record.spec_path, record.engineer,
+        );
+        let pr_body = format!(
+            "Spec hardening completed in {} round(s).\n\nSpec: {}\nBranch: {}",
+            record.round, record.spec_path, record.branch,
+        );
+        let pr_url = self
+            .git
+            .create_pr(
+                &record.branch,
+                &pr_title,
+                &pr_body,
+                &self.default_branch_for(record),
+            )
+            .await?;
+        record.spec_pr_url = Some(pr_url);
+
+        if self.config.harden.auto_merge_spec_pr {
+            let merge_sha = self
+                .git
+                .merge_pr(
+                    &record.branch,
+                    &self.config.harden.merge_strategy,
+                    &self.default_branch_for(record),
+                )
+                .await?;
+            record.merge_sha = Some(merge_sha);
+            record.merged_at = Some(chrono::Utc::now());
+        }
+
+        record.state = LoopState::Hardened;
+        record.sub_state = None;
+        record.active_job_name = None;
+        record.hardened_spec_path = Some(record.spec_path.clone());
+        self.store.update_loop(record).await?;
+        tracing::info!(loop_id = %record.id, "Harden loop HARDENED");
+        Ok(LoopState::Hardened)
+    }
+
+    /// Converge the review stage as clean: create PR and transition to Converged/Shipped.
+    /// Shared by the normal clean path and judge exit_clean.
+    async fn review_converge_clean(&self, record: &mut LoopRecord) -> Result<LoopState> {
+        // Create PR if not already created (idempotent across ticks)
+        if record.spec_pr_url.is_none() {
+            if let Err(e) = self.git.remove_path(&record.branch, ".agent").await {
+                tracing::warn!(loop_id = %record.id, error = %e, "Failed to clean up .agent/ artifacts, proceeding with PR");
+            }
+
+            let pr_title =
+                format!("feat(agent): {} for {}", record.spec_path, record.engineer,);
+            let pr_body = format!(
+                "Automated convergence loop completed in {} round(s).\n\nSpec: {}\nBranch: {}",
+                record.round, record.spec_path, record.branch,
+            );
+            let pr_url = self
+                .git
+                .create_pr(
+                    &record.branch,
+                    &pr_title,
+                    &pr_body,
+                    &self.default_branch_for(record),
+                )
+                .await?;
+            record.spec_pr_url = Some(pr_url);
+            self.store.update_loop(record).await?;
+        }
+
+        // Standard CONVERGED (no ship mode logic for judge exit_clean
+        // to keep it simple; ship mode auto-merge only triggers on
+        // genuine reviewer clean verdicts)
+        record.state = LoopState::Converged;
+        record.sub_state = None;
+        record.active_job_name = None;
+        self.store.update_loop(record).await?;
+        tracing::info!(loop_id = %record.id, round = record.round, "Loop CONVERGED (judge exit_clean)");
+        Ok(LoopState::Converged)
     }
 
     /// Handle AWAITING_APPROVAL: check for approve flag.

@@ -5,7 +5,8 @@ use uuid::Uuid;
 
 use crate::error::Result;
 use crate::types::{
-    EngineerCredential, LogEvent, LoopRecord, LoopState, MergeEvent, RoundRecord, SubState,
+    EngineerCredential, JudgeDecisionRecord, LogEvent, LoopRecord, LoopState, MergeEvent,
+    RoundRecord, SubState,
 };
 
 /// Trait abstracting all database operations for the control plane.
@@ -96,6 +97,24 @@ pub trait StateStore: Send + Sync + 'static {
     /// Create a merge event record (NFR-8).
     async fn create_merge_event(&self, event: &MergeEvent) -> Result<()>;
 
+    /// Create a judge decision record.
+    async fn create_judge_decision(&self, record: &JudgeDecisionRecord) -> Result<()>;
+
+    /// Get all judge decisions for a loop.
+    async fn get_judge_decisions(&self, loop_id: Uuid) -> Result<Vec<JudgeDecisionRecord>>;
+
+    /// Count judge decisions for a loop (for cost ceiling enforcement).
+    async fn count_judge_decisions(&self, loop_id: Uuid) -> Result<i64>;
+
+    /// Back-fill loop_final_state and loop_terminated_at on all judge_decisions
+    /// rows for a loop when it reaches a terminal state (FR-5b).
+    async fn backfill_judge_outcomes(
+        &self,
+        loop_id: Uuid,
+        final_state: &str,
+        terminated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()>;
+
     /// Try to acquire a per-loop advisory lock (for reconciler coordination).
     /// Returns `Some(guard_id)` if acquired, `None` if held by another session.
     /// The lock is session-scoped on a dedicated connection held internally.
@@ -161,6 +180,7 @@ pub mod memory {
         logs: Arc<RwLock<Vec<LogEvent>>>,
         credentials: Arc<RwLock<Vec<EngineerCredential>>>,
         merge_events: Arc<RwLock<Vec<MergeEvent>>>,
+        judge_decisions: Arc<RwLock<Vec<JudgeDecisionRecord>>>,
     }
 
     impl MemoryStateStore {
@@ -410,6 +430,40 @@ pub mod memory {
         async fn create_merge_event(&self, event: &MergeEvent) -> Result<()> {
             let mut events = self.merge_events.write().await;
             events.push(event.clone());
+            Ok(())
+        }
+
+        async fn create_judge_decision(&self, record: &JudgeDecisionRecord) -> Result<()> {
+            let mut decisions = self.judge_decisions.write().await;
+            decisions.push(record.clone());
+            Ok(())
+        }
+
+        async fn get_judge_decisions(&self, loop_id: Uuid) -> Result<Vec<JudgeDecisionRecord>> {
+            let decisions = self.judge_decisions.read().await;
+            Ok(decisions
+                .iter()
+                .filter(|d| d.loop_id == loop_id)
+                .cloned()
+                .collect())
+        }
+
+        async fn count_judge_decisions(&self, loop_id: Uuid) -> Result<i64> {
+            let decisions = self.judge_decisions.read().await;
+            Ok(decisions.iter().filter(|d| d.loop_id == loop_id).count() as i64)
+        }
+
+        async fn backfill_judge_outcomes(
+            &self,
+            loop_id: Uuid,
+            final_state: &str,
+            terminated_at: chrono::DateTime<chrono::Utc>,
+        ) -> Result<()> {
+            let mut decisions = self.judge_decisions.write().await;
+            for d in decisions.iter_mut().filter(|d| d.loop_id == loop_id) {
+                d.loop_final_state = Some(final_state.to_string());
+                d.loop_terminated_at = Some(terminated_at);
+            }
             Ok(())
         }
 

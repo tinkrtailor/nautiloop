@@ -139,12 +139,29 @@ async fn main() -> anyhow::Result<()> {
                 nautiloop_control_plane::git::bare::BareRepoGitOperations::new(&bare_repo_path),
             );
 
-            let driver = Arc::new(ConvergentLoopDriver::new(
+            let mut driver = ConvergentLoopDriver::new(
                 store.clone(),
                 dispatcher,
                 git,
                 config.clone(),
-            ));
+            );
+
+            // Wire up the orchestrator judge if enabled
+            if config.orchestrator.judge_enabled {
+                let judge_client = Arc::new(
+                    nautiloop_control_plane::loop_engine::judge::SidecarJudgeClient::new(),
+                );
+                let judge = Arc::new(
+                    nautiloop_control_plane::loop_engine::judge::OrchestratorJudge::new(
+                        config.orchestrator.clone(),
+                        store.clone(),
+                        judge_client,
+                    ),
+                );
+                driver = driver.with_judge(judge);
+            }
+
+            let driver = Arc::new(driver);
 
             let wake = Arc::new(Notify::new());
 
