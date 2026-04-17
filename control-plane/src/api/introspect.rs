@@ -133,16 +133,12 @@ pub async fn pod_introspect(
 
     let collected_at = Utc::now();
 
-    // Parse exec output — timeout → 503, other failures → partial snapshot (NFR-4)
+    // Parse exec output — timeout/failure → partial snapshot with metrics (FR-2c, NFR-4)
     let (processes, worktree) = match exec_result {
         Ok(output) => parse_introspect_output(&output),
         Err(ExecError::Timeout(msg)) => {
-            tracing::warn!(pod = %pod_name, error = %msg, "introspect exec timed out");
-            return Ok((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "pod introspection timeout"})),
-            )
-                .into_response());
+            tracing::warn!(pod = %pod_name, error = %msg, "introspect exec timed out, returning partial snapshot");
+            (Vec::new(), default_worktree())
         }
         Err(ExecError::Other(e)) => {
             tracing::warn!(pod = %pod_name, error = %e, "introspect exec failed, returning partial");

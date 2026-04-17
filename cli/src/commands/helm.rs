@@ -406,6 +406,7 @@ async fn run_app(
                     app.reset_logs();
                     app.reset_inspect();
                     app.introspect = None;
+                    app.introspect_status = "Loading...".to_string();
                     let _ = selection_tx.send(app.current_log_selection());
                     let _ = inspect_tx.send(app.selected_branch());
                     if app.side_panel == SidePanel::Introspect {
@@ -726,8 +727,8 @@ async fn poll_introspect_for_loop(
     loop_id: uuid::Uuid,
     event_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
+    let loop_id_str = loop_id.to_string();
     loop {
-        let loop_id_str = loop_id.to_string();
         match ps::fetch(&client, &loop_id_str).await {
             Ok(ps::FetchResult::Ok(snapshot)) => {
                 if event_tx
