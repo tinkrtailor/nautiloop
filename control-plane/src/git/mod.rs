@@ -147,6 +147,22 @@ pub mod bare {
             author_email: &str,
             commit_message: &str,
         ) -> Result<()> {
+            // Reject control characters (newlines, NUL, etc.) in author fields to prevent
+            // git config injection or malformed commits.
+            fn has_control_chars(s: &str) -> bool {
+                s.bytes().any(|b| b < 0x20 || b == 0x7f)
+            }
+            if has_control_chars(author_name) {
+                return Err(crate::error::NautiloopError::Git(
+                    "author_name contains control characters".to_string(),
+                ));
+            }
+            if has_control_chars(author_email) {
+                return Err(crate::error::NautiloopError::Git(
+                    "author_email contains control characters".to_string(),
+                ));
+            }
+
             let file_path = std::path::Path::new(worktree_dir).join(path);
             if let Some(parent) = file_path.parent() {
                 tokio::fs::create_dir_all(parent).await.map_err(|e| {

@@ -52,51 +52,56 @@ pub async fn start(
     // Fetch latest from remote so spec validation and branch creation use current state
     state.git.fetch().await?;
 
-    // FR-3c: validate spec_path — no traversal, no absolute paths, must end in .md.
-    if req.spec_path.contains('\\') {
-        return Err(NautiloopError::BadRequest(
-            "spec_path must not contain backslashes".to_string(),
-        ));
-    }
-    if req.spec_path.starts_with('/') {
-        return Err(NautiloopError::BadRequest(
-            "spec_path must not start with '/'".to_string(),
-        ));
-    }
-    // Check for ".." as a path component (traversal), not as a substring.
-    // This allows legitimate filenames containing ".." (e.g. "v2..final.md").
-    if req.spec_path.split('/').any(|seg| seg == "..") {
-        return Err(NautiloopError::BadRequest(
-            "spec_path must not contain '..' path traversal".to_string(),
-        ));
-    }
-    if !req.spec_path.ends_with(".md") {
-        return Err(NautiloopError::BadRequest(
-            "spec_path must end with '.md'".to_string(),
-        ));
-    }
-    // Reject paths with empty stem (e.g. ".md", "  .md") or control characters.
-    let stem = req
-        .spec_path
-        .rsplit('/')
-        .next()
-        .unwrap_or(&req.spec_path)
-        .strip_suffix(".md")
-        .unwrap_or("");
-    if stem.is_empty() || stem.trim().is_empty() {
-        return Err(NautiloopError::BadRequest(
-            "spec_path filename must have a non-empty name before '.md'".to_string(),
-        ));
-    }
-    if req.spec_path.bytes().any(|b| b < 0x20) {
-        return Err(NautiloopError::BadRequest(
-            "spec_path must not contain control characters".to_string(),
-        ));
-    }
-
     // Determine spec source: local upload (FR-1b) or default branch (FR-2b).
     let default_ref = state.config.default_remote_ref();
-    let spec_from_local: bool;
+    let spec_from_local = req.spec_content.is_some();
+
+    // FR-3c: validate spec_path when spec_content is provided (local upload).
+    // Legacy callers (FR-2b) are not subject to new validation per NFR-1 backward compat;
+    // they rely on the existing git read_file call which naturally rejects invalid paths.
+    if spec_from_local {
+        if req.spec_path.contains('\\') {
+            return Err(NautiloopError::BadRequest(
+                "spec_path must not contain backslashes".to_string(),
+            ));
+        }
+        if req.spec_path.starts_with('/') {
+            return Err(NautiloopError::BadRequest(
+                "spec_path must not start with '/'".to_string(),
+            ));
+        }
+        // Check for ".." as a path component (traversal), not as a substring.
+        // This allows legitimate filenames containing ".." (e.g. "v2..final.md").
+        if req.spec_path.split('/').any(|seg| seg == "..") {
+            return Err(NautiloopError::BadRequest(
+                "spec_path must not contain '..' path traversal".to_string(),
+            ));
+        }
+        if !req.spec_path.ends_with(".md") {
+            return Err(NautiloopError::BadRequest(
+                "spec_path must end with '.md'".to_string(),
+            ));
+        }
+        // Reject paths with empty stem (e.g. ".md", "  .md") or control characters.
+        let stem = req
+            .spec_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&req.spec_path)
+            .strip_suffix(".md")
+            .unwrap_or("");
+        if stem.is_empty() || stem.trim().is_empty() {
+            return Err(NautiloopError::BadRequest(
+                "spec_path filename must have a non-empty name before '.md'".to_string(),
+            ));
+        }
+        if req.spec_path.bytes().any(|b| b < 0x20) {
+            return Err(NautiloopError::BadRequest(
+                "spec_path must not contain control characters".to_string(),
+            ));
+        }
+    }
+
     let spec_content = if let Some(content) = req.spec_content.take() {
         // Reject empty spec content — an empty spec is clearly invalid input.
         if content.is_empty() {
@@ -111,11 +116,9 @@ pub async fn start(
                 size: content.len(),
             });
         }
-        spec_from_local = true;
         content
     } else {
         // FR-2b: legacy path — read from default branch.
-        spec_from_local = false;
         state
             .git
             .read_file(&req.spec_path, &default_ref)
@@ -241,6 +244,7 @@ pub async fn start(
         let all_creds = match state.store.get_credentials(&req.engineer).await {
             Ok(c) => c,
             Err(e) => {
+                let _ = state.git.delete_branch(&branch).await;
                 let _ = state
                     .store
                     .update_loop_state(loop_id, LoopState::Failed, None)
@@ -248,6 +252,22 @@ pub async fn start(
                 return Err(e);
             }
         };
+        let has_stored_name = all_creds
+            .iter()
+            .any(|c| c.provider == "_name" && c.valid);
+        let has_stored_email = all_creds
+            .iter()
+            .any(|c| c.provider == "_email" && c.valid);
+        if !has_stored_name || !has_stored_email {
+            tracing::warn!(
+                loop_id = %loop_id,
+                engineer = %req.engineer,
+                has_name = has_stored_name,
+                has_email = has_stored_email,
+                "Engineer credentials incomplete; falling back to synthetic identity for spec commit. \
+                 Run `nemo auth` to set name/email."
+            );
+        }
         let engineer_name = all_creds
             .iter()
             .find(|c| c.provider == "_name" && c.valid)
@@ -286,6 +306,7 @@ pub async fn start(
                             branch = %branch,
                             "Branch SHA not found after spec commit"
                         );
+                        let _ = state.git.delete_branch(&branch).await;
                         let _ = state
                             .store
                             .update_loop_state(loop_id, LoopState::Failed, None)
@@ -301,6 +322,7 @@ pub async fn start(
                             error = %e,
                             "Failed to get branch SHA after spec commit"
                         );
+                        let _ = state.git.delete_branch(&branch).await;
                         let _ = state
                             .store
                             .update_loop_state(loop_id, LoopState::Failed, None)
@@ -310,6 +332,7 @@ pub async fn start(
                 }
             }
             Err(e) => {
+                let _ = state.git.delete_branch(&branch).await;
                 let _ = state
                     .store
                     .update_loop_state(loop_id, LoopState::Failed, None)
@@ -1784,5 +1807,64 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_start_legacy_non_md_path_not_rejected() {
+        // NFR-1: Legacy callers (no spec_content) should not be subject to new path
+        // validation. A non-.md path that exists on the default branch should still work.
+        let (app, _store, git) = test_app();
+        git.add_file("specs/README.txt", "# Readme\n").await;
+
+        let body = serde_json::json!({
+            "spec_path": "specs/README.txt",
+            "engineer": "alice"
+        });
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .method(http::Method::POST)
+                .uri("/start")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        )
+        .await;
+
+        // Legacy path: no spec_content → validation skipped → succeeds if file exists in git
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_start_local_spec_fallback_identity() {
+        // When no _name/_email credentials exist, the handler should still succeed
+        // using synthetic fallback identity (engineer name + @nautiloop.dev email).
+        let (app, _store, git) = test_app();
+
+        let body = serde_json::json!({
+            "spec_path": "specs/fallback-id.md",
+            "engineer": "bob",
+            "spec_content": "# Fallback identity test"
+        });
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .method(http::Method::POST)
+                .uri("/start")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        // Verify fallback identity was used
+        let calls = git.get_write_file_as_calls().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].author_name, "bob");
+        assert_eq!(calls[0].author_email, "bob@nautiloop.dev");
     }
 }
