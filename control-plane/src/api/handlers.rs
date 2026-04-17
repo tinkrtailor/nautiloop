@@ -252,32 +252,30 @@ pub async fn start(
                 return Err(e);
             }
         };
-        let has_stored_name = all_creds
-            .iter()
-            .any(|c| c.provider == "_name" && c.valid);
-        let has_stored_email = all_creds
-            .iter()
-            .any(|c| c.provider == "_email" && c.valid);
-        if !has_stored_name || !has_stored_email {
+        let mut engineer_name: Option<String> = None;
+        let mut engineer_email: Option<String> = None;
+        for c in &all_creds {
+            if c.valid {
+                if c.provider == "_name" && engineer_name.is_none() {
+                    engineer_name = Some(c.credential_ref.clone());
+                } else if c.provider == "_email" && engineer_email.is_none() {
+                    engineer_email = Some(c.credential_ref.clone());
+                }
+            }
+        }
+        if engineer_name.is_none() || engineer_email.is_none() {
             tracing::warn!(
                 loop_id = %loop_id,
                 engineer = %req.engineer,
-                has_name = has_stored_name,
-                has_email = has_stored_email,
+                has_name = engineer_name.is_some(),
+                has_email = engineer_email.is_some(),
                 "Engineer credentials incomplete; falling back to synthetic identity for spec commit. \
                  Run `nemo auth` to set name/email."
             );
         }
-        let engineer_name = all_creds
-            .iter()
-            .find(|c| c.provider == "_name" && c.valid)
-            .map(|c| c.credential_ref.clone())
-            .unwrap_or_else(|| req.engineer.clone());
-        let engineer_email = all_creds
-            .iter()
-            .find(|c| c.provider == "_email" && c.valid)
-            .map(|c| c.credential_ref.clone())
-            .unwrap_or_else(|| format!("{}@nautiloop.dev", req.engineer));
+        let engineer_name = engineer_name.unwrap_or_else(|| req.engineer.clone());
+        let engineer_email =
+            engineer_email.unwrap_or_else(|| format!("{}@nautiloop.dev", req.engineer));
 
         let commit_message = format!("chore(spec): add {}", req.spec_path);
 
@@ -1382,8 +1380,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_with_local_spec_content() {
-        let (app, store, _git) = test_app();
+        let (app, store, git) = test_app();
         // Do NOT add the file to mock git — it only exists locally.
+
+        // The mock's create_branch always returns this SHA as the initial branch tip.
+        // We verify that after write_file_as, the SHA changes (FR-2a).
+        let default_sha = "0000000000000000000000000000000000000000";
 
         let body = serde_json::json!({
             "spec_path": "specs/local-only.md",
@@ -1416,6 +1418,19 @@ mod tests {
         let loops = store.get_loops_for_engineer(Some("alice"), false, true).await.unwrap();
         assert_eq!(loops.len(), 1);
         assert_eq!(loops[0].spec_path, "specs/local-only.md");
+
+        // FR-2a: current_sha must be the SHA of the spec commit, not the default-branch tip.
+        // The mock write_file_as generates a distinct SHA, so this must differ from the
+        // original default branch SHA.
+        let stored_sha = loops[0].current_sha.as_deref().unwrap_or("");
+        assert!(
+            !stored_sha.is_empty(),
+            "current_sha must be set after spec commit"
+        );
+        assert_ne!(
+            stored_sha, default_sha,
+            "current_sha must differ from the default branch SHA after spec commit"
+        );
     }
 
     #[tokio::test]

@@ -835,6 +835,21 @@ pub mod mock {
             let mut files = self.files.write().await;
             files.insert(path.to_string(), content.to_string());
             drop(files);
+
+            // Generate a distinct mock SHA from the commit inputs so that
+            // get_branch_sha returns a new value after the write, matching
+            // real git behavior where each commit produces a new SHA.
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            branch.hash(&mut hasher);
+            path.hash(&mut hasher);
+            content.hash(&mut hasher);
+            commit_message.hash(&mut hasher);
+            let new_sha = format!("{:016x}{:016x}0000000000000000", hasher.finish(), hasher.finish());
+            let mut branches = self.branches.write().await;
+            branches.insert(branch.to_string(), new_sha);
+            drop(branches);
+
             let mut calls = self.write_file_as_calls.write().await;
             calls.push(WriteFileAsCall {
                 branch: branch.to_string(),
