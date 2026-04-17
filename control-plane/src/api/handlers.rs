@@ -60,6 +60,11 @@ pub async fn start(
     // not just local uploads. While git.read_file limits blast radius to the repo,
     // rejecting malicious paths early is safer. The .md extension and stem checks
     // remain gated behind spec_from_local for NFR-1 backward compat.
+    if req.spec_path.trim().is_empty() {
+        return Err(NautiloopError::BadRequest(
+            "spec_path must not be empty or whitespace-only".to_string(),
+        ));
+    }
     if req.spec_path.contains('\\') {
         return Err(NautiloopError::BadRequest(
             "spec_path must not contain backslashes".to_string(),
@@ -98,9 +103,14 @@ pub async fn start(
             .unwrap_or(&req.spec_path)
             .strip_suffix(".md")
             .unwrap_or("");
-        if stem.is_empty() || stem.trim().is_empty() || stem.starts_with('.') {
+        if stem.is_empty() || stem.trim().is_empty() {
             return Err(NautiloopError::BadRequest(
-                "spec_path filename must have a non-empty, non-hidden name before '.md'".to_string(),
+                "spec_path filename must have a non-empty name before '.md'".to_string(),
+            ));
+        }
+        if stem.starts_with('.') {
+            return Err(NautiloopError::BadRequest(
+                "spec_path filename must not be a hidden file (no leading '.' before '.md')".to_string(),
             ));
         }
         if stem.ends_with(".md") {
@@ -1811,6 +1821,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_start_whitespace_only_spec_path_rejected() {
+        let (app, _store, _git) = test_app();
+
+        let body = serde_json::json!({
+            "spec_path": "   ",
+            "engineer": "alice",
+            "spec_content": "# Some spec"
+        });
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .method(http::Method::POST)
+                .uri("/start")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(err["error"].as_str().unwrap().contains("empty or whitespace"));
+    }
+
+    #[tokio::test]
+    async fn test_start_whitespace_only_spec_path_rejected_legacy() {
+        // Legacy callers (no spec_content) should also be rejected for whitespace-only paths.
+        let (app, _store, _git) = test_app();
+
+        let body = serde_json::json!({
+            "spec_path": "   ",
+            "engineer": "alice"
+        });
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .method(http::Method::POST)
+                .uri("/start")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(err["error"].as_str().unwrap().contains("empty or whitespace"));
+    }
+
+    #[tokio::test]
     async fn test_start_hidden_file_stem_rejected() {
         let (app, _store, _git) = test_app();
 
@@ -1836,7 +1904,7 @@ mod tests {
             .await
             .unwrap();
         let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(err["error"].as_str().unwrap().contains("non-hidden"));
+        assert!(err["error"].as_str().unwrap().contains("hidden file"));
     }
 
     #[tokio::test]
