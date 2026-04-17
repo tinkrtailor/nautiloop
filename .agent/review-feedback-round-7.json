@@ -1,0 +1,78 @@
+{
+  "round": 7,
+  "source": "review",
+  "issues": [
+    {
+      "severity": "high",
+      "category": "correctness",
+      "file": "control-plane/src/loop_engine/driver.rs",
+      "line": 1253,
+      "description": "harden_converge_clean lacks PR creation idempotency guard. Unlike review_converge_clean (which checks `record.spec_pr_url.is_none()` before creating a PR), harden_converge_clean always creates a PR unconditionally. If the tick retries after a successful git.create_pr but before the final store.update_loop persists the Hardened state (e.g., DB timeout), the next tick will attempt to create a duplicate PR. The original inline harden clean path (lines 608-665) has the same issue, but harden_converge_clean was a chance to fix it.",
+      "suggestion": "Add `if record.spec_pr_url.is_none() { ... }` guard around PR creation in harden_converge_clean, mirroring the pattern in review_converge_clean (line 1310)."
+    },
+    {
+      "severity": "high",
+      "category": "correctness",
+      "file": "control-plane/src/loop_engine/driver.rs",
+      "line": 608,
+      "description": "Duplicated harden convergence logic: the original audit clean path (lines 608-665) and the new harden_converge_clean method (lines 1253-1305) implement the same logic independently. The method comment says 'shared by audit clean path and judge exit_clean', but the original clean path was NOT refactored to call it. The two copies handle harden_only branching, PR creation, and auto-merge independently, creating divergence risk. Any future fix to one path will likely miss the other — this is exactly the problem the review_converge_clean extraction solved for the review path.",
+      "suggestion": "Refactor the `Some(v) if v.clean =>` arm in the harden audit evaluation (line 608) to call `self.harden_converge_clean(record).await` for the harden_only branch, eliminating the duplicated logic."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/loop_engine/judge.rs",
+      "line": 387,
+      "description": "FR-1b spec deviation: determine_trigger skips the judge at round 2 when findings include any high or critical severity (line 404 returns None for round < 3 with non-low/medium issues). Per FR-1b, `verdict.clean == false` alone is a trigger. While the budget optimization rationale is sound, this means the judge cannot override-accept a round-2 verdict where the 'high' severity issues are borderline or the reviewer over-classified them — Problem 1 (triviality override) partially unaddressed at round 2 for non-trivial-looking but actually resolvable findings.",
+      "suggestion": "Document this as an intentional deviation with a code comment explaining the tradeoff. Consider adding a config option (e.g., `judge_min_round`) to let operators control the skip threshold."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/loop_engine/judge.rs",
+      "line": 234,
+      "description": "Token budget may exceed FR-4b's 8K input limit for complex loops. MAX_SPEC_CHARS (6K) + MAX_ROUND_CHARS (4K) + MAX_VERDICT_CHARS (2K) = 12K chars (~3K tokens) for the user message fields alone, but the system prompt (prompt_template, ~2K chars) is sent separately. The JudgeInput JSON serialization adds envelope overhead (loop_id, spec_path, phase, round, max_rounds as keys). recurring_findings (capped at 10 entries, each ~200 chars = ~2K) brings the user message to ~14K chars (~3.5K tokens). Combined with the ~2K system prompt, total is ~16K chars (~4K tokens). This is within 8K tokens but leaves limited headroom; a loop with many large recurring findings could approach the limit.",
+      "suggestion": "Add a total-size check after serializing the full JudgeInput. If it exceeds ~28K chars, progressively reduce MAX_ROUND_CHARS and MAX_SPEC_CHARS until it fits. Log a warning when truncation was applied."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/loop_engine/driver.rs",
+      "line": 1137,
+      "description": "Review Continue-at-max-rounds failure message doesn't include judge reasoning. When the judge returns Continue at max_rounds in the review path (line 1137), the failure_reason is 'Max implement rounds (N) exceeded' without the judge's reasoning. The equivalent harden path (line 708) correctly includes it: 'Max harden rounds (N) exceeded. Judge wanted to continue: <reasoning>'. This asymmetry was flagged in round-5 review feedback but persists.",
+      "suggestion": "Change line 1140 to: `format!(\"Max implement rounds ({}) exceeded. Judge wanted to continue: {}\", record.max_rounds, judge_output.reasoning)`"
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/loop_engine/driver.rs",
+      "line": 1095,
+      "description": "The review `Some(v) if v.clean =>` path at line 1095 calls `review_converge_clean` for ALL clean verdicts, including round 1. FR-1c says the judge is not invoked on `clean == true AND round == 1`, but the code skips the judge for ALL clean rounds. While this is functionally correct (clean verdicts don't need judge oversight), the spec's FR-1c exemption specifically for round 1 implies round 2+ clean verdicts were intended to pass through the judge. The comment at line 1088 documents this as intentional, which is good, but it's a spec deviation.",
+      "suggestion": "No code change needed — the behavior is reasonable. The comment is sufficient documentation. Consider updating the spec to clarify that all clean verdicts skip the judge."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/loop_engine/judge.rs",
+      "line": 310,
+      "description": "FR-7a one-shot exit_clean guard has a TOCTOU window: between the judge_decision_stats query (line 199) and the create_judge_decision persistence (line 355), another concurrent tick for the same loop could also query stats, find no prior exit_clean, and both proceed to return exit_clean. The code comment at line 327 acknowledges this for multi-replica scenarios but doesn't implement a fix. With a single loop-engine instance this is acceptable, but the architecture section says 'Multi-pod future' which implies this will become a real issue.",
+      "suggestion": "Add a SELECT FOR UPDATE or use a Postgres advisory lock around the stats-check-then-persist sequence in PgStateStore. For Stage 1 single-instance, add a UNIQUE constraint or partial index on (loop_id, decision) WHERE decision = 'exit_clean' as a DB-level safety net."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "control-plane/src/loop_engine/judge.rs",
+      "line": 161,
+      "description": "NFR-5 test gap: no integration tests for the driver's harden path with the judge. The spec requires integration tests in control-plane/tests/judge_integration.rs asserting correct state transitions and judge_decisions rows for each decision variant. The unit tests in judge.rs test the judge module in isolation, but there are no tests that wire the judge into the driver and verify end-to-end harden/review state machine transitions with judge decisions.",
+      "suggestion": "Add integration tests that construct a ConvergentLoopDriver with a mock judge, run ticks through harden and review paths with each JudgeDecision variant, and assert both the resulting LoopState and the judge_decisions records in the store."
+    },
+    {
+      "severity": "low",
+      "category": "style",
+      "file": "cli/src/commands/inspect.rs",
+      "line": 68,
+      "description": "FR-6c presentation: the flat judge_decisions array is included in the API response (InspectResponse) but the CLI doesn't render it. The inline display within rounds satisfies FR-6c, but decisions that don't match a round (edge case: round number mismatch between judge decision and RoundRecord) would only be in the flat array, invisible in CLI output.",
+      "suggestion": "No change needed for Stage 1 — the inline display handles the common case. Consider adding a summary line at the end (e.g., 'N judge decisions total') if the flat array has entries not shown inline."
+    }
+  ]
+}
