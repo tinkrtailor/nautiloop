@@ -1,0 +1,62 @@
+{
+  "round": 11,
+  "source": "review",
+  "issues": [
+    {
+      "severity": "high",
+      "category": "correctness",
+      "file": "images/base/nautiloop-introspect",
+      "line": 62,
+      "description": "grep -c . || echo 0 produces double output for clean repos (0 dirty files). When uncommitted_raw is empty, grep -c . outputs '0' to stdout and exits 1. The || echo 0 fallback then fires, appending a second '0'. Command substitution captures '0\\n0' (with embedded newline). When interpolated into the heredoc JSON on line 87, this produces 'uncommitted_files: 0\\n0' which is malformed JSON. The control-plane parser (serde_json::from_str) rejects the entire output, causing ALL data — including the already-collected process list — to be lost. Clean worktrees are common (e.g., right after Claude commits), so this bug silently destroys diagnostic data in a frequent scenario.",
+      "suggestion": "Replace `grep -c . || echo 0` with `grep -c . 2>/dev/null || true` (grep -c always outputs the count to stdout, even when it's 0 — the || echo 0 is redundant and harmful). Or use: `uncommitted=$(printf '%s' \"$uncommitted_raw\" | wc -l)` since we already know the input is valid porcelain output."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "images/base/nautiloop-introspect",
+      "line": 46,
+      "description": "du -sb /work/target recursively traverses the entire target directory tree. On large Rust projects (5-10 GB, tens of thousands of files), this takes 1-3 seconds. Combined with git status --porcelain and the jq pipeline, the script will routinely exceed the 2s timeout wrapper. When killed, the exec-level fallback fires, but all data — including the already-collected process JSON — is lost because the script uses a heredoc that is only emitted at the end. The spec FR-2a mandates this command, but the script structure means processes are 'collected first' in variables, not 'emitted first' to stdout. A timeout mid-script discards everything.",
+      "suggestion": "Restructure the script to emit processes to a temp file or emit them as a partial JSON line before attempting worktree collection. Alternatively, since the exec wrapper's || fallback handles the timeout case, accept this as a known limitation and document it. The current comment on line 8-10 ('Processes are emitted FIRST') is misleading — they are collected first but emitted together at the end."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "images/base/nautiloop-introspect",
+      "line": 52,
+      "description": "When git status --porcelain fails (corrupt repo, missing .git) and the else branch sets uncommitted='null', this correctly reports unknown. But when git status succeeds on a broken worktree that returns unexpected output, the grep -c . pipeline could produce incorrect counts. More importantly: the 'null' in the else branch is a shell string that gets interpolated unquoted into JSON — this works, but the two code paths (successful status → number, failed status → literal 'null') create a fragile contract with the JSON builder.",
+      "suggestion": "No critical action needed, but consider using a consistent approach: always output a number or always use jq for the final value."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/introspect.rs",
+      "line": 73,
+      "description": "The 3s handler timeout wraps only the k8s-dependent operations (pod listing + exec + metrics). The database lookup (get_loop), terminal check, job_name validation, and kube_client check all run OUTSIDE this timeout. A slow Postgres query or degraded database could push total handler response time well beyond 3s. While FR-1c literally constrains 'pod exec' time, operators may still experience slow responses that undermine the 3s promise.",
+      "suggestion": "Add a separate timeout (e.g., 1s) around the get_loop database query, or wrap the entire handler body in a single timeout for defense-in-depth."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "cli/src/commands/helm.rs",
+      "line": 1153,
+      "description": "FR-5a specifies pressing 'p' cycles: closed → inspect → introspect → closed. The Inspect variant renders inspect data from app.inspect, which is populated by spawn_inspect_task. However, if the user presses 'p' before any selection change has occurred (rare but possible), the inspect watch channel was never sent a branch value, so no inspect data is fetched. The user sees an empty 'Loading inspect data...' pane indefinitely. The PanelToggle handler sends to inspect_tx when entering Inspect mode, which mitigates this, but only sends the branch if there IS a selected loop.",
+      "suggestion": "This is a minor edge case since selection typically triggers before panel toggle. No critical fix needed."
+    },
+    {
+      "severity": "low",
+      "category": "performance",
+      "file": "images/base/nautiloop-introspect",
+      "line": 49,
+      "description": "ls -U /work/target/debug/deps sorts by directory order (no sort), which is good for performance. However, piped ls still includes directories and symlinks in the count, not just compilation artifacts. The count can be ~2x actual compiled crate count. This matches the spec's FR-2a command (ls | wc -l) but may confuse operators expecting a meaningful artifact count.",
+      "suggestion": "Accept the approximation since it matches the spec's exact command. Document in operator docs that the count includes all entries, not just .rlib/.rmeta files."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "cli/src/commands/ps.rs",
+      "line": 60,
+      "description": "The run() function returns Ok(exit_code) and main.rs calls std::process::exit(exit_code), bypassing Drop destructors and async runtime cleanup. The reqwest client's connection pool and tokio runtime won't shut down gracefully.",
+      "suggestion": "Return a typed exit code from run() and use tokio::main's return value for the exit code, or accept this as standard CLI practice."
+    }
+  ]
+}
