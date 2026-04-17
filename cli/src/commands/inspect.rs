@@ -69,23 +69,6 @@ pub async fn run(client: &NemoClient, path: &str) -> Result<()> {
         println!();
     }
 
-    // Summary of all judge decisions if any were made
-    if !resp.judge_decisions.is_empty() {
-        println!("── Judge Decisions ──");
-        for jd in &resp.judge_decisions {
-            println!(
-                "  round {} ({}): {} [confidence={}, trigger={}]",
-                jd.round,
-                jd.phase,
-                jd.decision,
-                jd.confidence
-                    .map(|c| format!("{:.2}", c))
-                    .unwrap_or_else(|| "n/a".to_string()),
-                jd.trigger,
-            );
-        }
-    }
-
     Ok(())
 }
 

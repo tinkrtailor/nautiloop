@@ -807,15 +807,6 @@ impl StateStore for PgStateStore {
             .collect())
     }
 
-    async fn count_judge_decisions(&self, loop_id: Uuid) -> Result<i64> {
-        let row: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM judge_decisions WHERE loop_id = $1")
-                .bind(loop_id)
-                .fetch_one(&self.pool)
-                .await?;
-        Ok(row.0)
-    }
-
     async fn judge_decision_stats(&self, loop_id: Uuid) -> Result<(i64, bool)> {
         let row: (i64, bool) = sqlx::query_as(
             r#"

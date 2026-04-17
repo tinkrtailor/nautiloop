@@ -103,9 +103,6 @@ pub trait StateStore: Send + Sync + 'static {
     /// Get all judge decisions for a loop.
     async fn get_judge_decisions(&self, loop_id: Uuid) -> Result<Vec<JudgeDecisionRecord>>;
 
-    /// Count judge decisions for a loop (for cost ceiling enforcement).
-    async fn count_judge_decisions(&self, loop_id: Uuid) -> Result<i64>;
-
     /// Combined query: returns (count, has_exit_clean) for cost ceiling + one-shot guard.
     async fn judge_decision_stats(&self, loop_id: Uuid) -> Result<(i64, bool)>;
 
@@ -449,11 +446,6 @@ pub mod memory {
                 .filter(|d| d.loop_id == loop_id)
                 .cloned()
                 .collect())
-        }
-
-        async fn count_judge_decisions(&self, loop_id: Uuid) -> Result<i64> {
-            let decisions = self.judge_decisions.read().await;
-            Ok(decisions.iter().filter(|d| d.loop_id == loop_id).count() as i64)
         }
 
         async fn judge_decision_stats(&self, loop_id: Uuid) -> Result<(i64, bool)> {

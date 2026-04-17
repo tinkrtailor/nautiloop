@@ -694,8 +694,8 @@ impl ConvergentLoopDriver {
                                         record.state = LoopState::Failed;
                                         record.sub_state = None;
                                         record.failure_reason = Some(format!(
-                                            "Max harden rounds ({}) exceeded (judge chose continue at limit)",
-                                            record.max_rounds
+                                            "Max harden rounds ({}) exceeded. Judge wanted to continue: {}",
+                                            record.max_rounds, judge_output.reasoning
                                         ));
                                         record.active_job_name = None;
                                         self.store.update_loop(record).await?;
@@ -862,12 +862,21 @@ impl ConvergentLoopDriver {
                                 return Ok(LoopState::Failed);
                             }
                             JudgeDecision::Continue => {
-                                // At max_rounds, continue is not possible; fall through
-                                // to generic max-rounds failure below
+                                // At max_rounds, continue is not possible; fail with judge reasoning
+                                record.state = LoopState::Failed;
+                                record.sub_state = None;
+                                record.failure_reason = Some(format!(
+                                    "Max harden rounds ({}) exceeded. Judge wanted to continue: {}",
+                                    record.max_rounds, judge_output.reasoning
+                                ));
+                                record.active_job_name = None;
+                                self.store.update_loop(record).await?;
+                                return Ok(LoopState::Failed);
                             }
                         }
                     }
 
+                    // Fallthrough: no judge available, use generic failure
                     record.state = LoopState::Failed;
                     record.sub_state = None;
                     record.failure_reason = Some(format!(
@@ -1072,136 +1081,8 @@ impl ConvergentLoopDriver {
 
         match verdict {
             Some(v) if v.clean => {
-                // Create PR if not already created (idempotent across ticks)
-                if record.spec_pr_url.is_none() {
-                    if let Err(e) = self.git.remove_path(&record.branch, ".agent").await {
-                        tracing::warn!(loop_id = %record.id, error = %e, "Failed to clean up .agent/ artifacts, proceeding with PR");
-                    }
-
-                    let pr_title =
-                        format!("feat(agent): {} for {}", record.spec_path, record.engineer,);
-                    let pr_body = format!(
-                        "Automated convergence loop completed in {} round(s).\n\nSpec: {}\nBranch: {}",
-                        record.round, record.spec_path, record.branch,
-                    );
-                    let pr_url = self
-                        .git
-                        .create_pr(
-                            &record.branch,
-                            &pr_title,
-                            &pr_body,
-                            &self.default_branch_for(record),
-                        )
-                        .await?;
-                    record.spec_pr_url = Some(pr_url);
-                    // Persist PR URL so next tick knows PR was already created
-                    self.store.update_loop(record).await?;
-                }
-
-                if record.ship_mode {
-                    let threshold = self.config.ship.max_rounds_for_auto_merge as i32;
-                    if record.round <= threshold {
-                        // Non-blocking CI check: one check per tick, return if pending
-                        if self.config.ship.require_passing_ci {
-                            match self.git.ci_status(&record.branch).await {
-                                Ok(Some(true)) => {
-                                    // CI passed, proceed to merge
-                                }
-                                Ok(Some(false)) => {
-                                    // CI definitively failed
-                                    record.state = LoopState::Converged;
-                                    record.sub_state = None;
-                                    record.active_job_name = None;
-                                    record.failure_reason = Some(
-                                        "CI checks failed. PR created but not merged.".to_string(),
-                                    );
-                                    self.store.update_loop(record).await?;
-                                    tracing::warn!(
-                                        loop_id = %record.id,
-                                        "Ship mode: CI failed, converging without merge"
-                                    );
-                                    return Ok(LoopState::Converged);
-                                }
-                                Ok(None) => {
-                                    // CI still pending: return current state, check again next tick
-                                    tracing::debug!(
-                                        loop_id = %record.id,
-                                        "Ship mode: CI pending, will check on next tick"
-                                    );
-                                    return Ok(record.state);
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        loop_id = %record.id,
-                                        error = %e,
-                                        "CI check error, will retry next tick"
-                                    );
-                                    return Ok(record.state);
-                                }
-                            }
-                        }
-
-                        // Within threshold + CI passed: merge the PR -> SHIPPED
-                        let merge_sha = self
-                            .git
-                            .merge_pr(
-                                &record.branch,
-                                &self.config.ship.merge_strategy,
-                                &self.default_branch_for(record),
-                            )
-                            .await?;
-
-                        record.state = LoopState::Shipped;
-                        record.sub_state = None;
-                        record.active_job_name = None;
-                        record.merge_sha = Some(merge_sha.clone());
-                        record.merged_at = Some(chrono::Utc::now());
-                        self.store.update_loop(record).await?;
-
-                        // Log merge event (NFR-8)
-                        let merge_event = crate::types::MergeEvent {
-                            id: Uuid::new_v4(),
-                            loop_id: record.id,
-                            merge_sha,
-                            merge_strategy: self.config.ship.merge_strategy.clone(),
-                            ci_status: "passed".to_string(),
-                            created_at: chrono::Utc::now(),
-                        };
-                        let _ = self.store.create_merge_event(&merge_event).await;
-
-                        tracing::info!(
-                            loop_id = %record.id,
-                            round = record.round,
-                            "Loop SHIPPED (auto-merge, within threshold)"
-                        );
-                        Ok(LoopState::Shipped)
-                    } else {
-                        // Above threshold: converge but don't auto-merge (PR already created)
-                        record.state = LoopState::Converged;
-                        record.sub_state = None;
-                        record.active_job_name = None;
-                        record.failure_reason = Some(format!(
-                            "Converged in {} rounds (above auto-merge threshold of {}). PR created for human review.",
-                            record.round, threshold
-                        ));
-                        self.store.update_loop(record).await?;
-                        tracing::info!(
-                            loop_id = %record.id,
-                            round = record.round,
-                            threshold,
-                            "Loop CONVERGED (above ship threshold, PR created for review)"
-                        );
-                        Ok(LoopState::Converged)
-                    }
-                } else {
-                    // No ship mode: standard CONVERGED (PR already created for review)
-                    record.state = LoopState::Converged;
-                    record.sub_state = None;
-                    record.active_job_name = None;
-                    self.store.update_loop(record).await?;
-                    tracing::info!(loop_id = %record.id, round = record.round, "Loop CONVERGED");
-                    Ok(LoopState::Converged)
-                }
+                // Normal clean verdict: delegate to shared convergence logic
+                self.review_converge_clean(record).await
             }
             Some(v) => {
                 // Review found issues: invoke judge before deciding
@@ -1407,7 +1288,8 @@ impl ConvergentLoopDriver {
     }
 
     /// Converge the review stage as clean: create PR and transition to Converged/Shipped.
-    /// Shared by the normal clean path and judge exit_clean.
+    /// Shared convergence logic for review stage: creates PR, handles ship mode.
+    /// Called from both the normal clean verdict path and the judge exit_clean path.
     async fn review_converge_clean(&self, record: &mut LoopRecord) -> Result<LoopState> {
         // Create PR if not already created (idempotent across ticks)
         if record.spec_pr_url.is_none() {
@@ -1434,7 +1316,7 @@ impl ConvergentLoopDriver {
             self.store.update_loop(record).await?;
         }
 
-        // Support ship mode for judge exit_clean, same as reviewer clean path
+        // Support ship mode: auto-merge if within threshold
         if record.ship_mode {
             let threshold = self.config.ship.max_rounds_for_auto_merge as i32;
             if record.round <= threshold {
@@ -1453,7 +1335,7 @@ impl ConvergentLoopDriver {
                             self.store.update_loop(record).await?;
                             tracing::warn!(
                                 loop_id = %record.id,
-                                "Ship mode (judge exit_clean): CI failed, converging without merge"
+                                "Ship mode: CI failed, converging without merge"
                             );
                             return Ok(LoopState::Converged);
                         }
@@ -1461,7 +1343,7 @@ impl ConvergentLoopDriver {
                             // CI still pending: return current state, check again next tick
                             tracing::debug!(
                                 loop_id = %record.id,
-                                "Ship mode (judge exit_clean): CI pending, will check on next tick"
+                                "Ship mode: CI pending, will check on next tick"
                             );
                             return Ok(record.state);
                         }
@@ -1505,7 +1387,7 @@ impl ConvergentLoopDriver {
                 tracing::info!(
                     loop_id = %record.id,
                     round = record.round,
-                    "Loop SHIPPED (judge exit_clean, auto-merge within threshold)"
+                    "Loop SHIPPED (auto-merge within threshold)"
                 );
                 return Ok(LoopState::Shipped);
             } else {
@@ -1521,7 +1403,7 @@ impl ConvergentLoopDriver {
                     loop_id = %record.id,
                     round = record.round,
                     threshold,
-                    "Loop CONVERGED (judge exit_clean, above ship threshold)"
+                    "Loop CONVERGED (above ship threshold)"
                 );
                 return Ok(LoopState::Converged);
             }
@@ -1531,7 +1413,7 @@ impl ConvergentLoopDriver {
         record.sub_state = None;
         record.active_job_name = None;
         self.store.update_loop(record).await?;
-        tracing::info!(loop_id = %record.id, round = record.round, "Loop CONVERGED (judge exit_clean)");
+        tracing::info!(loop_id = %record.id, round = record.round, "Loop CONVERGED");
         Ok(LoopState::Converged)
     }
 
@@ -1806,6 +1688,22 @@ impl ConvergentLoopDriver {
         updated.failure_reason = Some("Cancelled by user".to_string());
         updated.active_job_name = None;
         self.store.update_loop(&updated).await?;
+
+        // FR-5b: Back-fill judge decision outcomes for cancelled loops.
+        // Cancelled is a terminal state, so judge_decisions rows need
+        // loop_final_state populated for the Stage 2 training dataset.
+        let now = chrono::Utc::now();
+        if let Err(e) = self
+            .store
+            .backfill_judge_outcomes(record.id, "Cancelled", now)
+            .await
+        {
+            tracing::warn!(
+                loop_id = %record.id,
+                error = %e,
+                "Failed to backfill judge decision outcomes on cancel (non-fatal)"
+            );
+        }
 
         self.store
             .set_loop_flag(record.id, crate::state::LoopFlag::Cancel, false)

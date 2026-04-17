@@ -179,11 +179,12 @@ impl OrchestratorJudge {
         }
 
         // Build judge input with truncation to stay within 8K input token budget (FR-4b).
-        // Approximate 1 token ≈ 4 chars; budget ~32K chars total, reserve 8K for
-        // prompt template + current_verdict + recurring_findings + overhead.
-        const MAX_SPEC_CHARS: usize = 12_000;
-        const MAX_ROUND_CHARS: usize = 8_000;
+        // Approximate 1 token ≈ 4 chars; budget ~32K chars total.
+        // Budget breakdown: spec 10K + rounds 6K + verdict 4K + recurring 2K + overhead 10K = 32K
+        const MAX_SPEC_CHARS: usize = 10_000;
+        const MAX_ROUND_CHARS: usize = 6_000;
         const MAX_VERDICT_CHARS: usize = 4_000;
+        const MAX_RECURRING_FINDINGS: usize = 10;
 
         let truncated_spec = if spec_content.len() > MAX_SPEC_CHARS {
             // Use char boundary to avoid panic on multi-byte UTF-8 characters
@@ -229,6 +230,13 @@ impl OrchestratorJudge {
             }
         };
 
+        // Truncate recurring_findings to stay within budget
+        let truncated_recurring = if recurring.len() > MAX_RECURRING_FINDINGS {
+            recurring[..MAX_RECURRING_FINDINGS].to_vec()
+        } else {
+            recurring
+        };
+
         let input = JudgeInput {
             loop_id,
             spec_path: spec_path.to_string(),
@@ -238,7 +246,7 @@ impl OrchestratorJudge {
             max_rounds,
             rounds: truncated_rounds,
             current_verdict: truncated_verdict,
-            recurring_findings: recurring,
+            recurring_findings: truncated_recurring,
         };
 
         let input_json = match serde_json::to_value(&input) {
@@ -344,23 +352,27 @@ impl OrchestratorJudge {
 
     /// Determine which trigger applies, if any.
     ///
-    /// Note: This intentionally always returns `Some` when called, because the caller
-    /// has already verified `verdict.clean == false`. Every non-clean verdict triggers
-    /// the judge per FR-1b (`not_clean` is a valid trigger). This means early rounds
-    /// with straightforward issues will use a judge call from the cost ceiling budget.
-    /// The cost ceiling (NFR-1, max 10 calls) prevents runaway spend; the judge on
-    /// early rounds can still add value by detecting triviality or reviewer drift.
+    /// Returns `None` on early rounds (< 3) with no recurring findings, preserving
+    /// the judge budget for ambiguous max_rounds and churn cases where the judge
+    /// provides the most value. The cost ceiling (NFR-1, max 10 calls) prevents
+    /// runaway spend, but skipping early trivial rounds avoids exhausting the budget
+    /// before the critical decisions arrive.
     fn determine_trigger(
         &self,
         round: i32,
         max_rounds: i32,
         recurring: &[RecurringFinding],
     ) -> Option<JudgeTrigger> {
-        // Priority: max_rounds > recurring_findings > not_clean
+        // Priority: max_rounds > recurring_findings > not_clean (with early-round skip)
         if round >= max_rounds {
             Some(JudgeTrigger::MaxRounds)
         } else if !recurring.is_empty() {
             Some(JudgeTrigger::RecurringFindings)
+        } else if round < 3 {
+            // Skip judge on early rounds without recurring findings.
+            // Straightforward issues in rounds 1-2 don't need judge intervention;
+            // preserves budget for the ambiguous later rounds.
+            None
         } else {
             // The caller already checked verdict.clean == false
             Some(JudgeTrigger::NotClean)
@@ -946,7 +958,7 @@ That's my decision."#;
                 "specs/test.md",
                 "test spec",
                 "review",
-                2,
+                3, // round >= 3 to pass early-round skip
                 15,
                 &serde_json::json!({"clean": false}),
                 &issues,
@@ -973,7 +985,7 @@ That's my decision."#;
                 "specs/test.md",
                 "test spec",
                 "review",
-                2,
+                3, // round >= 3 to pass early-round skip
                 15,
                 &serde_json::json!({}),
                 &[Issue {
@@ -1110,5 +1122,102 @@ That's my decision."#;
         let output = result.unwrap();
         assert_eq!(output.decision, JudgeDecision::Continue);
         assert!(output.reasoning.contains("downgraded from exit_clean"));
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_early_round_skip() {
+        let config = OrchestratorConfig::default();
+        let store = Arc::new(crate::state::memory::MemoryStateStore::new());
+        let client = Arc::new(MockJudgeClient {
+            response: r#"{"decision": "continue", "confidence": 0.8, "reasoning": "test"}"#
+                .to_string(),
+        });
+        let judge = OrchestratorJudge::new(config, store, client).await;
+
+        // Round 1, no recurring findings -> should skip judge
+        let result = judge
+            .evaluate(
+                Uuid::new_v4(),
+                "specs/test.md",
+                "test spec",
+                "review",
+                1,
+                15,
+                &serde_json::json!({"clean": false}),
+                &[Issue {
+                    severity: Severity::High,
+                    category: None,
+                    file: None,
+                    line: None,
+                    description: "Bug".to_string(),
+                    suggestion: "Fix".to_string(),
+                }],
+                &[],
+            )
+            .await;
+
+        assert!(result.is_none(), "Early round without recurring findings should skip judge");
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_early_round_with_recurring_triggers() {
+        let config = OrchestratorConfig::default();
+        let store = Arc::new(crate::state::memory::MemoryStateStore::new());
+        let client = Arc::new(MockJudgeClient {
+            response: r#"{"decision": "exit_escalate", "confidence": 0.9, "reasoning": "Churn on round 2"}"#
+                .to_string(),
+        });
+        let judge = OrchestratorJudge::new(config, store, client).await;
+
+        let issues = vec![Issue {
+            severity: Severity::High,
+            category: Some("correctness".to_string()),
+            file: Some("src/main.rs".to_string()),
+            line: Some(42),
+            description: "Recurring bug".to_string(),
+            suggestion: "Fix".to_string(),
+        }];
+
+        let prior_output = serde_json::json!({
+            "issues": [{
+                "severity": "high",
+                "category": "correctness",
+                "file": "src/main.rs",
+                "line": 43,
+                "description": "Same bug",
+                "suggestion": "Fix"
+            }]
+        });
+
+        let rounds = vec![RoundRecord {
+            id: Uuid::new_v4(),
+            loop_id: Uuid::new_v4(),
+            round: 1,
+            stage: "review".to_string(),
+            input: None,
+            output: Some(prior_output),
+            started_at: None,
+            completed_at: None,
+            duration_secs: Some(30),
+            job_name: None,
+        }];
+
+        // Round 2 with recurring findings -> should trigger judge even though round < 3
+        let result = judge
+            .evaluate(
+                Uuid::new_v4(),
+                "specs/test.md",
+                "test spec",
+                "review",
+                2,
+                15,
+                &serde_json::json!({"clean": false}),
+                &issues,
+                &rounds,
+            )
+            .await;
+
+        assert!(result.is_some(), "Early round WITH recurring findings should trigger judge");
+        assert_eq!(result.unwrap().decision, JudgeDecision::ExitEscalate);
     }
 }
