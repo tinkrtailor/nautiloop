@@ -1444,6 +1444,62 @@ async fn test_harden_audit_judge_continue_at_max_rounds_fails() {
     );
 }
 
+/// Judge error during revise-evaluation at max_rounds falls back to heuristic FAILED.
+/// This is the revise-path equivalent of test_harden_judge_error_at_max_rounds_falls_back_to_fail,
+/// which covers the audit-evaluation path.
+#[tokio::test]
+async fn test_harden_revise_judge_error_at_max_rounds_falls_back_to_fail() {
+    let store = Arc::new(MemoryStateStore::new());
+    let dispatcher = Arc::new(MockJobDispatcher::new());
+    let git = Arc::new(MockGitOperations::new());
+    install_fresh_creds(&dispatcher).await;
+
+    let audit_verdict = serde_json::json!({
+        "clean": false,
+        "issues": [{
+            "severity": "high",
+            "category": "correctness",
+            "description": "Logic gap in spec",
+            "suggestion": "Revise section 3"
+        }],
+        "summary": "Issues remain",
+        "token_usage": {"input": 100, "output": 50}
+    });
+
+    let record =
+        setup_harden_revise_at_max_rounds(&store, &dispatcher, &git, audit_verdict).await;
+
+    let config = make_config();
+    let model_client: Arc<dyn JudgeModelClient> = Arc::new(ErrorJudgeClient);
+    let judge = Arc::new(OrchestratorJudge::new(
+        config.orchestrator.clone(),
+        store.clone(),
+        model_client,
+        "test prompt".to_string(),
+    ));
+    let driver =
+        ConvergentLoopDriver::new(store.clone(), dispatcher, git, config).with_judge(judge);
+
+    let new_state = driver.tick(record.id).await.unwrap();
+    // Heuristic fallback at max_rounds: FAILED
+    assert_eq!(new_state, LoopState::Failed);
+
+    let updated = store.get_loop(record.id).await.unwrap().unwrap();
+    let reason = updated.failure_reason.as_ref().unwrap();
+    assert!(
+        reason.contains("Max harden rounds"),
+        "Should contain max rounds message, got: {reason:?}"
+    );
+    assert!(
+        reason.contains("judge unavailable"),
+        "Should indicate judge was unavailable, got: {reason:?}"
+    );
+
+    // No judge decisions should exist (judge errored, no record saved for the call)
+    let decisions = store.get_judge_decisions(record.id).await.unwrap();
+    assert_eq!(decisions.len(), 0);
+}
+
 /// FR-5b: Cancelling a loop with prior judge decisions correctly backfills
 /// loop_final_state='CANCELLED' and loop_terminated_at on all judge_decisions rows.
 #[tokio::test]

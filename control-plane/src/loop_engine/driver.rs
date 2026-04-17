@@ -841,7 +841,7 @@ impl ConvergentLoopDriver {
                     record.state = LoopState::Failed;
                     record.sub_state = None;
                     record.failure_reason = Some(format!(
-                        "Max harden rounds ({}) exceeded",
+                        "Max harden rounds ({}) exceeded (judge unavailable)",
                         record.max_rounds
                     ));
                     record.active_job_name = None;

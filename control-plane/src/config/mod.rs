@@ -183,8 +183,9 @@ pub struct OrchestratorConfig {
     #[serde(default = "default_max_judge_calls")]
     pub max_judge_calls_per_loop: u32,
     /// Minimum round before the judge is invoked for non-recurring, non-max-rounds
-    /// triggers (default: 3). Set to 1 to allow the judge on every round.
-    /// Controls the early-round skip threshold documented in FR-1b deviation.
+    /// triggers (default: 3). Note: round 1 is always skipped regardless of this
+    /// setting (see struct-level doc comment). Set to 2 to enable the judge from
+    /// round 2 onward. Controls the early-round skip threshold documented in FR-1b.
     #[serde(default = "default_judge_min_round")]
     pub judge_min_round: i32,
 }

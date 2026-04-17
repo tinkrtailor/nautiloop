@@ -473,7 +473,10 @@ pub mod memory {
             terminated_at: chrono::DateTime<chrono::Utc>,
         ) -> Result<()> {
             let mut decisions = self.judge_decisions.write().await;
-            for d in decisions.iter_mut().filter(|d| d.loop_id == loop_id) {
+            for d in decisions
+                .iter_mut()
+                .filter(|d| d.loop_id == loop_id && d.loop_final_state.is_none())
+            {
                 d.loop_final_state = Some(final_state.to_string());
                 d.loop_terminated_at = Some(terminated_at);
             }
