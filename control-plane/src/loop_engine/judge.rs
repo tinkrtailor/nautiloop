@@ -362,10 +362,13 @@ impl OrchestratorJudge {
         };
 
         // FR-7a: If this would be a second exit_clean, downgrade to continue.
-        // Application-layer guard for single-instance deployments. For multi-replica
+        // ASSUMPTION: Stage 1 runs single-instance. This application-layer guard
+        // prevents the yo-yo pattern for single-instance deployments. For multi-replica
         // scenarios, a partial unique index on (loop_id) WHERE decision = 'exit_clean'
         // in the migration provides a DB-level safety net against the TOCTOU window
-        // between the stats query and the decision persistence.
+        // between the stats query and the decision persistence. For true multi-replica
+        // correctness, consider SELECT FOR UPDATE or advisory lock around the
+        // stats-check-then-persist sequence.
         if output.decision == JudgeDecision::ExitClean && prior_exit_clean {
             tracing::warn!(
                 loop_id = %loop_id,
@@ -442,8 +445,13 @@ impl OrchestratorJudge {
         } else if !recurring.is_empty() {
             Some(JudgeTrigger::RecurringFindings)
         } else if round <= 1 {
-            // Skip judge on round 1 without recurring findings.
-            // First-round issues are straightforward; preserves budget.
+            // FR-1b deviation: round-1 verdicts skip the judge unconditionally
+            // (unless recurring findings exist, handled above). This means a
+            // round-1 verdict with only low-severity cosmetic nits will NOT get
+            // triviality override (Problem 1) — the engineer must wait until
+            // round 2. This is an intentional tradeoff: round-1 issues are
+            // near-certain "continue" cases, and skipping preserves the NFR-1
+            // cost ceiling budget for the ambiguous later rounds.
             None
         } else if round < self.config.judge_min_round {
             // Below the configurable minimum round threshold for non-recurring triggers.
