@@ -1,0 +1,70 @@
+{
+  "round": 5,
+  "source": "review",
+  "issues": [
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/introspect.rs",
+      "line": 100,
+      "description": "When no Running pod exists but a Pending pod does, the handler attempts exec on the Pending pod. A Pending pod has no running containers, so exec will always fail, returning a partial snapshot with empty processes and null stats. This is misleading — the operator sees a 200 response with an empty snapshot rather than the 425 'pod not yet running' that the spec (NFR-4) intends. The pod sort picks Pending pods as fallback (rank 1), and the exec failure is swallowed into a partial snapshot.",
+      "suggestion": "After sorting pods and picking the best one, check if `pod_phase == \"Pending\"` and return HTTP 425 instead of attempting exec. Only attempt exec on Running pods."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/introspect.rs",
+      "line": 332,
+      "description": "The `axum::http::Request` type used here is a re-export of the `http` crate. kube-rs's `Client::request<T>()` also takes `http::Request<Vec<u8>>`. If the `http` crate version pulled by axum and kube diverge (e.g., axum upgrades to http 2.x while kube stays on 1.x), this will be a compile error. More immediately: `kube::Client::request()` returns `Result<T, kube::Error>` and deserializes the response body. The `PodMetrics` struct only declares `containers` but lacks `#[serde(rename_all = ...)]` — if the metrics API returns camelCase keys like `containers` this works, but if the key naming differs it silently returns None. There are zero tests for this deserialization path.",
+      "suggestion": "Add a unit test that deserializes a sample PodMetrics JSON (from a real `kubectl get --raw /apis/metrics.k8s.io/v1beta1/namespaces/default/pods/test`) against the PodMetrics struct to verify the fields deserialize correctly."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "cli/src/commands/helm.rs",
+      "line": 405,
+      "description": "When the selection changes, `app.introspect` is set to `None` but `app.introspect_status` is set to a generic 'Loading...' only on selection change. However, the introspect_tx channel only sends a new loop_id when the side panel is in Introspect mode (`if app.side_panel == SidePanel::Introspect`). If the user changes selection while the panel is Closed or on Inspect, then later opens the Introspect panel via 'p', the PanelToggle action sends the current loop_id — but the stale 'Loading...' status set during SelectionChanged is still shown. Meanwhile no snapshot exists (introspect is None) because the previous selection's data was cleared. This is a minor UX glitch where the user briefly sees 'Loading...' with no data until the first poll completes.",
+      "suggestion": "In the PanelToggle action when switching to Introspect, also reset introspect_status to 'Loading...' and clear app.introspect to ensure a clean state."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "images/base/nautiloop-introspect",
+      "line": 40,
+      "description": "The `du -sb /work/target` command traverses the entire target directory tree, which on large Rust projects can be 5-10 GB with tens of thousands of files. This can take several hundred milliseconds to seconds, eating significantly into the 2s script budget. Combined with the `find` command on line 41 and the `jq` pipeline, the script may routinely approach or exceed the 2s `timeout` wrapper, causing partial or empty results.",
+      "suggestion": "Consider using `stat -c %s` on a single file or `df` for a faster approximation, or accept the risk and document that large target dirs may cause timeouts. Alternatively, the exec wrapper's fallback JSON handles this gracefully, so this is operationally safe but may result in frequent partial snapshots on large projects."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "control-plane/src/api/introspect.rs",
+      "line": 362,
+      "description": "parse_cpu_to_millicores uses rounding for nanocores ('n' suffix) but truncation for microcores ('u' suffix). This is inconsistent: 999u → 0m (should arguably round to 1m). In practice, k8s metrics API almost always reports in nanocores, so the 'u' path is rarely hit.",
+      "suggestion": "Apply the same rounding logic: `(micro.parse::<u64>().unwrap_or(0) + 500) / 1_000` for consistency."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "control-plane/src/api/introspect.rs",
+      "line": 373,
+      "description": "parse_memory_to_bytes does not handle 'Ti', 'Pi', 'Ei' suffixes or their SI counterparts. While pod-level memory is practically never in terabytes, k8s quantity parsing should be complete for correctness. Also, 'e' notation (e.g., '1e9') is not handled.",
+      "suggestion": "Add Ti/Pi handling for completeness, or document that only Ki/Mi/Gi/k/M/G and raw bytes are supported."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "images/base/nautiloop-introspect",
+      "line": 41,
+      "description": "The artifact count uses `find ... -name '*.rlib' -o -name '*.rmeta'` which deviates from the spec's FR-2a which says `ls /work/target/debug/deps 2>/dev/null | wc -l`. The find-based count is more meaningful (actual compiled artifacts vs all entries), but produces significantly lower numbers than the spec example (1069). Operators familiar with the spec's expected output may be confused.",
+      "suggestion": "Document this deviation or align with the spec's simpler `ls` approach. The current implementation is arguably better but differs from the spec's explicit command."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "cli/src/commands/ps.rs",
+      "line": 60,
+      "description": "The `run()` function calls `std::process::exit()` directly, bypassing Drop destructors and async runtime cleanup. While standard CLI practice, returning a typed exit code would be cleaner and allow the tokio runtime to shut down gracefully.",
+      "suggestion": "Return an exit code from `run()` and let `main()` call `std::process::exit()`."
+    }
+  ]
+}
