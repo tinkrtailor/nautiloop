@@ -1,0 +1,86 @@
+{
+  "round": 10,
+  "source": "review",
+  "issues": [
+    {
+      "severity": "high",
+      "category": "correctness",
+      "file": "images/base/nautiloop-introspect",
+      "line": 58,
+      "description": "Off-by-one in uncommitted_files count. Shell command substitution strips the trailing newline from `git status --porcelain` output, and then `printf '%s' \"$uncommitted_raw\" | wc -l` counts newline characters (not lines). Result: 1 dirty file reports 0, 2 dirty files reports 1, etc. Only the empty case (clean repo) is correct. This means the spec's acceptance criteria #1 ('dirty=2 files') will show 'dirty=1 files' for 2 actually dirty files.",
+      "suggestion": "Replace `uncommitted=$(printf '%s' \"$uncommitted_raw\" | wc -l | tr -d ' ')` with `uncommitted=$(echo \"$uncommitted_raw\" | grep -c .)` or `uncommitted=$(printf '%s\\n' \"$uncommitted_raw\" | wc -l | tr -d ' ')` — the key is ensuring a trailing newline before `wc -l`, or using `grep -c` which counts matching lines regardless of trailing newline."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "images/base/nautiloop-introspect",
+      "line": 46,
+      "description": "`du -sb /work/target` recursively traverses the entire target directory tree. On large Rust projects (5-10 GB, tens of thousands of files), this can take 1-3 seconds. Combined with git status and the jq pipeline, the script will routinely exceed the 2s `timeout` wrapper. When killed, the fallback JSON emits all-null worktree fields — meaning operators get no worktree data precisely on large projects where it's most needed. The spec FR-2a mandates this exact command, but the practical impact is significant.",
+      "suggestion": "Emit the JSON incrementally: output the processes JSON first (already collected), then attempt worktree collection. If the script structure doesn't allow incremental JSON, consider using `stat -f %b /work/target` (block count) as a faster approximation, or document this as a known limitation for large projects."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/types/api.rs",
+      "line": 198,
+      "description": "The `warnings` field uses `skip_serializing_if = \"Vec::is_empty\"` which omits the field entirely when empty. While the spec FR-1b doesn't mention a `warnings` field (it's an implementation addition), the CLI-side `PodIntrospectResponse` in `cli/src/api_types.rs` declares `#[serde(default)] pub warnings: Vec<String>` which handles the absent field correctly. However, the asymmetry is fragile — if any consumer doesn't use `#[serde(default)]`, deserialization will fail when warnings is empty.",
+      "suggestion": "Either always serialize the warnings field (remove `skip_serializing_if`) for robustness, or ensure all consumers use `#[serde(default)]`. The current code works but is fragile to new consumers."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/introspect.rs",
+      "line": 336,
+      "description": "fetch_container_metrics has no timeout. If the metrics API endpoint is reachable but slow (e.g., network partition to metrics-server), this function can block for the full TCP timeout (often 30s+). While it runs inside the outer 3s handler timeout, this means it can hold a tokio task and network resources long after the handler has returned 503 to the caller. The tokio::join! is cancelled when the outer timeout fires, but the underlying HTTP connection may linger.",
+      "suggestion": "Add a 2s timeout around the `client.request(request).await` call to ensure the metrics fetch completes quickly and releases resources."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "cli/src/commands/helm.rs",
+      "line": 405,
+      "description": "When the side panel is in Introspect mode and the user changes selection rapidly (arrow keys through loop list), each selection change clears `app.introspect = None` and sends a new loop_id to the channel. The old polling task is aborted, but the introspect pane shows 'Loading...' on every arrow key press with a 2s fetch delay before new data arrives. More importantly, if the user selects a terminal loop, the poll_introspect_for_loop returns immediately with Terminal status, but there's no debounce — each selection fires an HTTP request to the API server.",
+      "suggestion": "Consider debouncing the introspect_tx send by 200-500ms to avoid hammering the API during rapid selection changes."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "cli/src/commands/ps.rs",
+      "line": 79,
+      "description": "run_watch replaces the panic hook with a custom one that restores terminal state, but does not restore the original hook if the function completes normally. Line 106 calls `std::panic::take_hook()` which replaces the hook with the default, losing any previously installed hooks. If another library or the runtime installed a custom panic hook before run_watch, it will be permanently lost.",
+      "suggestion": "Save the original hook from `take_hook()` on line 106 and restore it with `set_hook(original_hook)` instead of discarding it."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "images/base/nautiloop-introspect",
+      "line": 49,
+      "description": "When `/work/target/debug/deps` exists but is empty, `ls -U ... | wc -l` returns 0. When it doesn't exist, the `else` branch sets `target_artifacts=\"null\"`. However, when the `target` directory exists but `debug/deps` does not (e.g., only release builds), this correctly reports null. Good. But: `ls -U /work/target/debug/deps` on a directory with a single file whose name starts with a newline would produce an incorrect count. This is extremely unlikely in practice.",
+      "suggestion": "No action needed — edge case is unrealistic for Rust dep directories."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "control-plane/src/api/introspect.rs",
+      "line": 383,
+      "description": "parse_cpu_to_millicores converts raw core values (e.g., '1.5') via `(cores * 1000.0) as u64`. The `as u64` truncates negative and NaN values to 0 on some platforms, but more importantly, for fractional values like '0.0015' (1.5 millicores), the floating-point multiplication gives 1.5 which truncates to 1m. This is minor — real CPU metrics rarely use fractional core notation — but is inconsistent with the rounding applied to nanocores and microcores.",
+      "suggestion": "Use `(cores * 1000.0).round() as u64` for consistency with the rounding applied to other units."
+    },
+    {
+      "severity": "low",
+      "category": "performance",
+      "file": "control-plane/src/api/introspect.rs",
+      "line": 73,
+      "description": "The 3s timeout wraps pod listing + exec + metrics, but the database lookup (get_loop) and job_name validation run outside. A degraded Postgres connection could push total handler response time beyond 3s. FR-1c says 'pod exec' specifically, so this is technically spec-compliant, but operators may still experience slow responses.",
+      "suggestion": "Acceptable as-is per FR-1c's literal requirement. Consider a separate DB query timeout for defense-in-depth."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "cli/src/commands/ps.rs",
+      "line": 96,
+      "description": "run_watch installs a panic hook that restores terminal state, but the `original_hook` variable captures the old hook by move into the closure. On line 106, `std::panic::take_hook()` returns the custom hook (not the original). The original hook is consumed inside the closure and not recoverable after the function returns normally. This means if another part of the program relied on the original hook, it's gone.",
+      "suggestion": "Store the result of take_hook() on line 106 and re-install it, or use a wrapper that preserves the chain."
+    }
+  ]
+}
