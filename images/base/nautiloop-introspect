@@ -5,9 +5,10 @@
 # No set -e: each section must fail independently so partial output is still
 # collected (FR-2c). The control-plane parser handles missing/null fields.
 #
-# Processes are emitted FIRST so that a timeout mid-script still yields
-# process data (the most valuable diagnostic signal). Worktree info is
-# collected second and may be truncated on large projects.
+# Processes are collected FIRST (most valuable diagnostic signal), then
+# worktree info (slower on large projects). Both are emitted together in
+# the final heredoc — a mid-script timeout loses all output. The exec
+# wrapper's || fallback handles this case by emitting a null-fields JSON.
 
 # Section 1: processes (top 30 by CPU) — fastest section, emitted first
 ps_output=$(ps -eo pid,ppid,user,pcpu,etime,args --sort=-pcpu --no-headers 2>/dev/null | head -30 || echo "")
@@ -55,11 +56,13 @@ head_sha=$(git -C /work rev-parse HEAD 2>/dev/null) || head_sha=""
 # FR-2a: git status --porcelain counts all dirty files including untracked.
 # Fallback to "null" (not "0") so callers can distinguish "clean" from "unknown".
 if uncommitted_raw=$(git -C /work status --porcelain 2>/dev/null); then
-  # Use grep -c to count non-empty lines. printf '%s' strips the trailing
-  # newline, and wc -l counts newline chars — so 1 dirty file would report 0.
-  # grep -c . counts lines with at least one character, which is correct
-  # regardless of trailing newline presence.
-  uncommitted=$(printf '%s' "$uncommitted_raw" | grep -c . || echo 0)
+  # Count non-empty lines. grep -c . always prints the count (even 0) to
+  # stdout and exits 1 when count is 0. We only need the exit-status
+  # suppressed (|| true), NOT an extra echo — otherwise clean repos produce
+  # "0\n0" which breaks the JSON output.
+  uncommitted=$(printf '%s' "$uncommitted_raw" | grep -c . 2>/dev/null || true)
+  # Ensure we have a valid number (empty string → 0)
+  uncommitted=${uncommitted:-0}
 else
   # git status failed entirely — report unknown, not clean
   uncommitted="null"

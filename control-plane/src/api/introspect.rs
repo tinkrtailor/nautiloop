@@ -21,11 +21,16 @@ pub async fn pod_introspect(
     State(state): State<AppState>,
     Path(loop_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, NautiloopError> {
-    let record = state
-        .store
-        .get_loop(loop_id)
-        .await?
-        .ok_or(NautiloopError::LoopNotFound { id: loop_id })?;
+    // Defense-in-depth: 1s timeout on the DB lookup so a degraded Postgres
+    // doesn't push total handler time well beyond the 3s k8s timeout.
+    let record = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        state.store.get_loop(loop_id),
+    )
+    .await
+    .map_err(|_| NautiloopError::Internal("database query timed out".to_string()))?
+    ?
+    .ok_or(NautiloopError::LoopNotFound { id: loop_id })?;
 
     // FR-1d: terminal loops have no pod to introspect
     if record.state.is_terminal() {
