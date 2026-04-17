@@ -507,6 +507,17 @@ fn build_agent_mounts(
             read_only: Some(is_review_or_audit), // FR-6: Read-only for REVIEW/AUDIT
             ..Default::default()
         },
+        // Mount the whole bare-repo PVC (no subPath) at /bare-repo so the
+        // worktree's .git pointer file can resolve `gitdir: /bare-repo/worktrees/<name>`.
+        // Without this, /work/.git points at a path outside the subPath mount, git
+        // fails, and the agent runs `git init` creating a disjoint repo whose commits
+        // never reach the bare repo's branch ref.
+        VolumeMount {
+            name: "worktree".to_string(),
+            mount_path: "/bare-repo".to_string(),
+            read_only: Some(is_review_or_audit),
+            ..Default::default()
+        },
         VolumeMount {
             name: "sessions".to_string(),
             mount_path: "/sessions".to_string(),
