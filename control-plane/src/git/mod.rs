@@ -29,6 +29,18 @@ pub trait GitOperations: Send + Sync + 'static {
     /// Write a file to the worktree for a branch and commit it.
     async fn write_file(&self, branch: &str, path: &str, content: &str) -> Result<()>;
 
+    /// Write a file to the worktree for a branch and commit it with custom author and message.
+    /// Used for spec commits that must be attributed to the engineer (FR-3d).
+    async fn write_file_as(
+        &self,
+        branch: &str,
+        path: &str,
+        content: &str,
+        author_name: &str,
+        author_email: &str,
+        commit_message: &str,
+    ) -> Result<()>;
+
     /// Delete a branch (cleanup on failure).
     async fn delete_branch(&self, branch: &str) -> Result<()>;
 
@@ -131,6 +143,9 @@ pub mod bare {
             worktree_dir: &str,
             path: &str,
             content: &str,
+            author_name: &str,
+            author_email: &str,
+            commit_message: &str,
         ) -> Result<()> {
             let file_path = std::path::Path::new(worktree_dir).join(path);
             if let Some(parent) = file_path.parent() {
@@ -157,15 +172,17 @@ pub mod bare {
                 )));
             }
 
+            let user_name_arg = format!("user.name={author_name}");
+            let user_email_arg = format!("user.email={author_email}");
             let commit = Command::new("git")
                 .args([
                     "-c",
-                    "user.name=nautiloop-control-plane",
+                    &user_name_arg,
                     "-c",
-                    "user.email=nautiloop@nautiloop.dev",
+                    &user_email_arg,
                     "commit",
                     "-m",
-                    &format!("chore(agent): add {path}"),
+                    commit_message,
                 ])
                 .current_dir(worktree_dir)
                 .output()
@@ -323,13 +340,40 @@ pub mod bare {
         }
 
         async fn write_file(&self, branch: &str, path: &str, content: &str) -> Result<()> {
+            self.write_file_as(
+                branch,
+                path,
+                content,
+                "nautiloop-control-plane",
+                "nautiloop@nautiloop.dev",
+                &format!("chore(agent): add {path}"),
+            )
+            .await
+        }
+
+        async fn write_file_as(
+            &self,
+            branch: &str,
+            path: &str,
+            content: &str,
+            author_name: &str,
+            author_email: &str,
+            commit_message: &str,
+        ) -> Result<()> {
             // Use the persistent worktree if it exists (created by ensure_worktree).
             // Git forbids the same branch in two worktrees, so we must not create
             // a second temporary worktree for a branch that already has one.
             let persistent = self.persistent_worktree_dir(branch);
             if persistent.exists() {
                 return self
-                    .write_file_in_worktree(&persistent.to_string_lossy(), path, content)
+                    .write_file_in_worktree(
+                        &persistent.to_string_lossy(),
+                        path,
+                        content,
+                        author_name,
+                        author_email,
+                        commit_message,
+                    )
                     .await;
             }
 
@@ -344,7 +388,14 @@ pub mod bare {
                 })?;
 
             let result = self
-                .write_file_in_worktree(&worktree_dir, path, content)
+                .write_file_in_worktree(
+                    &worktree_dir,
+                    path,
+                    content,
+                    author_name,
+                    author_email,
+                    commit_message,
+                )
                 .await;
 
             let _ = self
@@ -733,6 +784,20 @@ pub mod mock {
         }
 
         async fn write_file(&self, _branch: &str, path: &str, content: &str) -> Result<()> {
+            let mut files = self.files.write().await;
+            files.insert(path.to_string(), content.to_string());
+            Ok(())
+        }
+
+        async fn write_file_as(
+            &self,
+            _branch: &str,
+            path: &str,
+            content: &str,
+            _author_name: &str,
+            _author_email: &str,
+            _commit_message: &str,
+        ) -> Result<()> {
             let mut files = self.files.write().await;
             files.insert(path.to_string(), content.to_string());
             Ok(())

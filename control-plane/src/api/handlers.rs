@@ -52,10 +52,28 @@ pub async fn start(
     // Fetch latest from remote so spec validation and branch creation use current state
     state.git.fetch().await?;
 
+    // FR-3c: validate spec_path — no traversal, no absolute paths, must end in .md.
+    if req.spec_path.contains("..") || req.spec_path.starts_with('/') {
+        return Err(NautiloopError::BadRequest(
+            "spec_path must not contain '..' or start with '/'".to_string(),
+        ));
+    }
+    if !req.spec_path.ends_with(".md") {
+        return Err(NautiloopError::BadRequest(
+            "spec_path must end with '.md'".to_string(),
+        ));
+    }
+
     // Determine spec source: local upload (FR-1b) or default branch (FR-2b).
     let default_ref = state.config.default_remote_ref();
     let spec_from_local: bool;
     let spec_content = if let Some(ref content) = req.spec_content {
+        // Reject empty spec content — an empty spec is clearly invalid input.
+        if content.is_empty() {
+            return Err(NautiloopError::BadRequest(
+                "spec_content must not be empty".to_string(),
+            ));
+        }
         // FR-3a: spec_content must be valid UTF-8 (guaranteed by JSON deserialization).
         // FR-3b: enforce 1 MB size limit.
         if content.len() > 1_048_576 {
@@ -184,16 +202,69 @@ pub async fn start(
     };
 
     // FR-2a: If spec was uploaded locally, commit it onto the agent branch as the first commit.
+    // FR-3d: Use the engineer's identity for the spec commit, not the control-plane default.
     if spec_from_local {
+        // Look up engineer identity from stored credentials (same as loop engine driver).
+        let all_creds = state.store.get_credentials(&req.engineer).await?;
+        let engineer_name = all_creds
+            .iter()
+            .find(|c| c.provider == "_name" && c.valid)
+            .map(|c| c.credential_ref.clone())
+            .unwrap_or_else(|| req.engineer.clone());
+        let engineer_email = all_creds
+            .iter()
+            .find(|c| c.provider == "_email" && c.valid)
+            .map(|c| c.credential_ref.clone())
+            .unwrap_or_else(|| format!("{}@nautiloop.dev", req.engineer));
+
+        let commit_message = format!("chore(spec): add {}", req.spec_path);
+
         match state
             .git
-            .write_file(&branch, &req.spec_path, &spec_content)
+            .write_file_as(
+                &branch,
+                &req.spec_path,
+                &spec_content,
+                &engineer_name,
+                &engineer_email,
+                &commit_message,
+            )
             .await
         {
             Ok(()) => {
-                // Update branch_sha to the post-write tip so current_sha reflects the spec commit.
-                if let Ok(Some(new_sha)) = state.git.get_branch_sha(&branch).await {
-                    branch_sha = new_sha;
+                // FR-2a: current_sha must reflect the spec commit, not the default-branch tip.
+                // Treat get_branch_sha failure as an error — the SHA must be correct.
+                match state.git.get_branch_sha(&branch).await {
+                    Ok(Some(new_sha)) => {
+                        branch_sha = new_sha;
+                    }
+                    Ok(None) => {
+                        tracing::error!(
+                            loop_id = %loop_id,
+                            branch = %branch,
+                            "Branch SHA not found after spec commit"
+                        );
+                        let _ = state
+                            .store
+                            .update_loop_state(loop_id, LoopState::Failed, None)
+                            .await;
+                        return Err(NautiloopError::Git(
+                            "Branch not found after spec commit".to_string(),
+                        ));
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            loop_id = %loop_id,
+                            branch = %branch,
+                            error = %e,
+                            "Failed to get branch SHA after spec commit"
+                        );
+                        let _ = state
+                            .store
+                            .update_loop_state(loop_id, LoopState::Failed, None)
+                            .await;
+                        return Err(e);
+                    }
                 }
             }
             Err(e) => {
@@ -1384,5 +1455,116 @@ mod tests {
         let expected_branch =
             generate_branch_name("alice", "specs/test.md", "# New Local Content\n");
         assert_eq!(resp.branch, expected_branch);
+    }
+
+    #[tokio::test]
+    async fn test_start_empty_spec_content_rejected() {
+        let (app, _store, _git) = test_app();
+
+        let body = serde_json::json!({
+            "spec_path": "specs/empty.md",
+            "engineer": "alice",
+            "spec_content": ""
+        });
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .method(http::Method::POST)
+                .uri("/start")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(err["error"].as_str().unwrap().contains("must not be empty"));
+    }
+
+    #[tokio::test]
+    async fn test_start_path_traversal_rejected() {
+        let (app, _store, _git) = test_app();
+
+        let body = serde_json::json!({
+            "spec_path": "../../etc/passwd.md",
+            "engineer": "alice",
+            "spec_content": "# evil"
+        });
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .method(http::Method::POST)
+                .uri("/start")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(err["error"].as_str().unwrap().contains(".."));
+    }
+
+    #[tokio::test]
+    async fn test_start_absolute_path_rejected() {
+        let (app, _store, _git) = test_app();
+
+        let body = serde_json::json!({
+            "spec_path": "/etc/cron.d/pwn.md",
+            "engineer": "alice",
+            "spec_content": "# evil"
+        });
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .method(http::Method::POST)
+                .uri("/start")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_start_non_md_path_rejected() {
+        let (app, _store, _git) = test_app();
+
+        let body = serde_json::json!({
+            "spec_path": "specs/test.txt",
+            "engineer": "alice",
+            "spec_content": "# not markdown extension"
+        });
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .method(http::Method::POST)
+                .uri("/start")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(err["error"].as_str().unwrap().contains(".md"));
     }
 }
