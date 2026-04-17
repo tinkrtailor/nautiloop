@@ -333,6 +333,7 @@ struct ContainerUsage {
 
 /// Fetch CPU/memory metrics from the k8s metrics API (FR-2b).
 /// Returns None if metrics-server is unavailable.
+/// Has a 2s timeout to avoid holding resources when metrics-server is slow.
 async fn fetch_container_metrics(
     client: &kube::Client,
     pod_name: &str,
@@ -349,7 +350,21 @@ async fn fetch_container_metrics(
         .body(Vec::new())
         .ok()?;
 
-    let response: Result<PodMetrics, _> = client.request(request).await;
+    // 2s timeout: if the metrics API is reachable but slow (e.g. partial
+    // network partition to metrics-server), avoid holding the HTTP connection
+    // and tokio task beyond the outer 3s handler timeout.
+    let response: Result<PodMetrics, _> = match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.request(request),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::debug!("metrics API request timed out after 2s");
+            return None;
+        }
+    };
 
     match response {
         Ok(pod_metrics) => {
@@ -381,7 +396,7 @@ pub fn parse_cpu_to_millicores(cpu: &str) -> u64 {
         milli.parse::<u64>().unwrap_or(0)
     } else {
         let cores: f64 = cpu.parse().unwrap_or(0.0);
-        (cores * 1000.0) as u64
+        (cores * 1000.0).round() as u64
     }
 }
 

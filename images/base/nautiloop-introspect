@@ -55,7 +55,11 @@ head_sha=$(git -C /work rev-parse HEAD 2>/dev/null) || head_sha=""
 # FR-2a: git status --porcelain counts all dirty files including untracked.
 # Fallback to "null" (not "0") so callers can distinguish "clean" from "unknown".
 if uncommitted_raw=$(git -C /work status --porcelain 2>/dev/null); then
-  uncommitted=$(printf '%s' "$uncommitted_raw" | wc -l | tr -d ' ')
+  # Use grep -c to count non-empty lines. printf '%s' strips the trailing
+  # newline, and wc -l counts newline chars — so 1 dirty file would report 0.
+  # grep -c . counts lines with at least one character, which is correct
+  # regardless of trailing newline presence.
+  uncommitted=$(printf '%s' "$uncommitted_raw" | grep -c . || echo 0)
 else
   # git status failed entirely — report unknown, not clean
   uncommitted="null"

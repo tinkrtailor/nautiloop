@@ -725,11 +725,33 @@ fn spawn_introspect_task(
                 }));
             }
 
+            // Wait for the next change
             if loop_id_rx.changed().await.is_err() {
                 if let Some(task) = current_task {
                     task.abort();
                 }
                 break;
+            }
+
+            // Debounce: after a change arrives, wait 300ms for additional rapid
+            // changes (e.g. user arrowing through the loop list). This avoids
+            // hammering the API with one request per arrow-key press.
+            loop {
+                match tokio::time::timeout(
+                    Duration::from_millis(300),
+                    loop_id_rx.changed(),
+                )
+                .await
+                {
+                    Ok(Ok(())) => continue,   // another change arrived, keep waiting
+                    Ok(Err(_)) => {
+                        if let Some(task) = current_task {
+                            task.abort();
+                        }
+                        return;
+                    }
+                    Err(_) => break,          // 300ms elapsed with no new change
+                }
             }
         }
     });

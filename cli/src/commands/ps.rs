@@ -89,17 +89,25 @@ pub async fn run_watch(client: &NemoClient, loop_id: &str) -> Result<()> {
     // Install a panic hook that restores the terminal before printing the
     // panic message. Without this, a panic during watch mode leaves the
     // terminal in raw mode, requiring the user to run `reset`.
-    let original_hook = std::panic::take_hook();
+    // Use Arc so the original hook is shared (not consumed) by the closure,
+    // allowing us to restore it on normal exit.
+    let original_hook = std::sync::Arc::new(std::panic::take_hook());
+    let hook_for_panic = std::sync::Arc::clone(&original_hook);
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
-        original_hook(info);
+        hook_for_panic(info);
     }));
 
     let result = run_watch_loop(client, loop_id).await;
 
-    // Restore the original panic hook before exiting
+    // Discard our custom hook (drops hook_for_panic clone inside it).
     let _ = std::panic::take_hook();
+    // Restore the original hook. After take_hook drops the closure,
+    // original_hook is the sole Arc owner so try_unwrap succeeds.
+    if let Ok(hook) = std::sync::Arc::try_unwrap(original_hook) {
+        std::panic::set_hook(hook);
+    }
 
     disable_raw_mode()?;
     execute!(io::stdout(), LeaveAlternateScreen)?;

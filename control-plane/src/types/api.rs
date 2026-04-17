@@ -195,7 +195,9 @@ pub struct PodIntrospectResponse {
     pub worktree: WorktreeInfo,
     /// Non-empty when the snapshot is partial/degraded (e.g. exec timed out).
     /// Callers use this to distinguish "genuinely idle" from "data unavailable".
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Always serialized (no skip_serializing_if) so consumers without
+    /// #[serde(default)] don't break on absent field.
+    #[serde(default)]
     pub warnings: Vec<String>,
 }
 
