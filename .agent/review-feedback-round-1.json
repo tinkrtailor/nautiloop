@@ -1,0 +1,62 @@
+{
+  "round": 1,
+  "source": "review",
+  "issues": [
+    {
+      "severity": "high",
+      "category": "correctness",
+      "file": "control-plane/src/types/api.rs",
+      "line": 193,
+      "description": "container_stats uses skip_serializing_if which OMITS the field when None. FR-1e explicitly requires the field to be present as `null` when metrics-server is unavailable. The spec response shape in FR-1b shows `container_stats` as a top-level key. Callers (CLI, helm) that check for the key's presence will break if it's omitted vs null.",
+      "suggestion": "Remove `#[serde(skip_serializing_if = \"Option::is_none\")]` from `container_stats` so that `None` serializes as `\"container_stats\": null`."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "cli/src/commands/helm.rs",
+      "line": 1152,
+      "description": "FR-5a specifies that pressing 'p' cycles: closed → inspect (existing rounds view) → introspect → closed. But SidePanel::Inspect is rendered identically to SidePanel::Closed (both just show the log pane). The inspect pane showing the existing rounds view is not implemented — the state exists but has no visual effect.",
+      "suggestion": "Either render the existing inspect/rounds data in a side pane when SidePanel::Inspect is active, or document this as intentionally deferred. Currently the user presses 'p' once and sees no change, which is confusing."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/introspect.rs",
+      "line": 100,
+      "description": "Exec and metrics fetch are sequential: exec runs first, then metrics. If the exec takes close to 3s (timeout), the combined handler time exceeds the 3s budget specified in FR-1c. The 3s timeout in FR-1c is for the handler overall, not just the exec. The metrics fetch adds additional unbounded latency.",
+      "suggestion": "Either run exec and metrics fetch concurrently with tokio::join!, or wrap the entire handler body (after the terminal/job checks) in a single 3s timeout."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/loop_engine/reconciler.rs",
+      "line": 42,
+      "description": "The cleanup_interval tick is consumed on line 44 to skip the immediate first tick, but tokio::time::interval's second tick fires after the full interval (86400s = 24h). When the cleanup_interval branch wins in select!, it runs sweep_old_pod_snapshots AND then falls through to reconcile_all() on line 67. This is fine, but: the sweep runs unconditionally even when record_introspection is false (config not checked). This wastes a DELETE query against a likely-empty table on every daily tick.",
+      "suggestion": "Check `self.config.observability.record_introspection` (or equivalent) before running the sweep, or accept the minor waste since DELETE on an empty table is cheap."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "images/base/nautiloop-introspect",
+      "line": 5,
+      "description": "set -e is used but the jq command on line 9 can fail if ps output contains lines that don't match the regex capture pattern (e.g., kernel threads with unusual formatting). jq's capture() returns empty/error on no match, but the select(length > 0) only filters empty strings from split. A process line that doesn't match the regex would cause the entire jq pipeline to produce a partial result or error, and set -e would abort the script.",
+      "suggestion": "Add `? // empty` after the capture() call in jq to handle non-matching lines gracefully, or remove set -e and rely on the fallback in the exec command."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "control-plane/src/types/api.rs",
+      "line": 218,
+      "description": "WorktreeInfo fields target_dir_artifacts, target_dir_bytes, and head_sha also use skip_serializing_if, which omits them when None. The spec response shape (FR-1b) does not show these as optional/omittable. However, the CLI types in cli/src/api_types.rs define these as Option<u64>/Option<String> so deserialization handles absent fields correctly. This is less critical than container_stats since the spec doesn't explicitly address these being null.",
+      "suggestion": "For consistency with FR-1b response shape, consider removing skip_serializing_if from these fields too, so they serialize as null rather than being omitted."
+    },
+    {
+      "severity": "low",
+      "category": "performance",
+      "file": "control-plane/src/api/introspect.rs",
+      "line": 197,
+      "description": "The stdout read loop allocates a 64KB buffer and reads in a loop with a 2s timeout per read. For typical introspect output (~1-2KB), this works but the 2s per-read timeout means a slow-dripping exec could take much longer than 3s total (the outer timeout only covers the exec() call, not the read loop).",
+      "suggestion": "Wrap the entire read loop (not just individual reads) in the 3s overall timeout, or use the attached process's join() with a timeout."
+    }
+  ]
+}
