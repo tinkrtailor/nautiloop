@@ -178,7 +178,22 @@ impl OrchestratorJudge {
             return None;
         }
 
-        // Build judge input
+        // Build judge input with truncation to stay within 8K input token budget (FR-4b).
+        // Approximate 1 token ≈ 4 chars; budget ~32K chars total, reserve 8K for
+        // prompt template + current_verdict + recurring_findings + overhead.
+        const MAX_SPEC_CHARS: usize = 12_000;
+        const MAX_ROUND_CHARS: usize = 8_000;
+
+        let truncated_spec = if spec_content.len() > MAX_SPEC_CHARS {
+            let mut truncated = spec_content[..MAX_SPEC_CHARS].to_string();
+            truncated.push_str("\n\n[... spec truncated for token budget ...]");
+            truncated
+        } else {
+            spec_content.to_string()
+        };
+
+        // Keep only the most recent rounds if total serialized size is too large.
+        // Prioritize recent rounds since they're most relevant to the decision.
         let round_summaries: Vec<JudgeRoundSummary> = rounds
             .iter()
             .map(|r| JudgeRoundSummary {
@@ -189,14 +204,16 @@ impl OrchestratorJudge {
             })
             .collect();
 
+        let truncated_rounds = truncate_round_summaries(round_summaries, MAX_ROUND_CHARS);
+
         let input = JudgeInput {
             loop_id,
             spec_path: spec_path.to_string(),
-            spec_content: spec_content.to_string(),
+            spec_content: truncated_spec,
             phase: phase.to_string(),
             round,
             max_rounds,
-            rounds: round_summaries,
+            rounds: truncated_rounds,
             current_verdict: current_verdict.clone(),
             recurring_findings: recurring,
         };
@@ -312,7 +329,7 @@ impl OrchestratorJudge {
         // Priority: max_rounds > recurring_findings > not_clean
         if round >= max_rounds {
             Some(JudgeTrigger::MaxRounds)
-        } else if recurring.iter().any(|f| !f.seen_in_rounds.is_empty()) {
+        } else if !recurring.is_empty() {
             Some(JudgeTrigger::RecurringFindings)
         } else {
             // The caller already checked verdict.clean == false
@@ -484,6 +501,38 @@ pub fn extract_issues_from_output(output: &serde_json::Value) -> Vec<Issue> {
     }
 
     Vec::new()
+}
+
+/// Truncate round summaries to fit within a character budget.
+/// Keeps the most recent rounds (most relevant to the current decision).
+fn truncate_round_summaries(
+    rounds: Vec<JudgeRoundSummary>,
+    max_chars: usize,
+) -> Vec<JudgeRoundSummary> {
+    if rounds.is_empty() {
+        return rounds;
+    }
+
+    // Check if all rounds fit within budget
+    if let Ok(serialized) = serde_json::to_string(&rounds)
+        && serialized.len() <= max_chars
+    {
+        return rounds;
+    }
+
+    // Drop oldest rounds until we fit, always keeping at least the most recent
+    let mut kept = rounds;
+    while kept.len() > 1 {
+        kept.remove(0);
+        if let Ok(serialized) = serde_json::to_string(&kept)
+            && serialized.len() <= max_chars
+        {
+            return kept;
+        }
+    }
+
+    // If even a single round exceeds budget, return it anyway (judge needs some context)
+    kept
 }
 
 /// Load the judge prompt template from the .nautiloop/prompts directory.

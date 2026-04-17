@@ -110,6 +110,11 @@ impl ConvergentLoopDriver {
 
         // FR-5b: When a loop reaches a terminal state, back-fill loop_final_state
         // on all judge_decisions rows for this loop.
+        // Invariant: this runs in the same tick as the terminal transition.
+        // The `!was_terminal` guard ensures we backfill exactly once — on the tick
+        // that transitions to terminal. If the loop is already terminal on entry
+        // (line 80-91), we skip the match block entirely, so backfill already ran
+        // on the prior tick that caused the transition.
         if !was_terminal && new_state.is_terminal() {
             let now = chrono::Utc::now();
             if let Err(e) = self
@@ -728,7 +733,19 @@ impl ConvergentLoopDriver {
                             }
                         } else {
                             // No judge (disabled/error/timeout): use heuristic
-                            self.dispatch_revise(record, None).await
+                            if record.round >= record.max_rounds {
+                                record.state = LoopState::Failed;
+                                record.sub_state = None;
+                                record.failure_reason = Some(format!(
+                                    "Max harden rounds ({}) exceeded",
+                                    record.max_rounds
+                                ));
+                                record.active_job_name = None;
+                                self.store.update_loop(record).await?;
+                                Ok(LoopState::Failed)
+                            } else {
+                                self.dispatch_revise(record, None).await
+                            }
                         }
                     }
                     None => {
@@ -769,14 +786,20 @@ impl ConvergentLoopDriver {
 
                 // After revise: invoke judge if near max rounds or recurring findings
                 if record.round >= record.max_rounds {
-                    // At max rounds: invoke judge for final disposition
-                    let verdict_json = last_round
-                        .and_then(|r| r.output.clone())
-                        .unwrap_or(serde_json::json!({}));
-
-                    // Extract issues from last round output for recurring-findings detection
-                    let last_round_issues =
-                        crate::loop_engine::judge::extract_issues_from_output(&verdict_json);
+                    // At max rounds: invoke judge for final disposition.
+                    // Extract issues from the last AUDIT round (not revise), since revise
+                    // output contains the revised spec, not audit findings.
+                    let (verdict_json, last_round_issues) = rounds
+                        .iter()
+                        .rev()
+                        .find(|r| r.stage == "audit")
+                        .and_then(|r| r.output.as_ref())
+                        .map(|output| {
+                            let issues =
+                                crate::loop_engine::judge::extract_issues_from_output(output);
+                            (output.clone(), issues)
+                        })
+                        .unwrap_or_else(|| (serde_json::json!({}), vec![]));
 
                     if let Some(judge_output) = self
                         .invoke_judge_for_stage(

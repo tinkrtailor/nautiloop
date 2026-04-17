@@ -20,6 +20,99 @@ pub async fn run(client: &NemoClient, path: &str) -> Result<()> {
     // Pass branch as query param (not path segment) because branch names contain slashes
     let resp = fetch(client, &branch).await?;
 
-    println!("{}", serde_json::to_string_pretty(&resp)?);
+    // Header
+    println!("Loop:     {}", resp.loop_id);
+    println!("Engineer: {}", resp.engineer);
+    println!("Branch:   {}", resp.branch);
+    println!("State:    {}", resp.state);
+    println!();
+
+    // Rounds
+    for round in &resp.rounds {
+        println!("── Round {} ──", round.round);
+
+        if let Some(ref v) = round.implement {
+            print_stage("implement", v);
+        }
+        if let Some(ref v) = round.test {
+            print_stage("test", v);
+        }
+        if let Some(ref v) = round.review {
+            print_stage("review", v);
+        }
+        if let Some(ref v) = round.audit {
+            print_stage("audit", v);
+        }
+        if let Some(ref v) = round.revise {
+            print_stage("revise", v);
+        }
+
+        // Highlight judge decisions inline with the round (FR-6c)
+        if let Some(ref jd) = round.judge_decision {
+            println!(
+                "  judge:     decision={} confidence={} trigger={} ({}ms)",
+                jd.decision,
+                jd.confidence
+                    .map(|c| format!("{:.2}", c))
+                    .unwrap_or_else(|| "n/a".to_string()),
+                jd.trigger,
+                jd.duration_ms,
+            );
+            if let Some(ref reasoning) = jd.reasoning {
+                println!("             reasoning: {reasoning}");
+            }
+            if let Some(ref hint) = jd.hint {
+                println!("             hint: {hint}");
+            }
+        }
+
+        println!();
+    }
+
+    // Summary of all judge decisions if any were made
+    if !resp.judge_decisions.is_empty() {
+        println!("── Judge Decisions ──");
+        for jd in &resp.judge_decisions {
+            println!(
+                "  round {} ({}): {} [confidence={}, trigger={}]",
+                jd.round,
+                jd.phase,
+                jd.decision,
+                jd.confidence
+                    .map(|c| format!("{:.2}", c))
+                    .unwrap_or_else(|| "n/a".to_string()),
+                jd.trigger,
+            );
+        }
+    }
+
     Ok(())
+}
+
+fn print_stage(name: &str, value: &serde_json::Value) {
+    // Show a compact one-line summary for each stage
+    let clean = value
+        .get("clean")
+        .or_else(|| value.get("verdict").and_then(|v| v.get("clean")));
+    let issues = value
+        .get("issues")
+        .or_else(|| value.get("verdict").and_then(|v| v.get("issues")))
+        .and_then(|v| v.as_array())
+        .map(|a| a.len());
+
+    let mut summary = String::new();
+    if let Some(clean) = clean {
+        summary.push_str(&format!("clean={clean}"));
+    }
+    if let Some(count) = issues {
+        if !summary.is_empty() {
+            summary.push_str(", ");
+        }
+        summary.push_str(&format!("issues={count}"));
+    }
+    if summary.is_empty() {
+        summary.push_str("completed");
+    }
+
+    println!("  {name:10} {summary}");
 }
