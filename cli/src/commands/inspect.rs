@@ -83,7 +83,7 @@ pub async fn run(client: &NemoClient, path: &str) -> Result<()> {
         .count();
     if orphaned_count > 0 {
         println!(
-            "{orphaned_count} additional judge decision(s) not shown inline (use --json for details)"
+            "{orphaned_count} additional judge decision(s) not shown inline (use API /inspect endpoint for full details)"
         );
         println!();
     }

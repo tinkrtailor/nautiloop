@@ -163,6 +163,14 @@ impl Default for HardenMergeConfig {
 }
 
 /// Orchestrator judge configuration from `[orchestrator]` in nemo.toml.
+///
+/// **Round-1 skip**: The judge is always skipped on round 1 regardless of
+/// `judge_min_round`. This is a hard-coded optimization: round-1 verdicts with
+/// `clean == false` are near-certain "continue" cases, so skipping preserves the
+/// NFR-1 cost budget for ambiguous later rounds. Setting `judge_min_round = 1`
+/// enables the judge from round 2 onward but cannot override the round-1 skip.
+/// The round-1 skip does NOT apply when recurring findings are detected (which
+/// requires prior rounds to exist, so it's effectively impossible on round 1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrchestratorConfig {
     /// Model for the orchestrator judge (default: claude-haiku-4-5).

@@ -1333,6 +1333,117 @@ async fn test_harden_revise_no_judge_at_max_rounds_fails() {
     assert_eq!(decisions.len(), 0);
 }
 
+/// Judge returns Continue on harden audit at max_rounds -> FAILED.
+/// This covers the audit-evaluation path (driver.rs ~line 654), distinct from the
+/// revise-evaluation path tested by test_harden_revise_judge_continue_at_max_rounds_fails.
+#[tokio::test]
+async fn test_harden_audit_judge_continue_at_max_rounds_fails() {
+    let store = Arc::new(MemoryStateStore::new());
+    let dispatcher = Arc::new(MockJobDispatcher::new());
+    let git = Arc::new(MockGitOperations::new());
+    install_fresh_creds(&dispatcher).await;
+
+    let verdict = serde_json::json!({
+        "clean": false,
+        "issues": [{
+            "severity": "high",
+            "category": "correctness",
+            "description": "Logic gap still present",
+            "suggestion": "Needs further revision"
+        }],
+        "summary": "Issues remain after max rounds",
+        "token_usage": {"input": 100, "output": 50}
+    });
+
+    // Set up hardening loop at max_rounds with a completed *audit* job (not revise)
+    let mut record = make_loop_record();
+    record.state = LoopState::Hardening;
+    record.sub_state = Some(SubState::Dispatched);
+    record.round = 5;
+    record.max_rounds = 5;
+    record.harden = true;
+    record.harden_only = true;
+    record.kind = LoopKind::Harden;
+    record.active_job_name = Some("audit-job".to_string());
+    store.create_loop(&record).await.unwrap();
+
+    // Create the audit round record (open, not yet completed)
+    let round_record = RoundRecord {
+        id: Uuid::new_v4(),
+        loop_id: record.id,
+        round: 5,
+        stage: "audit".to_string(),
+        input: None,
+        output: None,
+        started_at: Some(Utc::now()),
+        completed_at: None,
+        duration_secs: None,
+        job_name: Some("audit-job".to_string()),
+    };
+    store.create_round(&round_record).await.unwrap();
+
+    // Set audit job to Succeeded
+    let job = k8s_openapi::api::batch::v1::Job {
+        metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+            name: Some("audit-job".to_string()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    dispatcher.create_job(&job).await.unwrap();
+    dispatcher
+        .set_job_status("audit-job", JobStatus::Succeeded)
+        .await;
+
+    // Set logs with NAUTILOOP_RESULT (audit envelope)
+    let envelope = serde_json::json!({
+        "stage": "audit",
+        "data": verdict,
+    });
+    let logs = format!(
+        "NAUTILOOP_RESULT:{}",
+        serde_json::to_string(&envelope).unwrap()
+    );
+    dispatcher.set_job_logs("audit-job", &logs).await;
+
+    // Set spec file in git
+    git.add_file("specs/test.md", "# Test spec\nSome requirements")
+        .await;
+
+    // Judge returns Continue, but we're at max_rounds in audit path
+    let judge_response = r#"{"decision": "continue", "confidence": 0.65, "reasoning": "Issues are fixable but audit at max rounds"}"#;
+    let driver = build_driver(store.clone(), dispatcher, git, judge_response);
+
+    let new_state = driver.tick(record.id).await.unwrap();
+    assert_eq!(new_state, LoopState::Failed);
+
+    let updated = store.get_loop(record.id).await.unwrap().unwrap();
+    let reason = updated.failure_reason.as_ref().unwrap();
+    assert!(
+        reason.contains("Max harden rounds"),
+        "Should contain max rounds message, got: {reason}"
+    );
+    assert!(
+        reason.contains("Judge wanted to continue"),
+        "Should indicate judge wanted to continue, got: {reason}"
+    );
+    assert!(
+        reason.contains("audit at max rounds"),
+        "Should contain judge reasoning, got: {reason}"
+    );
+
+    // Verify judge decision was persisted and backfilled (terminal state)
+    let decisions = store.get_judge_decisions(record.id).await.unwrap();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].decision, "continue");
+    assert_eq!(decisions[0].phase, "harden");
+    assert_eq!(
+        decisions[0].loop_final_state.as_deref(),
+        Some("FAILED"),
+        "Judge decision should be backfilled with FAILED state"
+    );
+}
+
 /// FR-5b: Cancelling a loop with prior judge decisions correctly backfills
 /// loop_final_state='CANCELLED' and loop_terminated_at on all judge_decisions rows.
 #[tokio::test]

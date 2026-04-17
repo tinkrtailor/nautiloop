@@ -239,12 +239,12 @@ impl OrchestratorJudge {
             if let Some(issues) = v.get_mut("issues").and_then(|i| i.as_array_mut()) {
                 issues.truncate(10); // Keep at most 10 issues
                 for issue in issues.iter_mut() {
-                    if let Some(desc) = issue.get_mut("description").and_then(|d| d.as_str().map(|s| s.to_string()))
-                        && desc.len() > MAX_ISSUE_DESC_CHARS
+                    if let Some(desc_str) = issue.get("description").and_then(|d| d.as_str())
+                        && desc_str.len() > MAX_ISSUE_DESC_CHARS
                     {
-                        let truncated = &desc[..desc.floor_char_boundary(MAX_ISSUE_DESC_CHARS)];
+                        let truncated = &desc_str[..desc_str.floor_char_boundary(MAX_ISSUE_DESC_CHARS)];
                         issue["description"] = serde_json::Value::String(
-                            format!("{}...", truncated),
+                            format!("{truncated}..."),
                         );
                     }
                 }
@@ -252,12 +252,15 @@ impl OrchestratorJudge {
             v
         };
 
-        // Truncate recurring_findings to stay within budget
-        let truncated_recurring = if recurring.len() > MAX_RECURRING_FINDINGS {
-            recurring[..MAX_RECURRING_FINDINGS].to_vec()
-        } else {
-            recurring
-        };
+        // Truncate recurring_findings to stay within budget.
+        // Each entry is compact (category + file + line + seen_in_rounds), so the
+        // MAX_RECURRING_FINDINGS cap of 10 entries keeps the total well within the
+        // token budget. The category and file strings are bounded by file-system
+        // path lengths and review-category vocabulary.
+        let truncated_recurring: Vec<RecurringFinding> = recurring
+            .into_iter()
+            .take(MAX_RECURRING_FINDINGS)
+            .collect();
 
         let input = JudgeInput {
             loop_id,
