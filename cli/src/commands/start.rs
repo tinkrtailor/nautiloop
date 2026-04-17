@@ -34,15 +34,7 @@ pub async fn run(client: &NemoClient, args: StartArgs<'_>) -> Result<()> {
     let spec_bytes = spec_content.len();
 
     // FR-3b: client-side size check to avoid uploading oversized specs.
-    const MAX_SPEC_SIZE: usize = 1_048_576;
-    if spec_bytes > MAX_SPEC_SIZE {
-        anyhow::bail!(
-            "Spec file '{}' is {} bytes, which exceeds the 1 MB limit ({} bytes).",
-            args.spec_path,
-            format_thousands(spec_bytes),
-            format_thousands(MAX_SPEC_SIZE),
-        );
-    }
+    validate_spec_size(args.spec_path, &spec_content)?;
 
     let body = build_start_body(&args, &spec_content);
 
@@ -85,6 +77,24 @@ fn format_thousands(n: usize) -> String {
         result.push(b as char);
     }
     result
+}
+
+/// Maximum spec file size in bytes (1 MB).
+const MAX_SPEC_SIZE: usize = 1_048_576;
+
+/// Validate that a spec's content does not exceed the size limit.
+/// Returns Ok(()) if within limits, or an error with a descriptive message.
+fn validate_spec_size(spec_path: &str, content: &str) -> Result<()> {
+    let spec_bytes = content.len();
+    if spec_bytes > MAX_SPEC_SIZE {
+        anyhow::bail!(
+            "Spec file '{}' is {} bytes, which exceeds the 1 MB limit ({} bytes).",
+            spec_path,
+            format_thousands(spec_bytes),
+            format_thousands(MAX_SPEC_SIZE),
+        );
+    }
+    Ok(())
 }
 
 /// Build the JSON request body for /start. Extracted for testability.
@@ -193,16 +203,14 @@ mod tests {
 
     #[test]
     fn test_oversized_spec_rejected_client_side() {
-        let mut tmp = NamedTempFile::new().unwrap();
-        // Write 1 MB + 1 byte
+        // 1 MB + 1 byte must be rejected
         let oversized = "x".repeat(1_048_577);
-        write!(tmp, "{}", oversized).unwrap();
-
-        let content = std::fs::read_to_string(tmp.path()).unwrap();
-        const MAX_SPEC_SIZE: usize = 1_048_576;
+        let result = validate_spec_size("specs/big.md", &oversized);
+        assert!(result.is_err(), "Oversized spec should be rejected");
+        let err_msg = format!("{:#}", result.unwrap_err());
         assert!(
-            content.len() > MAX_SPEC_SIZE,
-            "Test content should exceed 1 MB"
+            err_msg.contains("exceeds the 1 MB limit"),
+            "Expected size limit message, got: {err_msg}"
         );
     }
 
@@ -210,11 +218,8 @@ mod tests {
     fn test_spec_at_limit_accepted_client_side() {
         // Exactly 1 MB should be accepted
         let content = "x".repeat(1_048_576);
-        const MAX_SPEC_SIZE: usize = 1_048_576;
-        assert!(
-            content.len() <= MAX_SPEC_SIZE,
-            "Exactly 1 MB should not be rejected"
-        );
+        let result = validate_spec_size("specs/ok.md", &content);
+        assert!(result.is_ok(), "Exactly 1 MB should not be rejected");
     }
 
     #[test]

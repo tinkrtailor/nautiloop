@@ -264,6 +264,10 @@ pub async fn start(
             }
             Err(e) => {
                 let _ = state.git.delete_branch(&branch).await;
+                // Best-effort cleanup: the push inside commit_spec_to_branch may have
+                // partially succeeded (e.g. network timeout after remote accepted),
+                // leaving an orphan remote branch. Try to delete it.
+                let _ = state.git.delete_remote_branch(&branch).await;
                 let _ = state
                     .store
                     .update_loop_state(loop_id, LoopState::Failed, None)
