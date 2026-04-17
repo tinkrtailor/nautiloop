@@ -53,6 +53,11 @@ pub async fn start(
     state.git.fetch().await?;
 
     // FR-3c: validate spec_path — no traversal, no absolute paths, must end in .md.
+    if req.spec_path.contains('\\') {
+        return Err(NautiloopError::BadRequest(
+            "spec_path must not contain backslashes".to_string(),
+        ));
+    }
     if req.spec_path.starts_with('/') {
         return Err(NautiloopError::BadRequest(
             "spec_path must not start with '/'".to_string(),
@@ -76,7 +81,8 @@ pub async fn start(
         .rsplit('/')
         .next()
         .unwrap_or(&req.spec_path)
-        .trim_end_matches(".md");
+        .strip_suffix(".md")
+        .unwrap_or("");
     if stem.is_empty() || stem.trim().is_empty() {
         return Err(NautiloopError::BadRequest(
             "spec_path filename must have a non-empty name before '.md'".to_string(),
@@ -315,7 +321,16 @@ pub async fn start(
 
     // Persist the SHA via a narrow SQL update — never use update_loop() from /start
     // because the reconciler may have already advanced the record.
-    state.store.set_current_sha(loop_id, &branch_sha).await?;
+    match state.store.set_current_sha(loop_id, &branch_sha).await {
+        Ok(()) => {}
+        Err(e) => {
+            let _ = state
+                .store
+                .update_loop_state(loop_id, LoopState::Failed, None)
+                .await;
+            return Err(e);
+        }
+    };
 
     let spec_source = if spec_from_local {
         "local"
@@ -1660,6 +1675,90 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("non-empty name"));
+    }
+
+    #[tokio::test]
+    async fn test_start_backslash_path_rejected() {
+        let (app, _store, _git) = test_app();
+
+        let body = serde_json::json!({
+            "spec_path": "specs\\..\\..\\evil.md",
+            "engineer": "alice",
+            "spec_content": "# evil"
+        });
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .method(http::Method::POST)
+                .uri("/start")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(err["error"].as_str().unwrap().contains("backslash"));
+    }
+
+    #[tokio::test]
+    async fn test_start_local_spec_records_engineer_identity() {
+        // FR-3d: The spec commit must use the engineer's identity.
+        let (app, store, git) = test_app();
+
+        // Register engineer identity credentials
+        let name_cred = crate::types::EngineerCredential {
+            id: Uuid::new_v4(),
+            engineer: "alice".to_string(),
+            provider: "_name".to_string(),
+            credential_ref: "Alice Smith".to_string(),
+            valid: true,
+            updated_at: chrono::Utc::now(),
+        };
+        let email_cred = crate::types::EngineerCredential {
+            id: Uuid::new_v4(),
+            engineer: "alice".to_string(),
+            provider: "_email".to_string(),
+            credential_ref: "alice@example.com".to_string(),
+            valid: true,
+            updated_at: chrono::Utc::now(),
+        };
+        store.upsert_credential(&name_cred).await.unwrap();
+        store.upsert_credential(&email_cred).await.unwrap();
+
+        let body = serde_json::json!({
+            "spec_path": "specs/identity-test.md",
+            "engineer": "alice",
+            "spec_content": "# Identity Test Spec",
+            "auto_approve": true
+        });
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .method(http::Method::POST)
+                .uri("/start")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        // Verify the mock recorded the correct author identity
+        let calls = git.get_write_file_as_calls().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].path, "specs/identity-test.md");
+        assert_eq!(calls[0].content, "# Identity Test Spec");
+        assert_eq!(calls[0].author_name, "Alice Smith");
+        assert_eq!(calls[0].author_email, "alice@example.com");
+        assert_eq!(calls[0].commit_message, "chore(spec): add specs/identity-test.md");
     }
 
     #[tokio::test]

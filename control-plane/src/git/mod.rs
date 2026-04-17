@@ -709,11 +709,23 @@ pub mod mock {
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
+    /// Recorded call to `write_file_as` for test assertions (FR-3d).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct WriteFileAsCall {
+        pub branch: String,
+        pub path: String,
+        pub content: String,
+        pub author_name: String,
+        pub author_email: String,
+        pub commit_message: String,
+    }
+
     #[derive(Debug, Clone)]
     pub struct MockGitOperations {
         files: Arc<RwLock<HashMap<String, String>>>,
         branches: Arc<RwLock<HashMap<String, String>>>,
         default_sha: String,
+        write_file_as_calls: Arc<RwLock<Vec<WriteFileAsCall>>>,
     }
 
     impl MockGitOperations {
@@ -722,7 +734,13 @@ pub mod mock {
                 files: Arc::new(RwLock::new(HashMap::new())),
                 branches: Arc::new(RwLock::new(HashMap::new())),
                 default_sha: "0000000000000000000000000000000000000000".to_string(),
+                write_file_as_calls: Arc::new(RwLock::new(Vec::new())),
             }
+        }
+
+        /// Return all recorded `write_file_as` calls for test assertions.
+        pub async fn get_write_file_as_calls(&self) -> Vec<WriteFileAsCall> {
+            self.write_file_as_calls.read().await.clone()
         }
 
         /// Add a file to the mock repo.
@@ -791,15 +809,25 @@ pub mod mock {
 
         async fn write_file_as(
             &self,
-            _branch: &str,
+            branch: &str,
             path: &str,
             content: &str,
-            _author_name: &str,
-            _author_email: &str,
-            _commit_message: &str,
+            author_name: &str,
+            author_email: &str,
+            commit_message: &str,
         ) -> Result<()> {
             let mut files = self.files.write().await;
             files.insert(path.to_string(), content.to_string());
+            drop(files);
+            let mut calls = self.write_file_as_calls.write().await;
+            calls.push(WriteFileAsCall {
+                branch: branch.to_string(),
+                path: path.to_string(),
+                content: content.to_string(),
+                author_name: author_name.to_string(),
+                author_email: author_email.to_string(),
+                commit_message: commit_message.to_string(),
+            });
             Ok(())
         }
 
