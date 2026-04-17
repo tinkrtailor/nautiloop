@@ -233,8 +233,11 @@ async fn exec_introspect_script(
         ..Default::default()
     };
 
-    // The script has `timeout 2` internally; the exec handshake gets 1s so
-    // total exec budget (1s handshake + 2s read) stays under the outer 3s handler timeout.
+    // The script has `timeout 2` internally; the exec handshake gets 2s so
+    // loaded clusters with slow API server -> kubelet chains won't miss data.
+    // The read timeout is 1s since the script output arrives in a single burst
+    // once the 2s script completes. Total budget (2s handshake + 1s read) = 3s,
+    // bounded by the outer handler timeout.
     let cmd = vec![
         "/bin/sh",
         "-c",
@@ -242,17 +245,17 @@ async fn exec_introspect_script(
     ];
 
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(2),
         pods_api.exec(pod_name, cmd, &attach_params),
     )
     .await;
 
     match result {
         Ok(Ok(mut attached)) => {
-            // Wrap the entire read loop in a 2s timeout (FR-2c script budget).
-            // This prevents slow-dripping execs from exceeding the overall 3s handler budget.
+            // 1s read timeout: script output arrives as a single burst after the
+            // 2s internal timeout, so 1s is generous for reading buffered output.
             let read_result = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(1),
                 async {
                     let mut output = String::new();
                     let mut stderr_output = String::new();
@@ -294,11 +297,11 @@ async fn exec_introspect_script(
             .await;
             match read_result {
                 Ok(output) => Ok(output),
-                Err(_) => Err(ExecError::Timeout("exec read timed out after 2s".to_string())),
+                Err(_) => Err(ExecError::Timeout("exec read timed out after 1s".to_string())),
             }
         }
         Ok(Err(e)) => Err(ExecError::Other(format!("exec failed: {e}"))),
-        Err(_) => Err(ExecError::Timeout("exec handshake timed out after 1s".to_string())),
+        Err(_) => Err(ExecError::Timeout("exec handshake timed out after 2s".to_string())),
     }
 }
 

@@ -37,8 +37,12 @@ ps_json=$(echo "$ps_output" | jq -Rs '
 ') || ps_json='[]'
 
 # Section 2: worktree info
-target_bytes=$(du -sb /work/target 2>/dev/null | awk '{print $1}' || echo "null")
-target_artifacts=$(ls /work/target/debug/deps 2>/dev/null | wc -l || echo "0")
+# Use find instead of du to avoid full directory traversal on large target dirs.
+# Counts regular files and sums their sizes, which is faster than du on deep trees
+# because stat is cheaper than the inode walk du performs. Falls back to null on error.
+target_bytes=$(find /work/target -maxdepth 3 -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END {if(NR>0) print s; else print "null"}' || echo "null")
+# -fA skips sorting (faster with thousands of entries) and excludes . and ..
+target_artifacts=$(ls -fA /work/target/debug/deps 2>/dev/null | wc -l || echo "0")
 head_sha=$(git -C /work rev-parse HEAD 2>/dev/null || echo "null")
 uncommitted=$(git -C /work status --porcelain 2>/dev/null | wc -l || echo "0")
 
