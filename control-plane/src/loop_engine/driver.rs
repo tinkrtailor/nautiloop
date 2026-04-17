@@ -904,6 +904,39 @@ impl ConvergentLoopDriver {
 
         match verdict {
             Some(v) if v.clean => {
+                // Guard: review verdict clean but branch has no commits vs. main.
+                // Means the implementor never actually committed (e.g. it emitted a
+                // fake SHA in NAUTILOOP_RESULT, or the agent image lacked build tools
+                // and bailed). Without this guard, the driver retries create_pr every
+                // tick with "No commits between main and branch" and the loop is stuck
+                // forever. Transition to FAILED with a clear reason instead.
+                let default_branch = self.default_branch_for(record);
+                let branch_sha = self.git.get_branch_sha(&record.branch).await?;
+                let default_sha = self
+                    .git
+                    .get_branch_sha(&format!("origin/{default_branch}"))
+                    .await?;
+                if branch_sha.is_some() && branch_sha == default_sha {
+                    tracing::warn!(
+                        loop_id = %record.id,
+                        branch = %record.branch,
+                        "Review verdict clean but branch has no commits vs. {}; marking FAILED",
+                        default_branch
+                    );
+                    record.state = LoopState::Failed;
+                    record.sub_state = None;
+                    record.active_job_name = None;
+                    record.failure_reason = Some(format!(
+                        "Review returned clean={} but agent branch has no commits against {}. \
+                         Likely cause: implementor produced output but did not commit (missing \
+                         build tooling in the agent image, or agent emitted a synthetic SHA). \
+                         Check implement stage logs.",
+                        v.clean, default_branch
+                    ));
+                    self.store.update_loop(record).await?;
+                    return Ok(LoopState::Failed);
+                }
+
                 // Create PR if not already created (idempotent across ticks)
                 if record.spec_pr_url.is_none() {
                     if let Err(e) = self.git.remove_path(&record.branch, ".agent").await {
@@ -922,7 +955,7 @@ impl ConvergentLoopDriver {
                             &record.branch,
                             &pr_title,
                             &pr_body,
-                            &self.default_branch_for(record),
+                            &default_branch,
                         )
                         .await?;
                     record.spec_pr_url = Some(pr_url);

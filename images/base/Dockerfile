@@ -82,6 +82,21 @@ RUN npm install -g @anthropic-ai/claude-code@2.1.87
 COPY --from=opencode-src /opt/opencode/opencode /usr/local/bin/opencode
 RUN chmod +x /usr/local/bin/opencode && /usr/local/bin/opencode --version
 
+# Optional: Rust toolchain for Rust-targeted repos (e.g. nautiloop itself).
+# Off by default to keep the base image lean (~200MB saved). Enable per-build
+# with `--build-arg INCLUDE_RUST=true`. Production release workflow leaves it off
+# and publishes slim; dev builds enable it so Claude can verify + commit Rust code.
+ARG INCLUDE_RUST=false
+ENV CARGO_HOME=/usr/local/cargo
+ENV RUSTUP_HOME=/usr/local/rustup
+ENV PATH=/usr/local/cargo/bin:$PATH
+RUN if [ "$INCLUDE_RUST" = "true" ]; then \
+        set -eux; \
+        curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path --component clippy --component rustfmt; \
+        chmod -R a+rX "$CARGO_HOME" "$RUSTUP_HOME"; \
+        rustc --version; cargo --version; cargo clippy --version; \
+    fi
+
 # FR-4: Entrypoint script
 COPY images/base/nautiloop-agent-entry /usr/local/bin/nautiloop-agent-entry
 RUN chmod +x /usr/local/bin/nautiloop-agent-entry

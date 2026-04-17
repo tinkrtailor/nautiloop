@@ -46,8 +46,9 @@ if "$BUILD_SIDECAR"; then
 fi
 
 if "$BUILD_AGENT_BASE"; then
-    echo "==> Building agent-base image..."
+    echo "==> Building agent-base image (dev: includes Rust toolchain for dogfooding)..."
     docker build \
+        --build-arg INCLUDE_RUST=true \
         -f "${CONTEXT}/images/base/Dockerfile" \
         -t "nautiloop-agent-base:dev" \
         "${CONTEXT}"
