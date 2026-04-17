@@ -430,30 +430,25 @@ impl OrchestratorJudge {
             // Skip judge on round 1 without recurring findings.
             // First-round issues are straightforward; preserves budget.
             None
-        } else if round == 2
-            && !current_issues.is_empty()
-            && current_issues.iter().all(|i| {
-                i.severity == crate::types::verdict::Severity::Low
-                    || i.severity == crate::types::verdict::Severity::Medium
-            })
-        {
-            // Round 2 with only low/medium-severity findings: let the judge decide
-            // whether to override-accept (Problem 1: triviality override).
-            // FR-1b: verdict.clean == false is a trigger; we include medium-severity
-            // here because style/documentation nits are often medium and the judge
-            // can reasonably accept them if spec requirements are met.
-            Some(JudgeTrigger::NotClean)
-        } else if round < 3 {
-            // Intentional spec deviation (FR-1b): Round 2 with high/critical findings
-            // skips the judge as a budget optimization. Per FR-1b, `verdict.clean == false`
-            // alone is a trigger, but high-severity issues at round 2 are near-certain
-            // "continue" cases. The tradeoff: the judge cannot override-accept a round-2
-            // verdict where the reviewer over-classified severity. This is acceptable because
-            // (a) round-2 over-classification is rare, (b) the judge will see it at round 3,
-            // and (c) we preserve budget for the ambiguous later rounds where the judge adds
-            // more value. Operators wanting earlier judge intervention can adjust round-skip
-            // logic here.
-            None
+        } else if round < self.config.judge_min_round {
+            // Below the configurable minimum round threshold for non-recurring triggers.
+            // Per FR-1b, verdict.clean == false is a trigger, but early rounds with
+            // non-recurring findings are near-certain "continue" cases. Operators can
+            // set judge_min_round = 1 to allow the judge on every round, or increase it
+            // to further preserve budget. Default is 3.
+            //
+            // Exception: low/medium-only findings at round 2+ still trigger the judge
+            // for triviality override (Problem 1), since those are the ambiguous cases.
+            if !current_issues.is_empty()
+                && current_issues.iter().all(|i| {
+                    i.severity == crate::types::verdict::Severity::Low
+                        || i.severity == crate::types::verdict::Severity::Medium
+                })
+            {
+                Some(JudgeTrigger::NotClean)
+            } else {
+                None
+            }
         } else {
             // The caller already checked verdict.clean == false
             Some(JudgeTrigger::NotClean)

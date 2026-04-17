@@ -435,6 +435,16 @@ pub mod memory {
 
         async fn create_judge_decision(&self, record: &JudgeDecisionRecord) -> Result<()> {
             let mut decisions = self.judge_decisions.write().await;
+            // FR-7a: enforce one exit_clean per loop (mirrors Postgres partial unique index)
+            if record.decision == "exit_clean"
+                && decisions
+                    .iter()
+                    .any(|d| d.loop_id == record.loop_id && d.decision == "exit_clean")
+            {
+                return Err(crate::error::NautiloopError::Database(
+                    sqlx::Error::Database(Box::new(MemoryUniqueViolation)),
+                ));
+            }
             decisions.push(record.clone());
             Ok(())
         }

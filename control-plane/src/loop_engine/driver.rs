@@ -704,7 +704,7 @@ impl ConvergentLoopDriver {
                                 record.state = LoopState::Failed;
                                 record.sub_state = None;
                                 record.failure_reason = Some(format!(
-                                    "Max harden rounds ({}) exceeded",
+                                    "Max harden rounds ({}) exceeded (judge unavailable)",
                                     record.max_rounds
                                 ));
                                 record.active_job_name = None;
@@ -1133,7 +1133,7 @@ impl ConvergentLoopDriver {
                     record.state = LoopState::Failed;
                     record.sub_state = None;
                     record.failure_reason = Some(format!(
-                        "Max implement rounds ({}) exceeded",
+                        "Max implement rounds ({}) exceeded (judge unavailable)",
                         record.max_rounds
                     ));
                     record.active_job_name = None;
@@ -1225,6 +1225,7 @@ impl ConvergentLoopDriver {
                 )
                 .await?;
             record.spec_pr_url = Some(pr_url);
+            self.store.update_loop(record).await?;
         }
 
         if self.config.harden.auto_merge_spec_pr {

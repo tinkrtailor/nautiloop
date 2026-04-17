@@ -174,6 +174,11 @@ pub struct OrchestratorConfig {
     /// Max judge invocations per loop before falling back to heuristics (NFR-1).
     #[serde(default = "default_max_judge_calls")]
     pub max_judge_calls_per_loop: u32,
+    /// Minimum round before the judge is invoked for non-recurring, non-max-rounds
+    /// triggers (default: 3). Set to 1 to allow the judge on every round.
+    /// Controls the early-round skip threshold documented in FR-1b deviation.
+    #[serde(default = "default_judge_min_round")]
+    pub judge_min_round: i32,
 }
 
 impl Default for OrchestratorConfig {
@@ -182,6 +187,7 @@ impl Default for OrchestratorConfig {
             judge_model: default_judge_model(),
             judge_enabled: true,
             max_judge_calls_per_loop: default_max_judge_calls(),
+            judge_min_round: default_judge_min_round(),
         }
     }
 }
@@ -192,6 +198,10 @@ fn default_judge_model() -> String {
 
 fn default_max_judge_calls() -> u32 {
     10
+}
+
+fn default_judge_min_round() -> i32 {
+    3
 }
 
 fn default_true() -> bool {
