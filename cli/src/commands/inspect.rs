@@ -83,7 +83,7 @@ pub async fn run(client: &NemoClient, path: &str) -> Result<()> {
         .count();
     if orphaned_count > 0 {
         println!(
-            "{orphaned_count} additional judge decision(s) not shown inline (query judge_decisions table directly for full details)"
+            "{orphaned_count} additional judge decision(s) not shown inline (query judge_decisions table for full details, e.g. SELECT * FROM judge_decisions WHERE loop_id = '<loop_id>')"
         );
         println!();
     }
