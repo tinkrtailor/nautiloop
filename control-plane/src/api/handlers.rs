@@ -259,19 +259,29 @@ pub async fn start(
                 return Err(e);
             }
         };
-        // Use .find() for deterministic credential selection, consistent with loop engine
-        // (driver.rs). Sort by updated_at descending to prefer the most recently updated
-        // credential when multiple valid entries exist for the same provider.
-        let mut sorted_creds = all_creds.clone();
-        sorted_creds.sort_by_key(|c| std::cmp::Reverse(c.updated_at));
-        let engineer_name = sorted_creds
-            .iter()
-            .find(|c| c.provider == "_name" && c.valid)
-            .map(|c| c.credential_ref.clone());
-        let engineer_email = sorted_creds
-            .iter()
-            .find(|c| c.provider == "_email" && c.valid)
-            .map(|c| c.credential_ref.clone());
+        // Extract engineer name and email in a single pass over credentials,
+        // preferring the most recently updated valid entry for each provider.
+        let (mut engineer_name, mut engineer_email): (Option<String>, Option<String>) =
+            (None, None);
+        let mut best_name_ts = None;
+        let mut best_email_ts = None;
+        for c in &all_creds {
+            if !c.valid {
+                continue;
+            }
+            if c.provider == "_name"
+                && best_name_ts.is_none_or(|ts| c.updated_at > ts)
+            {
+                engineer_name = Some(c.credential_ref.clone());
+                best_name_ts = Some(c.updated_at);
+            }
+            if c.provider == "_email"
+                && best_email_ts.is_none_or(|ts| c.updated_at > ts)
+            {
+                engineer_email = Some(c.credential_ref.clone());
+                best_email_ts = Some(c.updated_at);
+            }
+        }
         if engineer_name.is_none() || engineer_email.is_none() {
             tracing::warn!(
                 loop_id = %loop_id,

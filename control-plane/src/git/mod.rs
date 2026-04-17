@@ -817,9 +817,25 @@ pub mod mock {
             }
         }
 
-        async fn write_file(&self, _branch: &str, path: &str, content: &str) -> Result<()> {
+        async fn write_file(&self, branch: &str, path: &str, content: &str) -> Result<()> {
             let mut files = self.files.write().await;
             files.insert(path.to_string(), content.to_string());
+            drop(files);
+
+            // Generate a distinct mock SHA so that get_branch_sha returns a new
+            // value after the write, matching real git behavior (consistent with
+            // write_file_as).
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            branch.hash(&mut hasher);
+            path.hash(&mut hasher);
+            content.hash(&mut hasher);
+            "write_file".hash(&mut hasher);
+            let hash_val = hasher.finish() as u128;
+            let new_sha = format!("{:040x}", hash_val);
+            let mut branches = self.branches.write().await;
+            branches.insert(branch.to_string(), new_sha);
+
             Ok(())
         }
 
