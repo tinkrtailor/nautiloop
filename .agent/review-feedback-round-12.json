@@ -1,0 +1,69 @@
+{
+  "round": 12,
+  "source": "review",
+  "issues": [
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/loop_engine/judge.rs",
+      "line": 387,
+      "description": "FR-1b deviation: default judge_min_round=2 means round 1 always skips the judge for non-recurring triggers, which is correct. However, the spec states verdict.clean==false is sufficient to trigger the judge, while the code skips it at round 1 unconditionally (line 461: round <= 1 returns None). This is a documented deviation but means a round-1 verdict with only low-severity cosmetic nits will NOT get triviality override (Problem 1) — the engineer must wait until round 2. Worth documenting as a known limitation.",
+      "suggestion": "This is an acceptable tradeoff for budget preservation. Add a code comment explicitly citing FR-1b and noting that round-1 triviality override is intentionally deferred to round 2."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/loop_engine/driver.rs",
+      "line": 1049,
+      "description": "FR-1c says judge is NOT invoked on 'clean==true AND round==1', implying round 2+ clean verdicts after prior failures should potentially pass through the judge. The code skips the judge for ALL clean verdicts at every round. While the behavior is reasonable (clean verdicts are unambiguous), it's a literal spec deviation. The code has a comment documenting this as intentional, which is good, but the spec should be updated to match.",
+      "suggestion": "No code change needed — the behavior is sound and documented. Track as a spec clarification item."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/loop_engine/judge.rs",
+      "line": 310,
+      "description": "FR-7a TOCTOU window: between judge_decision_stats query and create_judge_decision, a concurrent request could also pass the exit_clean check. The migration adds a partial unique index as a DB-level safety net for PgStateStore, and the MemoryStateStore now enforces the same constraint. However, the application-level guard (line 349-358) downgrades exit_clean to continue BEFORE persisting, so the create_judge_decision call stores 'continue', not 'exit_clean'. The DB constraint would never fire in this scenario because the application already changed the decision. The guard works for single-instance but the DB constraint is only a safety net for a narrow race in multi-replica.",
+      "suggestion": "Acceptable for Stage 1 single-instance. Document the single-instance assumption. For multi-replica, consider using SELECT FOR UPDATE or advisory lock around the stats-check-then-persist."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/loop_engine/judge.rs",
+      "line": 355,
+      "description": "When create_judge_decision fails (e.g., due to the exit_clean unique constraint race in multi-replica), the decision is still returned to the driver but NOT persisted — creating a gap in the Stage 2 training dataset. The log says 'non-fatal' but should be WARN level and explicitly mention the training data gap.",
+      "suggestion": "The log at line 362 does use tracing::warn and mentions Stage 2 training dataset. This is properly handled. No change needed."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/tests/judge_integration.rs",
+      "description": "No integration test covers the judge error/timeout fallback path through the full driver tick with the judge wired but failing (ErrorJudgeClient). The test test_review_judge_error_falls_back_to_heuristic exists and uses ErrorJudgeClient, which is good. However, there is no equivalent test for the harden path with ErrorJudgeClient. NFR-5 asks for fallback tests asserting 'identical behavior to the feature-flag-off case'.",
+      "suggestion": "Add an integration test for the harden path with ErrorJudgeClient, verifying fallback to heuristic produces the same transitions as judge_enabled=false."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "control-plane/src/loop_engine/judge.rs",
+      "line": 234,
+      "description": "Token budget math: MAX_SPEC_CHARS(4K) + MAX_ROUND_CHARS(3K) = 7K chars for truncatable fields, plus current_verdict (truncated to 10 issues × 200 chars + overhead ≈ 3K), recurring_findings (10 × ~200 = 2K), JSON envelope (~2K), totals ~14K chars (~3.5K tokens). The MAX_INPUT_CHARS=24K progressive truncation guard provides ample safety. Budget is well within FR-4b's 8K token limit.",
+      "suggestion": "No change needed — the budget math is sound with the current truncation values."
+    },
+    {
+      "severity": "low",
+      "category": "style",
+      "file": "control-plane/src/loop_engine/judge.rs",
+      "line": 161,
+      "description": "evaluate() takes 9 parameters with #[allow(clippy::too_many_arguments)]. While functional and called from one place, this could be improved with a context struct.",
+      "suggestion": "Consider bundling parameters into a JudgeEvaluateContext struct if the method gains more callers in Stage 2. Low priority for Stage 1."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "cli/src/commands/inspect.rs",
+      "line": 68,
+      "description": "FR-6c presentation: The implementation properly nests judge decisions inline with rounds and handles orphaned decisions with a summary line. The flat judge_decisions array in the API response serves programmatic consumers. This satisfies the spec requirement.",
+      "suggestion": "No change needed."
+    }
+  ]
+}
