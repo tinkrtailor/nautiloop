@@ -222,6 +222,29 @@ mod tests {
         async fn cleanup_pod_snapshots(&self, _: u32) -> crate::error::Result<u64> {
             unimplemented!()
         }
+        async fn create_judge_decision(
+            &self,
+            _: &crate::types::JudgeDecisionRecord,
+        ) -> crate::error::Result<()> {
+            unimplemented!()
+        }
+        async fn get_judge_decisions(
+            &self,
+            _: Uuid,
+        ) -> crate::error::Result<Vec<crate::types::JudgeDecisionRecord>> {
+            unimplemented!()
+        }
+        async fn count_judge_decisions(&self, _: Uuid) -> crate::error::Result<u32> {
+            unimplemented!()
+        }
+        async fn backfill_judge_decisions(
+            &self,
+            _: Uuid,
+            _: &str,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> crate::error::Result<()> {
+            unimplemented!()
+        }
     }
 
     #[tokio::test]
