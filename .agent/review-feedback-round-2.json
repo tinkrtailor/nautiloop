@@ -1,0 +1,38 @@
+{
+  "round": 2,
+  "source": "review",
+  "issues": [
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "cli/src/commands/start.rs",
+      "line": 324,
+      "description": "NFR-3 requires testing that '--harden --no-harden together exits with error' with the spec-prescribed message. test_harden_and_no_harden_both_parse tests the OPPOSITE: it asserts clap parsing SUCCEEDS. The actual conflict check (the anyhow::bail! in main.rs:309-311) is never tested. No test verifies the error message 'Cannot use --harden and --no-harden together. --harden is deprecated; remove it.' is produced. If someone removes the manual check in main.rs, this test would still pass.",
+      "suggestion": "Extract the conflict check into a testable function (e.g., `pub fn validate_harden_flags(harden: bool, no_harden: bool) -> Result<()>` in start.rs) and add a unit test that asserts it returns the spec-prescribed error message when both are true. Alternatively, add a CLI integration test that runs `nemo start specs/foo.md --harden --no-harden` and asserts the process exits non-zero with the expected stderr."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "cli/src/main.rs",
+      "line": 309,
+      "description": "FR-1d specifies 'Enforce via clap conflicts_with attribute on the --harden flag.' The implementation uses a manual runtime check instead. While the manual check produces the spec-prescribed error message (which is better UX), this means the conflict is enforced AFTER config loading, credential checking, and HTTP client construction (lines 238-253). If any of those fail first (e.g., missing API key at line 248), the user gets a confusing 'API key not configured' error instead of the flag-conflict error, even though the real problem is contradictory flags.",
+      "suggestion": "Move the conflict check before config loading (after `let cli = Cli::parse()` on line 225) so it fires before any side effects. This is a two-line move that matches the spec's intent of failing fast on contradictory flags."
+    },
+    {
+      "severity": "low",
+      "category": "style",
+      "file": "cli/src/commands/start.rs",
+      "line": 116,
+      "description": "When auto_approve is true (non-ship), the phase label shows 'HARDEN → IMPLEMENT (add --no-harden to skip harden)'. The '(add --no-harden to skip harden)' hint is slightly misleading here — it suggests the only way to speed things up is skipping harden, but the user has already opted into auto-approve which removes the approval gate. The hint is identical whether auto_approve is set or not, which doesn't reflect the reduced pipeline.",
+      "suggestion": "Consider differentiating the hint, e.g., 'HARDEN → IMPLEMENT' without the hint when auto-approve is set, since the user is already in 'fast path' mode."
+    },
+    {
+      "severity": "low",
+      "category": "style",
+      "file": "cli/src/main.rs",
+      "line": 56,
+      "description": "The --harden flag's doc comment says 'Deprecated: harden is now the default. This flag has no effect.' but the flag DOES have an effect: it triggers the deprecation warning and, when combined with --no-harden, triggers a conflict error. 'No effect' slightly mischaracterizes it.",
+      "suggestion": "Consider: 'Deprecated: harden is now the default. Passing this flag only emits a deprecation warning.'"
+    }
+  ]
+}
