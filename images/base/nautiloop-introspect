@@ -1,0 +1,91 @@
+#!/bin/sh
+# nautiloop-introspect — collect agent container runtime state (FR-2d).
+# Output: two NDJSON lines — processes first, then worktree.
+# Designed to run in < 2s. Read-only: ps, du, git-status. No writes.
+# No set -e: each section must fail independently so partial output is still
+# collected (FR-2c). The control-plane parser handles missing/null fields.
+#
+# Processes are collected and EMITTED FIRST (most valuable diagnostic signal).
+# Worktree info follows as a second JSON line. If a timeout kills the script
+# mid-worktree, the already-emitted process data is preserved in the exec
+# output buffer — the control-plane parser handles partial NDJSON gracefully.
+
+# Section 1: processes (top 30 by CPU) — collected and emitted immediately
+ps_output=$(ps -eo pid,ppid,user,pcpu,etime,args --sort=-pcpu --no-headers 2>/dev/null | head -30 || echo "")
+ps_json=$(echo "$ps_output" | jq -Rs '
+  [split("\n") | .[] | select(length > 0) |
+    (capture("^\\s*(?<pid>[0-9]+)\\s+(?<ppid>[0-9]+)\\s+(?<user>\\S+)\\s+(?<cpu>[0-9.]+)\\s+(?<etime>\\S+)\\s+(?<cmd>.+)$") // empty) |
+    {
+      pid: (.pid | tonumber),
+      ppid: (.ppid | tonumber),
+      user: .user,
+      cpu_percent: (.cpu | tonumber),
+      cmd: (.cmd | ltrimstr(" ")),
+      age_seconds: (
+        .etime |
+        if test("^[0-9]+-") then
+          (capture("^(?<d>[0-9]+)-(?<h>[0-9]+):(?<m>[0-9]+):(?<s>[0-9]+)$") |
+            ((.d|tonumber)*86400 + (.h|tonumber)*3600 + (.m|tonumber)*60 + (.s|tonumber)))
+        elif test("^[0-9]+:[0-9]+:[0-9]+$") then
+          (capture("^(?<h>[0-9]+):(?<m>[0-9]+):(?<s>[0-9]+)$") |
+            ((.h|tonumber)*3600 + (.m|tonumber)*60 + (.s|tonumber)))
+        elif test("^[0-9]+:[0-9]+$") then
+          (capture("^(?<m>[0-9]+):(?<s>[0-9]+)$") |
+            ((.m|tonumber)*60 + (.s|tonumber)))
+        elif test("^[0-9]+$") then
+          (. | tonumber)
+        else 0
+        end
+      )
+    }
+  ]
+') || ps_json='[]'
+
+# Emit processes immediately so they survive a mid-worktree timeout (FR-2c).
+printf '{"processes":%s}\n' "$ps_json"
+
+# Section 2: worktree info (can be slow on large projects)
+# du -sb summarizes total size in bytes (FR-2a). On large target dirs this
+# can take >1s, which is why processes are emitted before this section.
+target_bytes=$(du -sb /work/target 2>/dev/null | awk '{print $1}')
+target_bytes=${target_bytes:-null}
+# Use ls -U to skip sorting — unnecessary overhead on large dep dirs.
+if [ -d /work/target/debug/deps ]; then
+  target_artifacts=$(ls -U /work/target/debug/deps 2>/dev/null | wc -l)
+else
+  target_artifacts="null"
+fi
+# Use jq -Rs for safe JSON escaping of head_sha (handles malformed output)
+head_sha=$(git -C /work rev-parse HEAD 2>/dev/null) || head_sha=""
+# FR-2a: git status --porcelain counts all dirty files including untracked.
+# Fallback to "null" (not "0") so callers can distinguish "clean" from "unknown".
+if uncommitted_raw=$(git -C /work status --porcelain 2>/dev/null); then
+  # Count non-empty lines. grep -c . always prints the count (even 0) to
+  # stdout and exits 1 when count is 0. We only need the exit-status
+  # suppressed (|| true), NOT an extra echo — otherwise clean repos produce
+  # "0\n0" which breaks the JSON output.
+  uncommitted=$(printf '%s' "$uncommitted_raw" | grep -c . 2>/dev/null || true)
+  # Ensure we have a valid number (empty string → 0)
+  uncommitted=${uncommitted:-0}
+else
+  # git status failed entirely — report unknown, not clean
+  uncommitted="null"
+fi
+
+# Quote strings, handle nulls
+if [ "$target_bytes" = "" ]; then
+  target_bytes="null"
+fi
+# Use jq for safe JSON string escaping of head_sha
+if [ -n "$head_sha" ]; then
+  head_sha_json=$(printf '%s' "$head_sha" | jq -Rs '.')
+else
+  head_sha_json="null"
+fi
+
+# Emit worktree as second NDJSON line
+printf '{"worktree":{"path":"/work","target_dir_bytes":%s,"target_dir_artifacts":%s,"uncommitted_files":%s,"head_sha":%s}}\n' \
+  "$target_bytes" \
+  "$(echo "$target_artifacts" | tr -d ' ')" \
+  "$uncommitted" \
+  "$head_sha_json"

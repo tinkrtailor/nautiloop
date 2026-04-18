@@ -1190,6 +1190,7 @@ mod tests {
             git: git.clone(),
             config: Arc::new(config),
             kube_client: None,
+            pool: None,
         };
         let router = crate::api::build_router_no_auth(state);
         (router, store, git)
@@ -1455,6 +1456,7 @@ mod tests {
             git: git.clone(),
             config: Arc::new(config),
             kube_client: None,
+            pool: None,
         };
         let app = crate::api::build_router_no_auth(state);
 

@@ -3,6 +3,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 use super::ConvergentLoopDriver;
+use crate::config::NautiloopConfig;
 use crate::state::StateStore;
 
 /// The reconciliation loop that drives all active loops.
@@ -12,6 +13,7 @@ use crate::state::StateStore;
 pub struct Reconciler {
     driver: Arc<ConvergentLoopDriver>,
     store: Arc<dyn StateStore>,
+    config: Arc<NautiloopConfig>,
     interval: Duration,
     wake: Arc<Notify>,
 }
@@ -20,12 +22,14 @@ impl Reconciler {
     pub fn new(
         driver: Arc<ConvergentLoopDriver>,
         store: Arc<dyn StateStore>,
+        config: Arc<NautiloopConfig>,
         interval: Duration,
         wake: Arc<Notify>,
     ) -> Self {
         Self {
             driver,
             store,
+            config,
             interval,
             wake,
         }
@@ -38,12 +42,23 @@ impl Reconciler {
             "Starting reconciliation loop"
         );
 
+        // FR-6b: daily sweep of old pod_snapshots (7-day TTL = 168 hours)
+        let mut cleanup_interval = tokio::time::interval(Duration::from_secs(86400));
+        // Delay missed ticks so accumulated misses don't burst-fire multiple sweeps.
+        cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // First tick fires immediately; skip it so the first sweep happens after 24h
+        cleanup_interval.tick().await;
+
         loop {
-            // Wait for interval or wake signal or cancellation
+            // Wait for interval or wake signal or cleanup or cancellation
             tokio::select! {
                 _ = tokio::time::sleep(self.interval) => {},
                 _ = self.wake.notified() => {
                     tracing::debug!("Reconciler woken up by watcher");
+                },
+                _ = cleanup_interval.tick() => {
+                    self.sweep_old_pod_snapshots().await;
+                    continue;
                 },
                 _ = wait_for_cancel(&cancel) => {
                     tracing::info!("Reconciler shutting down");
@@ -57,6 +72,24 @@ impl Reconciler {
             }
 
             self.reconcile_all().await;
+        }
+    }
+
+    /// FR-6b: delete pod_snapshots older than 7 days.
+    /// Only runs when record_introspection is enabled to avoid wasting queries.
+    async fn sweep_old_pod_snapshots(&self) {
+        if !self.config.observability.record_introspection {
+            return;
+        }
+        const TTL_HOURS: u32 = 168; // 7 days
+        match self.store.cleanup_pod_snapshots(TTL_HOURS).await {
+            Ok(0) => {}
+            Ok(deleted) => {
+                tracing::info!(deleted, "Swept old pod_snapshots (>7 days)");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to sweep pod_snapshots");
+            }
         }
     }
 
@@ -181,6 +214,7 @@ mod tests {
         let reconciler = Reconciler::new(
             driver,
             store.clone(),
+            Arc::new(NautiloopConfig::default()),
             Duration::from_millis(50),
             wake.clone(),
         );

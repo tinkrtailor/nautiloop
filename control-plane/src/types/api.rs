@@ -203,6 +203,49 @@ pub struct CredentialsQuery {
     pub engineer: String,
 }
 
+/// GET /pod-introspect/:loop_id response body (FR-1b).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PodIntrospectResponse {
+    pub loop_id: Uuid,
+    pub pod_name: String,
+    pub pod_phase: String,
+    pub collected_at: DateTime<Utc>,
+    pub container_stats: Option<ContainerStats>,
+    pub processes: Vec<ProcessInfo>,
+    pub worktree: WorktreeInfo,
+    /// Non-empty when the snapshot is partial/degraded (e.g. exec timed out).
+    /// Callers use this to distinguish "genuinely idle" from "data unavailable".
+    /// Always serialized (no skip_serializing_if) so consumers without
+    /// #[serde(default)] don't break on absent field.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerStats {
+    pub cpu_millicores: u64,
+    pub memory_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub ppid: u32,
+    pub user: String,
+    pub cpu_percent: f64,
+    pub cmd: String,
+    pub age_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeInfo {
+    pub path: String,
+    pub target_dir_artifacts: Option<u64>,
+    pub target_dir_bytes: Option<u64>,
+    pub uncommitted_files: Option<u64>,
+    pub head_sha: Option<String>,
+}
+
 /// Generic error response body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {

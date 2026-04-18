@@ -8,6 +8,7 @@ pub mod init;
 pub mod inspect;
 pub mod logs;
 pub mod models;
+pub mod ps;
 pub mod resume;
 pub mod start;
 pub mod status;

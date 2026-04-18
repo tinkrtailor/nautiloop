@@ -127,6 +127,16 @@ enum Commands {
         container: String,
     },
 
+    /// Show live processes and runtime state of an active loop's pod
+    Ps {
+        /// Loop ID
+        loop_id: String,
+
+        /// Poll every 2s and redraw (press q to quit)
+        #[arg(long)]
+        watch: bool,
+    },
+
     /// Cancel a running loop
     Cancel {
         /// Loop ID
@@ -396,6 +406,14 @@ async fn main() -> anyhow::Result<()> {
                 }
             } else {
                 commands::logs::run(&http_client, &loop_id, round, stage).await?;
+            }
+        }
+        Commands::Ps { loop_id, watch } => {
+            if watch {
+                commands::ps::run_watch(&http_client, &loop_id).await?;
+            } else {
+                let exit_code = commands::ps::run(&http_client, &loop_id).await?;
+                std::process::exit(exit_code);
             }
         }
         Commands::Cancel { loop_id } => {

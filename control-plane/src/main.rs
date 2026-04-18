@@ -70,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
         .connect(&database_url)
         .await?;
 
-    let pg_store = PgStateStore::new(pool);
+    let pg_store = PgStateStore::new(pool.clone());
     pg_store.run_migrations().await?;
     tracing::info!("Database migrations complete");
 
@@ -96,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
                 git,
                 config: config_arc,
                 kube_client: Some(kube_client),
+                pool: Some(pool.clone()),
             };
             let router = api::build_router(app_state);
 
@@ -151,6 +152,7 @@ async fn main() -> anyhow::Result<()> {
             let reconciler = Reconciler::new(
                 driver,
                 store.clone(),
+                config_arc.clone(),
                 Duration::from_secs(config.cluster.reconcile_interval_secs),
                 wake.clone(),
             );
