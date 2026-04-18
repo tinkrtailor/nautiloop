@@ -686,9 +686,12 @@ impl ConvergentLoopDriver {
 
                         // Heuristic / judge-continue: check max rounds before dispatching
                         if record.round >= record.max_rounds {
-                            // If no critical/high issues remain, escalate for
-                            // human review instead of hard-failing.
-                            if !judge::has_blocking_issues(&v.issues) {
+                            // NFR-3: Only escalate to AwaitingApproval when the judge
+                            // was actually invoked (judge_decision.is_some()). When judge
+                            // is disabled or absent, preserve original direct-to-Failed behavior.
+                            if judge_decision.is_some()
+                                && !judge::has_blocking_issues(&v.issues)
+                            {
                                 record.state = LoopState::AwaitingApproval;
                                 record.sub_state = None;
                                 record.active_job_name = None;
@@ -1027,9 +1030,12 @@ impl ConvergentLoopDriver {
 
                 // Heuristic / judge-continue path: check max rounds
                 if record.round >= record.max_rounds {
-                    // If no critical/high issues remain, escalate for
-                    // human review instead of hard-failing.
-                    if !judge::has_blocking_issues(&v.issues) {
+                    // NFR-3: Only escalate to AwaitingApproval when the judge
+                    // was actually invoked (judge_decision.is_some()). When judge
+                    // is disabled or absent, preserve original direct-to-Failed behavior.
+                    if judge_decision.is_some()
+                        && !judge::has_blocking_issues(&v.issues)
+                    {
                         record.state = LoopState::AwaitingApproval;
                         record.sub_state = None;
                         record.active_job_name = None;

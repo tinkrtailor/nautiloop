@@ -8,11 +8,13 @@
 //! NOT as a k8s Job. Every invocation is logged to `judge_decisions` for
 //! Stage 2 fine-tuning.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::config::OrchestratorConfig;
@@ -258,6 +260,12 @@ pub struct OrchestratorJudge {
     config: OrchestratorConfig,
     model_client: Arc<dyn JudgeModelClient>,
     store: Arc<dyn StateStore>,
+    /// In-memory counter tracking all judge call attempts per loop (including
+    /// failures/timeouts) for cost ceiling enforcement (NFR-1). Using an
+    /// in-memory counter ensures failed API calls also count against the ceiling.
+    call_counts: Mutex<HashMap<Uuid, u32>>,
+    /// Cached prompt template, loaded once on first use to avoid repeated git reads.
+    cached_prompt_template: Mutex<Option<Option<String>>>,
 }
 
 impl OrchestratorJudge {
@@ -270,6 +278,8 @@ impl OrchestratorJudge {
             config,
             model_client,
             store,
+            call_counts: Mutex::new(HashMap::new()),
+            cached_prompt_template: Mutex::new(None),
         }
     }
 
@@ -326,31 +336,26 @@ impl OrchestratorJudge {
     ) -> Option<JudgeOutput> {
         let start = Instant::now();
 
-        // NFR-1: Cost ceiling — check if we've exceeded max judge calls
-        let call_count = match self.store.count_judge_decisions(context.loop_id).await {
-            Ok(count) => count,
-            Err(e) => {
+        // NFR-1: Cost ceiling — check and increment in-memory counter.
+        // This counts ALL attempts (including failures/timeouts) to accurately
+        // bound API cost, since even failed HTTP requests incur some cost.
+        {
+            let mut counts = self.call_counts.lock().await;
+            let count = counts.entry(context.loop_id).or_insert(0);
+            if *count >= self.config.max_judge_calls {
                 tracing::warn!(
                     loop_id = %context.loop_id,
-                    error = %e,
-                    "Failed to count judge decisions, falling back to heuristic"
+                    call_count = *count,
+                    max = self.config.max_judge_calls,
+                    "Judge call count exceeded cost ceiling, short-circuiting to heuristic"
                 );
                 return None;
             }
-        };
-
-        if call_count >= self.config.max_judge_calls {
-            tracing::warn!(
-                loop_id = %context.loop_id,
-                call_count,
-                max = self.config.max_judge_calls,
-                "Judge call count exceeded cost ceiling, short-circuiting to heuristic"
-            );
-            return None;
+            *count += 1;
         }
 
         // Build prompt
-        let prompt = self.build_prompt(context);
+        let prompt = self.build_prompt(context).await;
 
         // Invoke model with 30s timeout (FR-1d)
         let model_result = tokio::time::timeout(
@@ -438,16 +443,31 @@ impl OrchestratorJudge {
         Some(output)
     }
 
+    /// Cache the prompt template from the context on first invocation.
+    /// Subsequent calls reuse the cached value, avoiding repeated git reads.
+    async fn cache_prompt_template(&self, template: Option<String>) {
+        let mut cached = self.cached_prompt_template.lock().await;
+        if cached.is_none() {
+            *cached = Some(template);
+        }
+    }
+
     /// Build the judge prompt from context.
-    /// Uses the prompt template from .nautiloop/prompts/judge.md if available,
+    /// Uses the cached prompt template from .nautiloop/prompts/judge.md if available,
     /// falling back to a hardcoded prompt otherwise.
-    fn build_prompt(&self, context: &JudgeContext) -> String {
+    async fn build_prompt(&self, context: &JudgeContext) -> String {
+        // Cache the template from this invocation's context
+        self.cache_prompt_template(context.prompt_template.clone())
+            .await;
+
         let context_json = serde_json::to_string_pretty(context).unwrap_or_default();
 
-        // Use template from .nautiloop/prompts/judge.md if loaded
-        if let Some(ref template) = context.prompt_template {
+        // Use cached template if available
+        let cached = self.cached_prompt_template.lock().await;
+        if let Some(Some(ref template)) = *cached {
             return template.replace("{{CONTEXT}}", &context_json);
         }
+        drop(cached);
 
         // Fallback: hardcoded prompt (used when template file is missing)
         format!(
@@ -455,9 +475,7 @@ impl OrchestratorJudge {
 
 ## Context
 
-```json
 {context_json}
-```
 
 ## Decision Criteria
 
@@ -471,14 +489,12 @@ impl OrchestratorJudge {
 
 Respond with ONLY a JSON object (no markdown fencing, no explanation outside the JSON):
 
-```json
 {{
   "decision": "continue" | "exit_clean" | "exit_escalate" | "exit_fail",
   "confidence": 0.0 to 1.0,
   "reasoning": "short human-readable summary of why this decision",
   "hint": "optional short instruction for the next agent round (null if not applicable)"
 }}
-```
 
 Decisions:
 - `continue`: Keep iterating. The agent should address the findings.
@@ -1103,15 +1119,15 @@ mod tests {
 
     // --- prompt assembly test ---
 
-    #[test]
-    fn test_prompt_assembly_includes_context() {
+    #[tokio::test]
+    async fn test_prompt_assembly_includes_context() {
         let judge = OrchestratorJudge::new(
             test_config(),
             Arc::new(MockJudgeClient::new("")),
             Arc::new(MemoryStateStore::new()),
         );
         let ctx = test_context();
-        let prompt = judge.build_prompt(&ctx);
+        let prompt = judge.build_prompt(&ctx).await;
         assert!(prompt.contains("orchestrator judge"));
         assert!(prompt.contains(&ctx.loop_id.to_string()));
         assert!(prompt.contains("specs/test.md"));

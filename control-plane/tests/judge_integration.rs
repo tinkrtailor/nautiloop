@@ -14,6 +14,7 @@ use uuid::Uuid;
 use nautiloop_control_plane::config::NautiloopConfig;
 use nautiloop_control_plane::error::Result;
 use nautiloop_control_plane::git::mock::MockGitOperations;
+use nautiloop_control_plane::git::GitOperations;
 use nautiloop_control_plane::k8s::mock::MockJobDispatcher;
 use nautiloop_control_plane::k8s::{JobDispatcher, JobStatus};
 use nautiloop_control_plane::loop_engine::judge::JudgeModelClient;
@@ -423,6 +424,17 @@ async fn test_review_continue_dispatches_next_round() {
     let decisions = store.get_judge_decisions(record.id).await.unwrap();
     assert_eq!(decisions.len(), 1);
     assert_eq!(decisions[0].decision, "continue");
+
+    // FR-3: Verify the hint is written into the feedback file
+    let feedback_json = git
+        .read_file(".agent/review-feedback-round-2.json", "agent/alice/test-abc12345")
+        .await
+        .unwrap();
+    let feedback: serde_json::Value = serde_json::from_str(&feedback_json).unwrap();
+    assert_eq!(
+        feedback["orchestrator_hint"].as_str(),
+        Some("focus on the null check")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -610,6 +622,74 @@ async fn test_fallback_on_judge_error_matches_no_judge_behavior() {
         .await
         .unwrap();
     assert!(decisions.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// NFR-3: Fallback at max_rounds — judge error and no-judge both produce Failed
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_fallback_at_max_rounds_matches_no_judge_behavior() {
+    // At max_rounds with non-clean verdict containing only low-severity issues,
+    // both judge-error and no-judge paths must produce Failed (NFR-3).
+    // The has_blocking_issues escalation to AwaitingApproval must NOT happen
+    // when the judge was not successfully invoked.
+
+    // --- With failing judge ---
+    let store_with = Arc::new(MemoryStateStore::new());
+    let dispatcher_with = Arc::new(MockJobDispatcher::new());
+    let git_with = Arc::new(MockGitOperations::new());
+    install_fresh_claude_creds(&dispatcher_with).await;
+    setup_git_for_convergence(&git_with, "agent/alice/test-abc12345").await;
+
+    let driver_with = make_driver_with_judge(
+        store_with.clone(),
+        dispatcher_with.clone(),
+        git_with.clone(),
+        Arc::new(FailingJudgeClient),
+    );
+
+    // Loop at max_rounds (15) with low-severity-only non-clean verdict
+    let record_with = make_reviewing_loop(15);
+    store_with.create_loop(&record_with).await.unwrap();
+    store_with
+        .create_round(&make_review_round_not_clean(record_with.id, 15))
+        .await
+        .unwrap();
+    setup_succeeded_job(&dispatcher_with, "review-job").await;
+
+    let state_with = driver_with.tick(record_with.id).await.unwrap();
+
+    // --- Without judge ---
+    let store_without = Arc::new(MemoryStateStore::new());
+    let dispatcher_without = Arc::new(MockJobDispatcher::new());
+    let git_without = Arc::new(MockGitOperations::new());
+    install_fresh_claude_creds(&dispatcher_without).await;
+    setup_git_for_convergence(&git_without, "agent/alice/test-abc12345").await;
+
+    let driver_without = make_driver_no_judge(
+        store_without.clone(),
+        dispatcher_without.clone(),
+        git_without.clone(),
+    );
+
+    let mut record_without = make_reviewing_loop(15);
+    record_without.id = Uuid::new_v4();
+    store_without
+        .create_loop(&record_without)
+        .await
+        .unwrap();
+    store_without
+        .create_round(&make_review_round_not_clean(record_without.id, 15))
+        .await
+        .unwrap();
+    setup_succeeded_job(&dispatcher_without, "review-job").await;
+
+    let state_without = driver_without.tick(record_without.id).await.unwrap();
+
+    // Both should produce Failed (not AwaitingApproval)
+    assert_eq!(state_with, state_without);
+    assert_eq!(state_with, LoopState::Failed);
 }
 
 // ---------------------------------------------------------------------------

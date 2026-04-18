@@ -29,14 +29,12 @@ The following JSON contains the full round history, current verdict, and any rec
 
 Respond with ONLY a JSON object (no markdown fencing, no explanation outside the JSON):
 
-```json
 {
   "decision": "continue" | "exit_clean" | "exit_escalate" | "exit_fail",
   "confidence": 0.0 to 1.0,
   "reasoning": "short human-readable summary of why this decision was made",
   "hint": "optional short instruction for the next agent round (null if not applicable)"
 }
-```
 
 ## Decision Definitions
 
