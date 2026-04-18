@@ -1,0 +1,90 @@
+{
+  "round": 1,
+  "source": "audit",
+  "issues": [
+    {
+      "severity": "critical",
+      "category": "correctness",
+      "file": "specs/mobile-dashboard.md",
+      "description": "FR-2a specifies the cookie as HttpOnly, but also says dashboard JS should derive a Bearer header from the auth cookie. HttpOnly cookies are inaccessible to JavaScript by definition — this is a direct contradiction. JS fetch calls cannot read the cookie value to construct an Authorization header.",
+      "suggestion": "Pick one strategy: (a) drop HttpOnly and let JS read the cookie to build Bearer headers (weaker XSS defense), (b) keep HttpOnly and have JS rely on the cookie being sent automatically with same-origin fetch (no Bearer header needed — axum middleware checks cookie OR Bearer), or (c) store the API key in a non-HttpOnly cookie or sessionStorage alongside the HttpOnly cookie. Option (b) is simplest: the auth middleware already exists and can be extended to check cookies; JS never touches the key directly."
+    },
+    {
+      "severity": "high",
+      "category": "completeness",
+      "file": "specs/mobile-dashboard.md",
+      "description": "FR-3e defines a 'Mine' filter 'derived from API-key → engineer mapping', but the codebase uses a single shared API key (NAUTILOOP_API_KEY) with no per-engineer identity. FR-3g acknowledges the shared key but never resolves how the dashboard determines the current viewer's engineer name. Without this, 'Mine' cannot filter.",
+      "suggestion": "Add an explicit mechanism: either (a) the login form collects both api_key AND engineer_name, storing the engineer name in a second cookie or in the auth cookie payload, or (b) the dashboard prompts for engineer name on first visit and stores it in localStorage. Option (a) is better since it travels with the session. Update FR-2b to reflect the additional field."
+    },
+    {
+      "severity": "high",
+      "category": "completeness",
+      "file": "specs/mobile-dashboard.md",
+      "description": "Cost/pricing data is referenced throughout (FR-3b metrics row '$0.18', FR-4a token/cost breakdown, FR-9 total cost + top spender, FR-12 cost per event, FR-13 cost per run, FR-14 total cost + per-engineer cost) but the codebase has NO pricing configuration. TokenUsage (input/output token counts) exists per stage in round output JSONB, but there is no pricing model to convert token counts to dollar amounts. Every cost figure in the spec is unfeasible without a pricing implementation.",
+      "suggestion": "Either (a) add a prerequisite: define a `[pricing]` config section in nemo.toml mapping model names to per-token costs, plus a helper function to compute cost from TokenUsage, OR (b) scope v1 to showing raw token counts only and mark cost display as a follow-up. If (a), specify where the pricing config lives and how it handles multiple models (the codebase supports model_implementor and model_reviewer which may differ)."
+    },
+    {
+      "severity": "medium",
+      "category": "clarity",
+      "file": "specs/mobile-dashboard.md",
+      "description": "FR-12c and FR-13b contain '{{SPEC}}' in query string URLs (e.g., '/dashboard/feed?cursor=<timestamp>{{SPEC}}limit=50'). This appears to be a template rendering artifact — should be '&' to separate query parameters.",
+      "suggestion": "Replace '{{SPEC}}' with '&' in both URLs: '/dashboard/feed?cursor=<timestamp>&limit=50' and '/dashboard/specs?path=<>&limit=50'."
+    },
+    {
+      "severity": "medium",
+      "category": "completeness",
+      "file": "specs/mobile-dashboard.md",
+      "description": "FR-1a lists '/dashboard/stream/:id' as 'Existing /logs/:id SSE, re-exposed under dashboard namespace', but the existing /logs/:id handler returns JSON (full log dump) for terminal loops and SSE for active loops. FR-4a's live log pane says 'SSE stream for active loops; static dump for terminal loops'. The stream route table entry doesn't reflect this dual behavior — an implementor might only wire SSE.",
+      "suggestion": "Clarify in FR-1a that '/dashboard/stream/:id' mirrors the existing /logs/:id behavior: SSE for active loops, JSON array for terminal loops. Or split into two routes if the semantics should differ from the original."
+    },
+    {
+      "severity": "medium",
+      "category": "completeness",
+      "file": "specs/mobile-dashboard.md",
+      "description": "FR-4a references 'Token/cost breakdown: per-stage, per-round (bar chart optional; data table mandatory)' but token_usage is stored inside the JSONB output column of the rounds table, nested within stage-specific verdict structs (ReviewResultData, ImplResultData, etc.). The spec doesn't specify how to extract and aggregate this data — each stage struct has a different shape, and not all stages may include token_usage.",
+      "suggestion": "Specify that the aggregation endpoint should parse the JSONB output field per stage type, extract token_usage where present, and sum across stages within a round. Define fallback behavior when token_usage is missing from a stage output (display '—' or 0)."
+    },
+    {
+      "severity": "medium",
+      "category": "completeness",
+      "file": "specs/mobile-dashboard.md",
+      "description": "FR-8b defines '/dashboard/state' as a roll-up of all active loops, but doesn't specify whether it includes terminal loops. FR-3d says the card grid polls this endpoint, but FR-3e's filter chips include 'Converged' and 'Failed' (terminal states). If /dashboard/state only returns active loops, terminal loops won't appear in the grid after a refresh.",
+      "suggestion": "Clarify that '/dashboard/state' returns both active and recently-terminal loops (e.g., terminal within the last 24h or the current session), plus the aggregates. Alternatively, specify a query parameter to control inclusion of terminal loops."
+    },
+    {
+      "severity": "medium",
+      "category": "clarity",
+      "file": "specs/mobile-dashboard.md",
+      "description": "FR-10b says results are reported 'in the status bar' but no status bar component is defined anywhere in the spec. It's unclear what UI element this refers to.",
+      "suggestion": "Define what the status bar is (e.g., a toast notification, a banner at the top of the page, or an inline result below the modal) or replace with a concrete UI element like 'a dismissible toast notification'."
+    },
+    {
+      "severity": "medium",
+      "category": "completeness",
+      "file": "specs/mobile-dashboard.md",
+      "description": "FR-2b says login validates the key by 'making an internal /status call; if 200, sets the cookie'. But the existing auth middleware compares against NAUTILOOP_API_KEY env var — an internal /status call would require constructing an HTTP request to itself with the candidate key as Bearer. This is awkward and creates a localhost loopback dependency. A direct comparison against the env var (same logic as auth middleware) is simpler and more reliable.",
+      "suggestion": "Specify that validation uses the same constant-time comparison logic as the existing auth middleware (compare against NAUTILOOP_API_KEY), not an internal HTTP call. This avoids the self-request pattern and is consistent with existing code."
+    },
+    {
+      "severity": "low",
+      "category": "completeness",
+      "file": "specs/mobile-dashboard.md",
+      "description": "NFR-4 says 'No htmx/hyperscript/alpine.js' but the spec requires significant client-side interactivity: polling + diff re-render, SSE subscriptions, action button fetch, tab title updates, web audio, filter chip state, localStorage persistence, confirm modals, and fan-out cancel. Implementing all of this in a single <10KB vanilla JS file is feasible but aggressive. The spec doesn't prioritize which JS behaviors are mandatory v1 vs nice-to-have.",
+      "suggestion": "Consider tiering the JS features: mandatory (polling, action buttons, SSE log stream) vs progressive enhancement (tab title badge, web audio bell, animation transitions). This helps the implementor ship a working v1 without getting blocked on polish features."
+    },
+    {
+      "severity": "low",
+      "category": "clarity",
+      "file": "specs/mobile-dashboard.md",
+      "description": "FR-6b says the dashboard 'Inherits from [helm] theme in nemo.toml if set' but the dashboard is server-rendered HTML with CSS custom properties driven by prefers-color-scheme. The helm TUI theme is a terminal concept. It's unclear how a terminal theme setting would map to web CSS custom properties or who performs this mapping.",
+      "suggestion": "Either drop the nemo.toml theme inheritance (system preference is sufficient for v1) or specify exactly which nemo.toml values map to which CSS custom properties and where the mapping code lives (likely in the template rendering context)."
+    },
+    {
+      "severity": "low",
+      "category": "clarity",
+      "file": "specs/mobile-dashboard.md",
+      "description": "FR-9c says 'Tapping any field of the summary navigates to /dashboard/stats with that field pre-focused' but doesn't define what 'pre-focused' means for a stats page. Is it a scroll anchor? A highlighted card? A query parameter that expands a section?",
+      "suggestion": "Specify the mechanism: e.g., '/dashboard/stats?focus=converge_rate' scrolls to and highlights the relevant section, or use anchor links like '/dashboard/stats#converge-rate'."
+    }
+  ]
+}
