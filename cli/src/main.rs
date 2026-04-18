@@ -54,7 +54,7 @@ enum Commands {
         no_harden: bool,
 
         /// Deprecated: harden is now the default. This flag has no effect.
-        #[arg(long, conflicts_with = "no_harden")]
+        #[arg(long)]
         harden: bool,
 
         /// Skip AWAITING_APPROVAL gate
@@ -306,8 +306,11 @@ async fn main() -> anyhow::Result<()> {
             model_impl,
             model_review,
         } => {
-            if harden {
-                eprintln!("Warning: --harden is now the default; this flag has no effect.");
+            if harden && no_harden {
+                anyhow::bail!("Cannot use --harden and --no-harden together. --harden is deprecated; remove it.");
+            }
+            if let Some(warning) = commands::start::deprecation_warning(harden) {
+                eprintln!("{warning}");
             }
             let (model_impl, model_review) =
                 project_config::resolve_models(model_impl, model_review, &eng_config.models)?;

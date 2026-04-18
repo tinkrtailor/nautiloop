@@ -50,23 +50,7 @@ pub async fn run(client: &NemoClient, args: StartArgs<'_>) -> Result<()> {
     );
 
     // FR-4: show phase plan so engineers know what to expect
-    if args.ship_mode {
-        if args.harden {
-            println!(
-                "  Phase:  HARDEN \u{2192} IMPLEMENT \u{2192} SHIP"
-            );
-        } else {
-            println!("  Phase:  IMPLEMENT \u{2192} SHIP");
-        }
-    } else if args.harden_only {
-        println!("  Phase:  HARDEN");
-    } else if args.harden {
-        println!(
-            "  Phase:  HARDEN \u{2192} AWAITING_APPROVAL \u{2192} IMPLEMENT (add --no-harden to skip harden)"
-        );
-    } else {
-        println!("  Phase:  IMPLEMENT (harden skipped)");
-    }
+    println!("  Phase:  {}", phase_plan_label(&args));
 
     println!("  State:  {}", resp.state);
 
@@ -115,6 +99,36 @@ fn validate_spec_size(spec_path: &str, content: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Return the phase-plan label for CLI output. Pure function for testability.
+fn phase_plan_label(args: &StartArgs<'_>) -> &'static str {
+    if args.ship_mode {
+        if args.harden {
+            "HARDEN \u{2192} IMPLEMENT \u{2192} SHIP"
+        } else {
+            "IMPLEMENT \u{2192} SHIP"
+        }
+    } else if args.harden_only {
+        "HARDEN"
+    } else if args.harden {
+        if args.auto_approve {
+            "HARDEN \u{2192} IMPLEMENT (add --no-harden to skip harden)"
+        } else {
+            "HARDEN \u{2192} AWAITING_APPROVAL \u{2192} IMPLEMENT (add --no-harden to skip harden)"
+        }
+    } else {
+        "IMPLEMENT (harden skipped)"
+    }
+}
+
+/// Return a deprecation warning if the `--harden` flag was explicitly passed.
+pub fn deprecation_warning(harden_flag_set: bool) -> Option<&'static str> {
+    if harden_flag_set {
+        Some("Warning: --harden is now the default; this flag has no effect.")
+    } else {
+        None
+    }
 }
 
 /// Build the JSON request body for /start. Extracted for testability.
@@ -286,50 +300,40 @@ mod tests {
         assert_eq!(body["harden"], false, "--no-harden must send harden: false");
     }
 
-    /// NFR-3: deprecated --harden flag still sends harden: true
+    /// NFR-3: deprecated --harden flag emits deprecation warning
     #[test]
-    fn test_deprecated_harden_flag_sends_harden_true() {
-        // When --harden is passed (no --no-harden), the CLI computes harden = !false = true.
-        // The --harden flag itself is a deprecated no-op; the result is the same as default.
-        let args = StartArgs {
-            engineer: "alice",
-            spec_path: "specs/test.md",
-            harden: true,
-            harden_only: false,
-            auto_approve: false,
-            ship_mode: false,
-            model_impl: None,
-            model_review: None,
-        };
-        let body = build_start_body(&args, "# Spec");
-        assert_eq!(body["harden"], true, "--harden (deprecated) must send harden: true");
+    fn test_deprecated_harden_flag_emits_warning() {
+        let warning = deprecation_warning(true);
+        assert_eq!(
+            warning,
+            Some("Warning: --harden is now the default; this flag has no effect."),
+            "--harden must emit deprecation warning"
+        );
     }
 
-    /// NFR-3: --harden --no-harden together is rejected by clap (conflicts_with)
+    /// NFR-3: no deprecation warning when --harden is not passed
     #[test]
-    fn test_harden_and_no_harden_conflict() {
+    fn test_no_deprecation_warning_without_harden_flag() {
+        assert_eq!(deprecation_warning(false), None);
+    }
+
+    /// NFR-3: --harden --no-harden together parses but is caught by manual check.
+    /// The manual check in main.rs produces the spec-prescribed error message:
+    /// "Cannot use --harden and --no-harden together. --harden is deprecated; remove it."
+    #[test]
+    fn test_harden_and_no_harden_both_parse() {
         use clap::Parser;
 
-        // Attempt to parse with both flags — clap should reject
-        let result = crate::Cli::try_parse_from([
+        // Both flags parse successfully (manual conflict check is in main.rs, not clap)
+        let cli = crate::Cli::try_parse_from([
             "nemo", "start", "specs/foo.md", "--harden", "--no-harden",
         ]);
-        assert!(
-            result.is_err(),
-            "--harden and --no-harden together must be rejected"
-        );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("--harden") && err_msg.contains("--no-harden"),
-            "Error must mention both conflicting flags, got: {err_msg}"
-        );
+        assert!(cli.is_ok(), "clap should parse both flags; conflict is checked manually");
     }
 
     /// FR-4a: default output shows HARDEN → AWAITING_APPROVAL → IMPLEMENT phase plan
     #[test]
-    fn test_default_start_phase_includes_harden() {
-        // Verify the args that would be constructed for default invocation
-        // produce harden=true, which triggers the HARDEN phase plan output
+    fn test_default_start_phase_label() {
         let args = StartArgs {
             engineer: "alice",
             spec_path: "specs/test.md",
@@ -340,13 +344,15 @@ mod tests {
             model_impl: None,
             model_review: None,
         };
-        // The phase plan logic: harden && !harden_only && !ship_mode
-        assert!(args.harden && !args.harden_only && !args.ship_mode);
+        assert_eq!(
+            phase_plan_label(&args),
+            "HARDEN \u{2192} AWAITING_APPROVAL \u{2192} IMPLEMENT (add --no-harden to skip harden)"
+        );
     }
 
-    /// FR-4b: --no-harden output shows IMPLEMENT (harden skipped) phase plan
+    /// FR-4b: --no-harden output shows IMPLEMENT (harden skipped)
     #[test]
-    fn test_no_harden_phase_shows_implement_only() {
+    fn test_no_harden_phase_label() {
         let args = StartArgs {
             engineer: "alice",
             spec_path: "specs/test.md",
@@ -357,7 +363,60 @@ mod tests {
             model_impl: None,
             model_review: None,
         };
-        // The phase plan logic: !harden && !harden_only && !ship_mode → "IMPLEMENT (harden skipped)"
-        assert!(!args.harden && !args.harden_only && !args.ship_mode);
+        assert_eq!(phase_plan_label(&args), "IMPLEMENT (harden skipped)");
+    }
+
+    /// FR-2b: --auto-approve omits AWAITING_APPROVAL from phase plan
+    #[test]
+    fn test_auto_approve_phase_label_omits_approval_gate() {
+        let args = StartArgs {
+            engineer: "alice",
+            spec_path: "specs/test.md",
+            harden: true,
+            harden_only: false,
+            auto_approve: true,
+            ship_mode: false,
+            model_impl: None,
+            model_review: None,
+        };
+        assert_eq!(
+            phase_plan_label(&args),
+            "HARDEN \u{2192} IMPLEMENT (add --no-harden to skip harden)"
+        );
+    }
+
+    /// Phase plan for ship mode with harden
+    #[test]
+    fn test_ship_harden_phase_label() {
+        let args = StartArgs {
+            engineer: "alice",
+            spec_path: "specs/test.md",
+            harden: true,
+            harden_only: false,
+            auto_approve: true,
+            ship_mode: true,
+            model_impl: None,
+            model_review: None,
+        };
+        assert_eq!(
+            phase_plan_label(&args),
+            "HARDEN \u{2192} IMPLEMENT \u{2192} SHIP"
+        );
+    }
+
+    /// Phase plan for harden-only mode
+    #[test]
+    fn test_harden_only_phase_label() {
+        let args = StartArgs {
+            engineer: "alice",
+            spec_path: "specs/test.md",
+            harden: true,
+            harden_only: true,
+            auto_approve: false,
+            ship_mode: false,
+            model_impl: None,
+            model_review: None,
+        };
+        assert_eq!(phase_plan_label(&args), "HARDEN");
     }
 }
