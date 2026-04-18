@@ -1,0 +1,94 @@
+{
+  "round": 2,
+  "source": "audit",
+  "issues": [
+    {
+      "severity": "high",
+      "category": "correctness",
+      "file": "specs/mobile-dashboard.md",
+      "line": 111,
+      "description": "FR-4a references a non-existent type `HardenResultData`. The codebase has: `ImplResultData`, `TestResultData`, `ReviewResultData`, `ReviseResultData`, and `AuditVerdict`. There is no `HardenResultData`. The spec also omits `TestResultData` and `ReviseResultData` from the list of stage types whose `token_usage` must be aggregated, which would cause under-counting.",
+      "suggestion": "Replace `HardenResultData` with the actual stage output types: `ImplResultData`, `TestResultData`, `ReviewResultData`, `ReviseResultData`, and `AuditVerdict`. List all five explicitly so the implementor doesn't miss any."
+    },
+    {
+      "severity": "high",
+      "category": "correctness",
+      "file": "specs/mobile-dashboard.md",
+      "line": 111,
+      "description": "FR-4a states each stage type embeds `token_usage` with fields `input_tokens` and `output_tokens`. The actual `TokenUsage` struct has fields `input: u64` and `output: u64` — no `_tokens` suffix. An implementor coding against the spec would write field accesses that don't compile.",
+      "suggestion": "Change `input_tokens` and `output_tokens` to `input` and `output` to match the actual `TokenUsage` struct in `control-plane/src/types/verdict.rs`."
+    },
+    {
+      "severity": "medium",
+      "category": "completeness",
+      "file": "specs/mobile-dashboard.md",
+      "line": 145,
+      "description": "FR-8b defines `/dashboard/state` as returning a 'single roll-up object' but provides no response schema. The implementor must guess the JSON shape for: loop summaries, aggregate counts per state, total tokens, total cost, engineer list, and fleet summary fields. Without a defined contract, the handler and the JS consumer will likely diverge.",
+      "suggestion": "Add a concrete JSON response schema (or at minimum, a TypeScript-style interface) for the `/dashboard/state` endpoint showing the exact fields, nesting, and types. Do the same for `/dashboard/stats`, `/dashboard/feed`, and `/dashboard/specs` endpoints."
+    },
+    {
+      "severity": "medium",
+      "category": "clarity",
+      "file": "specs/mobile-dashboard.md",
+      "line": 55,
+      "description": "FR-2b says `engineer_name` 'must match one of the engineer names present in loop data (or be accepted as free-text if no loops exist yet)'. This is ambiguous: if loops exist but the engineer is new to the system (first-time user), should they be rejected? The validation rule conflates 'no loops at all' with 'no loops for this engineer'.",
+      "suggestion": "Clarify: either (a) always accept free-text (the engineer name is self-declared, not validated against loop data), or (b) validate against a known-engineers list from the DB and provide a clear UX for new engineers. Option (a) is simpler and consistent with the CLI, which also accepts any engineer name on `nemo start`."
+    },
+    {
+      "severity": "medium",
+      "category": "consistency",
+      "file": "specs/mobile-dashboard.md",
+      "line": 31,
+      "description": "FR-1a defines a new route `/dashboard/stream/:id` that 'mirrors existing `/logs/:id` behavior'. Meanwhile, FR-4b says the existing API auth middleware is extended to accept cookies. If existing endpoints accept cookies, dashboard JS could call `/logs/:id` directly — making `/dashboard/stream/:id` redundant. Two endpoints serving identical data creates a maintenance burden and ambiguity about which to use.",
+      "suggestion": "Either (a) remove `/dashboard/stream/:id` and have dashboard JS call `/logs/:id` directly (since cookie auth is being added to the existing middleware), or (b) clarify what `/dashboard/stream/:id` does differently from `/logs/:id` (e.g., different format, last-200-lines only, HTML-formatted chunks)."
+    },
+    {
+      "severity": "medium",
+      "category": "completeness",
+      "file": "specs/mobile-dashboard.md",
+      "line": 68,
+      "description": "FR-3b lists state badge examples as 'IMPLEMENTING/REVIEWING/CONVERGED/FAILED/etc.' but the codebase has 13 states (Pending, Hardening, AwaitingApproval, Implementing, Testing, Reviewing, Converged, Failed, Cancelled, Paused, AwaitingReauth, Hardened, Shipped). The 'etc.' is too vague for a badge color mapping — the implementor needs to know the color for every state.",
+      "suggestion": "Enumerate all 13 states with their badge colors explicitly. At minimum, group them: green (Converged, Hardened, Shipped), red (Failed, Cancelled), amber (AwaitingApproval, Paused, AwaitingReauth), blue (Implementing, Testing, Reviewing, Hardening), gray (Pending)."
+    },
+    {
+      "severity": "medium",
+      "category": "completeness",
+      "file": "specs/mobile-dashboard.md",
+      "line": 68,
+      "description": "FR-3b pulse indicator fires 'if state is RUNNING'. But RUNNING is a SubState, not a LoopState. The top-level state would be Implementing/Testing/Reviewing/Hardening with sub_state=Running. The spec conflates the two levels of the state machine.",
+      "suggestion": "Change to: 'small animated dot if sub_state is RUNNING (i.e., the loop is in an active stage with a dispatched job currently executing), solid dot for all other states'."
+    },
+    {
+      "severity": "medium",
+      "category": "completeness",
+      "file": "specs/mobile-dashboard.md",
+      "line": 220,
+      "description": "FR-13a routes to `/dashboard/specs/<path>` where `<path>` is a spec filename. Spec paths can contain directory separators (e.g., `specs/mobile-dashboard.md`). The route pattern `<path>` as a single segment won't match multi-segment paths in axum without a wildcard. No URL encoding strategy is specified.",
+      "suggestion": "Either (a) use a wildcard route `/dashboard/specs/*path` and document that the path is the full relative spec path, or (b) use a query parameter `/dashboard/specs?path=<url-encoded-path>` (which FR-13b already uses for the backing endpoint). Recommend consistency: use the query-param form for both the page route and the API endpoint."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "specs/mobile-dashboard.md",
+      "line": 345,
+      "description": "Files Likely Touched section suggests `askama = \"0.12\"` in Cargo.toml. The current askama version on crates.io is 0.12.x but will likely be higher by implementation time. Pinning a specific version in a spec is fragile.",
+      "suggestion": "Change to `askama` (no version pin) or `askama = \"0.12\"` with a note that the implementor should use the latest compatible version."
+    },
+    {
+      "severity": "low",
+      "category": "completeness",
+      "file": "specs/mobile-dashboard.md",
+      "line": 43,
+      "description": "FR-2a specifies `Secure` flag on cookies, which prevents them from being sent over plain HTTP. During local development without TLS, authentication will silently fail. No development/testing workaround is mentioned.",
+      "suggestion": "Add a note: 'In development without TLS, the `Secure` flag may be conditionally omitted based on a config flag or the bind address being localhost. Production deployments MUST use `Secure`.' Or document that local dev requires a TLS terminator."
+    },
+    {
+      "severity": "low",
+      "category": "completeness",
+      "file": "specs/mobile-dashboard.md",
+      "line": 109,
+      "description": "FR-4a references 'FR-9 of the helm TUI phase 2 spec' for the rounds table format, but doesn't inline the column definitions. If that spec changes or the implementor doesn't have it, they can't build the rounds table correctly.",
+      "suggestion": "Inline the rounds table column definitions (round number, stage, verdict, issues count, confidence, tokens, cost, duration) directly in this spec rather than cross-referencing an external spec."
+    }
+  ]
+}
