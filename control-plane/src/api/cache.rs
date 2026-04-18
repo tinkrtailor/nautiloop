@@ -27,7 +27,10 @@ pub async fn cache_show(
     let resolved = state.config.resolved_cache_config();
     let namespace = &state.config.cluster.jobs_namespace;
 
-    let (disk_usage, volume_capacity_gi) = if let Some(ref client) = state.kube_client {
+    // FR-3d: when cache is disabled, no /cache mount exists — skip kube API calls.
+    let (disk_usage, volume_capacity_gi) = if resolved.disabled {
+        (None, None)
+    } else if let Some(ref client) = state.kube_client {
         let disk = get_cache_disk_usage(client, namespace).await;
         let cap = get_pvc_capacity(client, namespace).await;
         (disk, cap)
@@ -136,7 +139,7 @@ async fn get_cache_disk_usage(
     let pod_name = pod.metadata.name.as_deref()?;
 
     // Get total size first: `du -sh /cache`
-    let total = exec_du(&pods, pod_name, &["sh", "-c", "du -sh /cache 2>/dev/null"])
+    let total = exec_in_pod(&pods, pod_name, &["sh", "-c", "du -sh /cache 2>/dev/null"])
         .await
         .and_then(|output| {
             output.lines().next().and_then(|line| {
@@ -151,7 +154,7 @@ async fn get_cache_disk_usage(
         .unwrap_or_else(|| "0".to_string());
 
     // Get per-subdirectory sizes: `du -sh /cache/*` (needs shell for glob expansion)
-    let subdirectories = exec_du(&pods, pod_name, &["sh", "-c", "du -sh /cache/* 2>/dev/null"])
+    let subdirectories = exec_in_pod(&pods, pod_name, &["sh", "-c", "du -sh /cache/* 2>/dev/null"])
         .await
         .map(|output| {
             let mut dirs = std::collections::HashMap::new();
@@ -172,7 +175,7 @@ async fn get_cache_disk_usage(
 }
 
 /// Execute a command in the agent container of a pod and return stdout as a string.
-async fn exec_du(
+async fn exec_in_pod(
     pods: &kube::api::Api<k8s_openapi::api::core::v1::Pod>,
     pod_name: &str,
     command: &[&str],
@@ -186,7 +189,7 @@ async fn exec_du(
         .stderr(false);
 
     let mut exec = match pods
-        .exec(pod_name, command.iter().map(|s| s.to_string()).collect::<Vec<_>>(), &ap)
+        .exec(pod_name, command.to_vec(), &ap)
         .await
     {
         Ok(e) => e,

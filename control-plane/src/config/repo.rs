@@ -128,8 +128,10 @@ pub struct RepoConfig {
     pub timeouts: Option<TimeoutsConfig>,
     /// Cache configuration. `None` = absent from nemo.toml → sccache defaults.
     /// `Some` with empty env → no cache env vars injected.
-    /// Uses `Option` (not `#[serde(default)]`) so absent vs present-but-empty
-    /// are distinguishable (FR-3b).
+    /// `#[serde(default)]` is redundant here (`Option` defaults to `None`), but
+    /// kept for consistency with other optional fields on `RepoConfig`. The
+    /// absent-vs-present distinction required by FR-3b is handled by
+    /// `NautiloopConfig.cache` (which is `Option` without `#[serde(default)]`).
     #[serde(default)]
     pub cache: Option<CacheConfig>,
 }
