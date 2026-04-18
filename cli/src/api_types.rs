@@ -55,6 +55,10 @@ pub struct LoopSummary {
     pub kind: String,
     #[serde(default)]
     pub max_rounds: i32,
+    #[serde(default)]
+    pub model_implementor: Option<String>,
+    #[serde(default)]
+    pub model_reviewer: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

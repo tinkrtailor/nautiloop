@@ -52,7 +52,6 @@ impl ThemeName {
 
 /// Parse a theme name from config string.
 impl ThemeName {
-    #[allow(dead_code)]
     pub fn from_str_opt(s: &str) -> Option<Self> {
         match s {
             "dark" => Some(Self::Dark),

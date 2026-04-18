@@ -357,6 +357,8 @@ pub async fn status(
                 LoopKind::Implement => "implement".to_string(),
             },
             max_rounds: loop_record.max_rounds,
+            model_implementor: loop_record.model_implementor.clone(),
+            model_reviewer: loop_record.model_reviewer.clone(),
             created_at: loop_record.created_at,
             updated_at: loop_record.updated_at,
         });

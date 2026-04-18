@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::api_types::{InspectResponse, LoopSummary};
-use super::cost::{self, PricingConfig, format_cost, format_tokens, round_total_tokens, round_duration_secs};
+use super::cost::{self, PricingConfig, format_cost, format_tokens, round_total_tokens, round_duration_secs, calculate_loop_round_cost};
 
 /// Build the compact one-line header summary (FR-1a).
 ///
@@ -59,10 +59,13 @@ pub fn build_header(
                 total_output_tokens += out;
                 total_duration += round_duration_secs(round);
 
-                // Cost calculation: we don't know which model per-stage,
-                // so we try the loop's known model or use a default heuristic.
-                // For simplicity, use the first matching model from defaults.
-                let cost = pricing.calculate_cost(Some("claude-sonnet-4-6"), inp, out);
+                let cost = calculate_loop_round_cost(
+                    pricing,
+                    l.model_implementor.as_deref(),
+                    l.model_reviewer.as_deref(),
+                    inp,
+                    out,
+                );
                 match cost {
                     Some(c) => total_cost += c,
                     None => has_unknown_cost = true,
@@ -140,6 +143,8 @@ mod tests {
             failed_from_state: None,
             kind: "implement".to_string(),
             max_rounds: 15,
+            model_implementor: None,
+            model_reviewer: None,
             created_at: "2026-04-10T10:00:00Z".to_string(),
             updated_at: "2026-04-10T10:00:00Z".to_string(),
         }

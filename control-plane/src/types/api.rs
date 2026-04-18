@@ -72,6 +72,10 @@ pub struct LoopSummary {
     pub failed_from_state: Option<LoopState>,
     pub kind: String,
     pub max_rounds: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_implementor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_reviewer: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

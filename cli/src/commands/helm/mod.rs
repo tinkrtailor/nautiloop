@@ -7,7 +7,7 @@ pub mod summary;
 pub mod themes;
 
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, Stdout, Write as _};
+use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -28,9 +28,10 @@ use tokio::sync::{mpsc, watch};
 use crate::api_types::{InspectResponse, LoopSummary, PodIntrospectResponse, RoundSummary};
 use crate::client::NemoClient;
 use crate::commands::{inspect, ps, status};
+use crate::config::HelmConfig;
 
 use self::actions::LoopCommand;
-use self::cost::{PricingConfig, format_cost, format_tokens, round_total_tokens};
+use self::cost::{PricingConfig, calculate_loop_round_cost, format_cost, format_tokens, round_total_tokens};
 use self::summary::approval_hints;
 use self::themes::{Theme, ThemeName};
 
@@ -163,14 +164,40 @@ struct App {
     all_inspect: HashMap<uuid::Uuid, InspectResponse>,
     // Convergence detection (FR-4)
     previous_states: HashMap<uuid::Uuid, String>,
+    // Row flash for convergence events (FR-4a)
+    row_flash: HashMap<uuid::Uuid, Instant>,
     // Status flash (FR-3d)
     status_flash: Option<(String, Instant)>,
     // Cancel confirmation (FR-3b)
     cancel_confirm_pending: bool,
+    // Desktop notifications (FR-4b) - read behind `desktop-notifications` feature
+    #[allow(dead_code)]
+    desktop_notifications: bool,
 }
 
 impl App {
-    fn new(team_view: bool) -> Self {
+    fn new(team_view: bool, helm_config: &HelmConfig) -> Self {
+        // Load theme from config (FR-8a)
+        let theme_name = helm_config.theme.as_deref()
+            .and_then(ThemeName::from_str_opt)
+            .unwrap_or(ThemeName::Dark);
+
+        // Load pricing from nemo.toml if available (FR-7a)
+        let pricing = match std::env::current_dir() {
+            Ok(cwd) => {
+                match crate::project_config::load_project_pricing(&cwd) {
+                    Some(pricing_val) => {
+                        // Wrap in a table with "pricing" key for from_toml
+                        let mut wrapper = toml::map::Map::new();
+                        wrapper.insert("pricing".to_string(), pricing_val);
+                        PricingConfig::from_toml(&toml::Value::Table(wrapper))
+                    }
+                    None => PricingConfig::default(),
+                }
+            }
+            Err(_) => PricingConfig::default(),
+        };
+
         Self {
             loops: Vec::new(),
             list_state: ListState::default(),
@@ -185,8 +212,8 @@ impl App {
             side_panel: SidePanel::Closed,
             introspect: None,
             introspect_status: "Press 'i' to toggle introspect pane".to_string(),
-            theme_name: ThemeName::Dark,
-            pricing: PricingConfig::default(),
+            theme_name,
+            pricing,
             main_view: MainView::Logs,
             diff_content: None,
             diff_status: "Press 'd' to load diff".to_string(),
@@ -197,8 +224,10 @@ impl App {
             multi_logs: HashMap::new(),
             all_inspect: HashMap::new(),
             previous_states: HashMap::new(),
+            row_flash: HashMap::new(),
             status_flash: None,
             cancel_confirm_pending: false,
+            desktop_notifications: helm_config.desktop_notifications,
         }
     }
 
@@ -268,7 +297,7 @@ impl App {
     /// Detect convergence/failure transitions and ring terminal bell (FR-4).
     fn detect_state_changes(&mut self) {
         // Collect transitions first to avoid borrow conflict
-        let transitions: Vec<(uuid::Uuid, String, String)> = self
+        let transitions: Vec<(uuid::Uuid, String, String, Option<String>)> = self
             .loops
             .iter()
             .filter_map(|loop_item| {
@@ -281,7 +310,7 @@ impl App {
                         .next()
                         .unwrap_or(&loop_item.spec_path)
                         .to_string();
-                    Some((loop_item.loop_id, spec_name, new_state.clone()))
+                    Some((loop_item.loop_id, spec_name, new_state.clone(), loop_item.spec_pr_url.clone()))
                 } else {
                     None
                 }
@@ -294,11 +323,39 @@ impl App {
         }
 
         // Now apply side effects
-        for (_loop_id, spec_name, new_state) in transitions {
-            let _ = io::stdout().write_all(b"\x07");
-            let _ = io::stdout().flush();
-            self.set_status_flash(format!("{spec_name} -> {new_state}"));
+        for (loop_id, spec_name, new_state, pr_url) in transitions {
+            // Ring terminal bell via crossterm (safe during TUI rendering)
+            let _ = crossterm::execute!(io::stdout(), crossterm::style::Print('\x07'));
+            // Set row flash for 1-second highlight (FR-4a)
+            self.row_flash.insert(loop_id, Instant::now());
+            // Build notification message with PR URL if available (FR-4a)
+            let flash = match &pr_url {
+                Some(url) => format!("✓ {new_state}: {spec_name} → {url}"),
+                None => format!("{spec_name} → {new_state}"),
+            };
+            self.set_status_flash(flash.clone());
+
+            // FR-4b: desktop notification if enabled
+            #[cfg(feature = "desktop-notifications")]
+            if self.desktop_notifications {
+                let body = match &pr_url {
+                    Some(url) => format!("{spec_name}\n{url}"),
+                    None => spec_name.clone(),
+                };
+                // Fire-and-forget: don't block TUI on notification delivery
+                let _ = notify_rust::Notification::new()
+                    .summary(&format!("nautiloop: {new_state}"))
+                    .body(&body)
+                    .show();
+            }
         }
+    }
+
+    /// Check if a loop has an active row flash (within 1 second).
+    fn has_row_flash(&self, loop_id: &uuid::Uuid) -> bool {
+        self.row_flash
+            .get(loop_id)
+            .is_some_and(|when| when.elapsed() < Duration::from_secs(1))
     }
 
     fn set_status_flash(&mut self, message: String) {
@@ -568,7 +625,7 @@ enum StreamOutcome {
     Disconnected,
 }
 
-pub async fn run(client: &NemoClient, engineer: &str, team: bool) -> Result<()> {
+pub async fn run(client: &NemoClient, engineer: &str, team: bool, helm_config: &HelmConfig) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -576,7 +633,7 @@ pub async fn run(client: &NemoClient, engineer: &str, team: bool) -> Result<()> 
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let result = run_app(&mut terminal, client.clone(), engineer.to_string(), team).await;
+    let result = run_app(&mut terminal, client.clone(), engineer.to_string(), team, helm_config).await;
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -590,6 +647,7 @@ async fn run_app(
     client: NemoClient,
     engineer: String,
     team: bool,
+    helm_config: &HelmConfig,
 ) -> Result<()> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (selection_tx, selection_rx) = watch::channel(None::<LogSelection>);
@@ -605,7 +663,7 @@ async fn run_app(
     spawn_diff_task(client.clone(), diff_rx, event_tx.clone());
     spawn_batch_inspect_task(client.clone(), event_tx.clone());
 
-    let mut app = App::new(team);
+    let mut app = App::new(team, helm_config);
 
     loop {
         terminal.draw(|frame| render(frame, &mut app))?;
@@ -728,6 +786,14 @@ async fn run_app(
                         // FR-3c: validate before sending
                         if let Err(reason) = actions::validate_action(command, loop_item) {
                             app.set_status_flash(reason);
+                        } else if command == LoopCommand::OpenPr {
+                            // OpenPr is client-side: open URL in browser
+                            if let Some(url) = loop_item.spec_pr_url.clone() {
+                                match open::that(&url) {
+                                    Ok(()) => app.set_status_flash(format!("opened {url}")),
+                                    Err(e) => app.set_status_flash(format!("open PR failed: {e}")),
+                                }
+                            }
                         } else {
                             let loop_id = loop_item.loop_id;
                             app.set_status_flash(format!("sending {} for {loop_id}", command.verb()));
@@ -918,8 +984,9 @@ async fn perform_loop_action(
             ))
         }
         LoopCommand::OpenPr => {
-            // OpenPr is handled client-side by opening a URL, not an API call
-            Ok("use 'o' to open PR in browser".to_string())
+            // OpenPr is handled client-side before this function is called.
+            // This branch should not be reached.
+            Ok("open PR handled client-side".to_string())
         }
     }
 }
@@ -1228,17 +1295,21 @@ fn spawn_batch_inspect_task(
     event_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
-        // Periodically fetch status + inspect for all active loops
-        // This runs on a slower cadence (5s) to avoid hammering the API
+        // Periodically fetch inspect for all active loops.
+        // Runs on a slower cadence (5s) to avoid hammering the API.
         loop {
-            // First get the list of active loops
             if let Ok(status_resp) = status::fetch(&client, "", true).await {
                 for loop_item in &status_resp.loops {
-                    if !loop_item.branch.is_empty()
-                        && let Ok(inspect_data) = inspect::fetch(&client, &loop_item.branch).await
-                        && event_tx
-                            .send(AppEvent::BatchInspectLoaded(loop_item.loop_id, inspect_data))
-                            .is_err()
+                    if loop_item.branch.is_empty() {
+                        continue;
+                    }
+                    let inspect_data = match inspect::fetch(&client, &loop_item.branch).await {
+                        Ok(data) => data,
+                        Err(_) => continue,
+                    };
+                    if event_tx
+                        .send(AppEvent::BatchInspectLoaded(loop_item.loop_id, inspect_data))
+                        .is_err()
                     {
                         return;
                     }
@@ -1614,6 +1685,8 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut App) {
                     let is_harden = app.is_harden_loop();
                     let current_round = app.selected_loop().map(|l| l.round).unwrap_or(0);
                     let current_stage = app.selected_loop().and_then(|l| l.current_stage.as_deref());
+                    let model_impl = app.selected_loop().and_then(|l| l.model_implementor.as_deref());
+                    let model_rev = app.selected_loop().and_then(|l| l.model_reviewer.as_deref());
                     let table_widget = rounds_table::render_table(&rounds_table::RoundsTableConfig {
                         inspect: app.inspect.as_ref(),
                         inspect_status: &app.inspect_status,
@@ -1623,6 +1696,8 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut App) {
                         current_round,
                         current_stage,
                         pricing: &app.pricing,
+                        model_implementor: model_impl,
+                        model_reviewer: model_rev,
                         area: right[1],
                         theme: &theme,
                     });
@@ -1631,14 +1706,17 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut App) {
                 MainView::RoundDetail => {
                     if let Some(inspect) = &app.inspect
                         && let Some(round) = inspect.rounds.get(app.rounds_table_selected) {
-                            let is_harden = app.is_harden_loop();
                             let detail_widget = rounds_table::render_detail(
-                                round,
-                                is_harden,
-                                &app.pricing,
-                                app.round_detail_scroll,
-                                right[1],
-                                &theme,
+                                &rounds_table::RoundDetailConfig {
+                                    round,
+                                    is_harden: app.is_harden_loop(),
+                                    pricing: &app.pricing,
+                                    model_implementor: app.selected_loop().and_then(|l| l.model_implementor.as_deref()),
+                                    model_reviewer: app.selected_loop().and_then(|l| l.model_reviewer.as_deref()),
+                                    scroll: app.round_detail_scroll,
+                                    area: right[1],
+                                    theme: &theme,
+                                },
                             );
                             frame.render_widget(detail_widget, right[1]);
                     }
@@ -1708,7 +1786,13 @@ fn render_loop_selector(app: &App, theme: &Theme) -> List<'static> {
                         total_out += out;
                     }
                     let tokens = format_tokens(total_inp + total_out);
-                    let cost_val = app.pricing.calculate_cost(Some("claude-sonnet-4-6"), total_inp, total_out);
+                    let cost_val = calculate_loop_round_cost(
+                        &app.pricing,
+                        loop_item.model_implementor.as_deref(),
+                        loop_item.model_reviewer.as_deref(),
+                        total_inp,
+                        total_out,
+                    );
                     let cost = format_cost(cost_val);
                     (tokens, cost)
                 } else {
@@ -1725,7 +1809,13 @@ fn render_loop_selector(app: &App, theme: &Theme) -> List<'static> {
                     cost_str,
                     loop_item.spec_path
                 );
-                ListItem::new(Line::from(Span::styled(line, Style::default().fg(theme.text))))
+                // FR-4a: row flash for convergence events (1-second highlight)
+                let fg = if app.has_row_flash(&loop_item.loop_id) {
+                    theme.green
+                } else {
+                    theme.text
+                };
+                ListItem::new(Line::from(Span::styled(line, Style::default().fg(fg))))
             })
             .collect()
     };
@@ -1751,7 +1841,7 @@ fn render_loop_selector(app: &App, theme: &Theme) -> List<'static> {
         .highlight_style(
             Style::default()
                 .fg(theme.text)
-                .bg(ratatui::style::Color::Rgb(36, 35, 34))
+                .bg(theme.surface)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("> ")
@@ -2250,6 +2340,10 @@ fn state_color(state: &str, theme: &Theme) -> ratatui::style::Color {
 mod tests {
     use super::*;
 
+    fn default_helm_config() -> HelmConfig {
+        HelmConfig::default()
+    }
+
     fn loop_summary(id: uuid::Uuid, engineer: &str, updated_at: &str) -> LoopSummary {
         LoopSummary {
             loop_id: id,
@@ -2265,6 +2359,8 @@ mod tests {
             failed_from_state: None,
             kind: "implement".to_string(),
             max_rounds: 15,
+            model_implementor: None,
+            model_reviewer: None,
             created_at: updated_at.to_string(),
             updated_at: updated_at.to_string(),
         }
@@ -2309,7 +2405,7 @@ mod tests {
     fn set_loops_preserves_selected_loop_when_still_present() {
         let first_id = uuid::Uuid::new_v4();
         let second_id = uuid::Uuid::new_v4();
-        let mut app = App::new(false);
+        let mut app = App::new(false, &default_helm_config());
         app.set_loops(vec![
             loop_summary(first_id, "alice", "2026-04-10T10:00:00Z"),
             loop_summary(second_id, "bob", "2026-04-10T09:00:00Z"),
@@ -2327,7 +2423,7 @@ mod tests {
 
     #[test]
     fn action_hotkeys_map_to_loop_commands() {
-        let mut app = App::new(false);
+        let mut app = App::new(false, &default_helm_config());
 
         assert_eq!(
             app.handle_input(KeyEvent::from(KeyCode::Char('a'))),
@@ -2345,7 +2441,7 @@ mod tests {
 
     #[test]
     fn log_source_hotkey_cycles_sources() {
-        let mut app = App::new(false);
+        let mut app = App::new(false, &default_helm_config());
 
         assert_eq!(app.log_source, LogSource::Persisted);
         assert_eq!(
@@ -2368,7 +2464,7 @@ mod tests {
     #[test]
     fn persisted_log_selection_does_not_restart_on_job_name_changes() {
         let first_id = uuid::Uuid::new_v4();
-        let mut app = App::new(false);
+        let mut app = App::new(false, &default_helm_config());
         app.set_loops(vec![loop_summary(
             first_id,
             "alice",
@@ -2387,7 +2483,7 @@ mod tests {
     #[test]
     fn pod_log_selection_tracks_active_job_name() {
         let first_id = uuid::Uuid::new_v4();
-        let mut app = App::new(false);
+        let mut app = App::new(false, &default_helm_config());
         app.log_source = LogSource::AgentPod;
         app.set_loops(vec![loop_summary(
             first_id,
@@ -2415,7 +2511,7 @@ mod tests {
 
     #[test]
     fn theme_cycling_works() {
-        let mut app = App::new(false);
+        let mut app = App::new(false, &default_helm_config());
         assert_eq!(app.theme_name, ThemeName::Dark);
         assert_eq!(
             app.handle_input(KeyEvent::from(KeyCode::Char('T'))),
@@ -2427,7 +2523,7 @@ mod tests {
 
     #[test]
     fn view_switching_works() {
-        let mut app = App::new(false);
+        let mut app = App::new(false, &default_helm_config());
         assert_eq!(app.main_view, MainView::Logs);
         assert_eq!(
             app.handle_input(KeyEvent::from(KeyCode::Char('d'))),
@@ -2445,7 +2541,7 @@ mod tests {
 
     #[test]
     fn cancel_requires_confirmation() {
-        let mut app = App::new(false);
+        let mut app = App::new(false, &default_helm_config());
         let id = uuid::Uuid::new_v4();
         app.set_loops(vec![LoopSummary {
             state: "IMPLEMENTING".to_string(),
@@ -2465,7 +2561,7 @@ mod tests {
 
     #[test]
     fn cancel_confirmation_aborts_on_other_key() {
-        let mut app = App::new(false);
+        let mut app = App::new(false, &default_helm_config());
         let id = uuid::Uuid::new_v4();
         app.set_loops(vec![LoopSummary {
             state: "IMPLEMENTING".to_string(),
@@ -2482,9 +2578,10 @@ mod tests {
     }
 
     #[test]
-    fn convergence_detection_rings_bell() {
+    fn convergence_detection_sets_flash_and_row_flash() {
         let id = uuid::Uuid::new_v4();
-        let mut app = App::new(false);
+        let helm_config = HelmConfig::default();
+        let mut app = App::new(false, &helm_config);
 
         // Set up initial state
         app.previous_states.insert(id, "IMPLEMENTING".to_string());
@@ -2497,5 +2594,7 @@ mod tests {
         // Should have a status flash
         assert!(app.active_status_flash().is_some());
         assert!(app.active_status_flash().unwrap().contains("CONVERGED"));
+        // Should have a row flash
+        assert!(app.has_row_flash(&id));
     }
 }

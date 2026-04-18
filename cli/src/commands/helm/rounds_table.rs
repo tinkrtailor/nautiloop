@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::api_types::{InspectResponse, RoundSummary};
-use super::cost::{self, PricingConfig, format_cost, format_tokens, round_total_tokens, round_duration_secs};
+use super::cost::{self, PricingConfig, calculate_loop_round_cost, format_cost, format_tokens, round_total_tokens, round_duration_secs};
 use super::themes::Theme;
 
 /// Configuration for the rounds table renderer.
@@ -17,6 +17,8 @@ pub struct RoundsTableConfig<'a> {
     pub current_round: i32,
     pub current_stage: Option<&'a str>,
     pub pricing: &'a PricingConfig,
+    pub model_implementor: Option<&'a str>,
+    pub model_reviewer: Option<&'a str>,
     pub area: Rect,
     pub theme: &'a Theme,
 }
@@ -32,6 +34,8 @@ pub fn render_table(cfg: &RoundsTableConfig<'_>) -> Paragraph<'static> {
         current_round,
         current_stage,
         pricing,
+        model_implementor: _,
+        model_reviewer: _,
         area,
         theme,
     } = cfg;
@@ -72,7 +76,7 @@ pub fn render_table(cfg: &RoundsTableConfig<'_>) -> Paragraph<'static> {
         let stages = build_stages_column(round, *is_harden, is_current, *current_stage);
 
         // Verdict column
-        let (verdict_text, verdict_color) = extract_verdict(round, *is_harden);
+        let (verdict_text, verdict_color) = extract_verdict(round, *is_harden, theme);
 
         // Issues column
         let issues_text = extract_issues(round, *is_harden);
@@ -86,7 +90,7 @@ pub fn render_table(cfg: &RoundsTableConfig<'_>) -> Paragraph<'static> {
         let tokens_text = format_tokens(total_tokens);
 
         // Cost column
-        let cost = pricing.calculate_cost(Some("claude-sonnet-4-6"), inp, out);
+        let cost = calculate_loop_round_cost(pricing, cfg.model_implementor, cfg.model_reviewer, inp, out);
         let cost_text = format_cost(cost);
 
         // Duration column
@@ -103,7 +107,7 @@ pub fn render_table(cfg: &RoundsTableConfig<'_>) -> Paragraph<'static> {
         );
 
         let bg = if is_selected {
-            ratatui::style::Color::Rgb(36, 35, 34)
+            theme.surface
         } else {
             theme.bg
         };
@@ -138,15 +142,30 @@ pub fn render_table(cfg: &RoundsTableConfig<'_>) -> Paragraph<'static> {
         .style(Style::default().fg(theme.text).bg(theme.bg))
 }
 
+/// Configuration for the round detail renderer.
+pub struct RoundDetailConfig<'a> {
+    pub round: &'a RoundSummary,
+    pub is_harden: bool,
+    pub pricing: &'a PricingConfig,
+    pub model_implementor: Option<&'a str>,
+    pub model_reviewer: Option<&'a str>,
+    pub scroll: usize,
+    pub area: Rect,
+    pub theme: &'a Theme,
+}
+
 /// Render round detail view (FR-9d).
-pub fn render_detail(
-    round: &RoundSummary,
-    is_harden: bool,
-    pricing: &PricingConfig,
-    scroll: usize,
-    area: Rect,
-    theme: &Theme,
-) -> Paragraph<'static> {
+pub fn render_detail(cfg: &RoundDetailConfig<'_>) -> Paragraph<'static> {
+    let RoundDetailConfig {
+        round,
+        is_harden,
+        pricing,
+        model_implementor,
+        model_reviewer,
+        scroll,
+        area,
+        theme,
+    } = cfg;
     let mut lines = Vec::new();
 
     lines.push(Line::from(Span::styled(
@@ -157,7 +176,7 @@ pub fn render_detail(
 
     // Summary info
     let (inp, out) = round_total_tokens(round);
-    let cost = pricing.calculate_cost(Some("claude-sonnet-4-6"), inp, out);
+    let cost = calculate_loop_round_cost(pricing, *model_implementor, *model_reviewer, inp, out);
     let duration = round_duration_secs(round);
 
     lines.push(Line::from(vec![
@@ -174,7 +193,7 @@ pub fn render_detail(
     lines.push(Line::from(Span::styled("", Style::default())));
 
     // Verdict summary
-    let verdict_source = if is_harden { &round.audit } else { &round.review };
+    let verdict_source = if *is_harden { &round.audit } else { &round.review };
     if let Some(data) = verdict_source {
         let verdict = data.get("verdict").unwrap_or(data);
         if let Some(summary) = verdict.get("summary").and_then(|v| v.as_str()) {
@@ -247,7 +266,7 @@ pub fn render_detail(
     }
 
     let inner_height = area.height.saturating_sub(2) as usize;
-    let effective_scroll = scroll.min(lines.len().saturating_sub(inner_height));
+    let effective_scroll = (*scroll).min(lines.len().saturating_sub(inner_height));
 
     Paragraph::new(Text::from(lines))
         .block(
@@ -316,16 +335,16 @@ fn stage_succeeded(value: &serde_json::Value) -> bool {
     true
 }
 
-fn extract_verdict(round: &RoundSummary, is_harden: bool) -> (String, ratatui::style::Color) {
+fn extract_verdict(round: &RoundSummary, is_harden: bool, theme: &Theme) -> (String, ratatui::style::Color) {
     let source = if is_harden { &round.audit } else { &round.review };
     match source {
-        None => ("".to_string(), ratatui::style::Color::Reset),
+        None => ("".to_string(), theme.text),
         Some(data) => {
             let verdict = data.get("verdict").unwrap_or(data);
             match verdict.get("clean").and_then(|v| v.as_bool()) {
-                Some(true) => ("clean".to_string(), ratatui::style::Color::Rgb(45, 122, 79)),
-                Some(false) => ("not clean".to_string(), ratatui::style::Color::Rgb(232, 168, 56)),
-                None => ("".to_string(), ratatui::style::Color::Reset),
+                Some(true) => ("clean".to_string(), theme.green),
+                Some(false) => ("not clean".to_string(), theme.amber),
+                None => ("".to_string(), theme.text),
             }
         }
     }

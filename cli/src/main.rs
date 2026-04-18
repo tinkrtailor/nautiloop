@@ -359,7 +359,7 @@ async fn main() -> anyhow::Result<()> {
             commands::status::run(&http_client, &eng_config.engineer, team, json).await?;
         }
         Commands::Helm { team } => {
-            commands::helm::run(&http_client, &eng_config.engineer, team).await?;
+            commands::helm::run(&http_client, &eng_config.engineer, team, &eng_config.helm).await?;
         }
         Commands::Logs {
             loop_id,

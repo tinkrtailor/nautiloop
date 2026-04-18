@@ -18,11 +18,13 @@ pub fn render(
     theme: &Theme,
 ) {
     // Pick N most recently active non-terminal loops, capped at 4
-    let active_loops: Vec<&LoopSummary> = loops
+    // Sort by updated_at descending to show most recently active first (FR-6a)
+    let mut active_loops: Vec<&LoopSummary> = loops
         .iter()
         .filter(|l| !is_terminal(&l.state))
-        .take(4)
         .collect();
+    active_loops.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    active_loops.truncate(4);
 
     if active_loops.is_empty() {
         let p = Paragraph::new(Text::from(vec![Line::from(Span::styled(

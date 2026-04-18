@@ -45,7 +45,6 @@ impl PricingConfig {
     /// [pricing]
     /// "claude-opus-4-6" = { input_per_1m = 15.00, output_per_1m = 75.00 }
     /// ```
-    #[allow(dead_code)]
     pub fn from_toml(table: &toml::Value) -> Self {
         let mut config = Self::default();
         if let Some(pricing) = table.get("pricing").and_then(|v| v.as_table()) {
@@ -60,6 +59,22 @@ impl PricingConfig {
         }
         config
     }
+}
+
+/// Calculate cost for a round given a loop's model info.
+///
+/// Uses the implementor model for cost since that dominates token usage.
+/// Falls back to reviewer model if implementor is not set.
+pub fn calculate_loop_round_cost(
+    pricing: &PricingConfig,
+    model_implementor: Option<&str>,
+    model_reviewer: Option<&str>,
+    input_tokens: u64,
+    output_tokens: u64,
+) -> Option<f64> {
+    // Try implementor model first (drives most token usage), then reviewer
+    let model = model_implementor.or(model_reviewer);
+    pricing.calculate_cost(model, input_tokens, output_tokens)
 }
 
 /// Extract total token usage (input + output) from all stages of a round.
@@ -98,7 +113,8 @@ pub fn format_tokens(tokens: u64) -> String {
     if tokens >= 1_000_000 {
         format!("{:.1}M", tokens as f64 / 1_000_000.0)
     } else if tokens >= 1_000 {
-        format!("{}K", tokens / 1_000)
+        // Round to nearest K instead of truncating
+        format!("{}K", (tokens + 500) / 1_000)
     } else {
         format!("{tokens}")
     }
@@ -148,6 +164,7 @@ mod tests {
     #[test]
     fn format_tokens_k() {
         assert_eq!(format_tokens(52000), "52K");
+        assert_eq!(format_tokens(52999), "53K"); // rounds up
         assert_eq!(format_tokens(999), "999");
     }
 
@@ -229,6 +246,45 @@ mod tests {
     #[test]
     fn format_duration_minutes() {
         assert_eq!(format_duration_secs(202), "3m 22s");
+    }
+
+    #[test]
+    fn calculate_loop_round_cost_uses_implementor() {
+        let config = PricingConfig::default();
+        // With implementor model set, uses its pricing
+        let cost = calculate_loop_round_cost(
+            &config,
+            Some("claude-opus-4-6"),
+            Some("claude-haiku-4-5"),
+            100_000,
+            10_000,
+        );
+        assert!(cost.is_some());
+        let c = cost.unwrap();
+        // input: 100K * 15.0/1M = 1.50, output: 10K * 75.0/1M = 0.75
+        assert!((c - 2.25).abs() < 0.001);
+    }
+
+    #[test]
+    fn calculate_loop_round_cost_falls_back_to_reviewer() {
+        let config = PricingConfig::default();
+        let cost = calculate_loop_round_cost(
+            &config,
+            None,
+            Some("claude-haiku-4-5"),
+            100_000,
+            10_000,
+        );
+        assert!(cost.is_some());
+        let c = cost.unwrap();
+        // input: 100K * 1.0/1M = 0.10, output: 10K * 5.0/1M = 0.05
+        assert!((c - 0.15).abs() < 0.001);
+    }
+
+    #[test]
+    fn calculate_loop_round_cost_none_when_no_model() {
+        let config = PricingConfig::default();
+        assert!(calculate_loop_round_cost(&config, None, None, 100_000, 10_000).is_none());
     }
 
     #[test]

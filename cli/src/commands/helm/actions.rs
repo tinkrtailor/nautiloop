@@ -90,6 +90,8 @@ mod tests {
             failed_from_state: None,
             kind: "implement".to_string(),
             max_rounds: 15,
+            model_implementor: None,
+            model_reviewer: None,
             created_at: "2026-04-10T10:00:00Z".to_string(),
             updated_at: "2026-04-10T10:00:00Z".to_string(),
         }

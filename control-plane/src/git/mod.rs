@@ -769,7 +769,11 @@ pub mod bare {
 
         async fn diff(&self, branch: &str, base_ref: &str, max_bytes: Option<usize>) -> Result<String> {
             let diff_range = format!("{base_ref}...{branch}");
-            let output = self.run_git(&["diff", &diff_range]).await.unwrap_or_default();
+            let output = self.run_git(&["diff", &diff_range]).await.map_err(|e| {
+                crate::error::NautiloopError::Git(format!(
+                    "Failed to compute diff {diff_range}: {e}"
+                ))
+            })?;
             match max_bytes {
                 Some(max) if output.len() > max => {
                     let truncated = &output[..max];
