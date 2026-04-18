@@ -95,11 +95,13 @@ GRADLE_USER_HOME = "/cache/gradle"
 
 **FR-3b.** Default: when the `[cache]` section is absent entirely from nemo.toml, the control plane injects the sccache defaults (`RUSTC_WRAPPER=sccache`, `SCCACHE_DIR=/cache/sccache`, `SCCACHE_CACHE_SIZE=15G`, `SCCACHE_IDLE_TIMEOUT=0`). Byte-identical to #130. If `[cache]` is present but `[cache.env]` is absent or empty, no cache env vars are injected — the sccache defaults only apply when the entire `[cache]` section is missing. To get sccache behavior with an explicit `[cache]` section, list the sccache env vars in `[cache.env]`.
 
+> **Implementation note:** The `cache` field on `NautiloopConfig` must use `Option<CacheConfig>` (not `#[serde(default)]`) so that the absent-section case (`None` → inject sccache defaults) is distinguishable from the present-but-empty case (`Some` with empty `env` → no cache env vars). This diverges from the `#[serde(default)]` pattern used by other config sections in `mod.rs` — the distinction is intentional and required by the three-case semantics above.
+
 **FR-3c.** No validation of env-var names or values. Typos are the operator's problem; a wrong env var just means that tool uses its default (usually `$HOME`-relative) path, missing the cache benefit — which shows up as a slow build, not a crash.
 
 **FR-3d.** `[cache] disabled = true` skips both the `/cache` mount and ALL cache env vars (including the default sccache ones). Single flag for "run without caching."
 
-**FR-3e.** Cache config is repo-level only. The `[cache]` section is read from the repo's nemo.toml; cluster and engineer configs do not contribute cache settings. If multi-layer cache config is needed in the future, env maps would merge with higher-priority layers winning per-key — but that is out of scope for this spec.
+**FR-3e.** Cache config is repo-level only. The `[cache]` section is read from the repo's nemo.toml; cluster and engineer configs do not contribute cache settings. If `[cache]` appears in cluster or engineer configs, it is **silently ignored** — the repo-level nemo.toml is the sole source for cache configuration. The `CacheConfig` field should only be present on the repo-layer config struct, not on the cluster or engineer config structs, so serde never deserializes it from those layers. If multi-layer cache config is needed in the future, env maps would merge with higher-priority layers winning per-key — but that is out of scope for this spec.
 
 ### FR-4: No validation of tool binary presence
 
@@ -149,21 +151,23 @@ Subdirectory sizes:
   /cache/npm:         340 MiB
 ```
 
-If no agent pod with `/cache` is available for disk inspection:
+PVC capacity ("50 GiB" above) is read from the PVC's `status.capacity` field via the Kubernetes API, reflecting the actual provisioned size rather than the requested size from terraform/config.
+
+If no running agent pod with `/cache` is available for disk inspection:
 
 ```
 Cache volume: nautiloop-cache (50 GiB)
-Disk usage:   unavailable (no recent pod)
+Disk usage:   unavailable (no running pod)
 
 Active env vars (from nemo.toml [cache.env] on origin/main):
   RUSTC_WRAPPER        = sccache
   ...
 ```
 
-**FR-6b.** Backed by a new `GET /dashboard/cache` endpoint (read-only, no new state) that returns:
+**FR-6b.** Backed by a new `GET /cache` endpoint (read-only, no new state). This follows the existing flat route pattern (`/start`, `/status`, `/logs/{id}`, etc.) rather than introducing a new `/dashboard` namespace. The endpoint returns:
 
 1. The resolved `[cache.env]` from the repo's nemo.toml (or the sccache defaults if `[cache]` is absent).
-2. Disk usage via `du -sh /cache/*` executed on the most recent completed or running agent pod that has the `/cache` mount. If no such pod is available (all pods garbage-collected or none have run yet), the disk-usage section is omitted and the CLI displays `Disk usage: unavailable (no recent pod)`. No ephemeral pod is spawned to inspect the PVC.
+2. Disk usage via `du -sh /cache/*` executed on the most recent **running** agent pod that has the `/cache` mount. Only running pods accept `kubectl exec`; completed pods have exited containers and cannot be exec'd into. Since agent pods typically complete quickly, the window for a running pod is small — disk usage will frequently be `unavailable`. If no running pod with `/cache` is found (all pods completed/garbage-collected or none have run yet), the disk-usage section is omitted and the CLI displays `Disk usage: unavailable (no running pod)`. No ephemeral pod or debug container is spawned to inspect the PVC.
 3. Per-subdirectory size breakdown from the same `du` output.
 
 Hit-rate stats (e.g., sccache compile hit rate) are **descoped** from this spec. The log capture pipeline does not currently emit structured stats lines, and defining the format + parsing logic is non-trivial. Hit-rate display will be addressed in a follow-up spec. The example output in FR-6a is aspirational; the initial implementation omits the "Observed in recent loops" section and shows only config + disk usage.
@@ -216,7 +220,7 @@ Job_builder does NOT list known backends. It reads `[cache.env]`, iterates, and 
 
 ## Files Likely Touched
 
-- `control-plane/src/config/repo.rs` + `merged.rs` — add `[cache]` section (`HashMap<String, String>` for `env` + a `disabled: bool`).
+- `control-plane/src/config/mod.rs` — add `Option<CacheConfig>` field to `NautiloopConfig` (see FR-3b implementation note). `CacheConfig` struct contains `disabled: bool` and `env: HashMap<String, String>`.
 - `control-plane/src/k8s/job_builder.rs` — rename volume claim reference, change mount path to `/cache`, replace hardcoded sccache env with iterate-over-config.
 - `dev/k8s/01-storage.yaml` — rename PVC.
 - `terraform/modules/nautiloop/variables.tf` — rename variable, keep deprecated alias, remove #148 `cache_backends` map.
@@ -224,7 +228,7 @@ Job_builder does NOT list known backends. It reads `[cache.env]`, iterates, and 
 - `dev/setup.sh` — update any references.
 - `cli/src/commands/cache.rs` — new `nemo cache show` command (FR-6).
 - `cli/src/main.rs` — wire the subcommand.
-- `control-plane/src/api/dashboard/cache.rs` — new endpoint `GET /dashboard/cache` that returns resolved env + disk usage + recent stats.
+- `control-plane/src/api/cache.rs` — new endpoint `GET /cache` that returns resolved env + disk usage.
 - `docs/cache.md` — new doc: short explanation, full example of common env vars for Rust / Node (npm/pnpm/yarn/bun) / Python (pip/poetry/uv) / Go.
 - Tests per NFR-3.
 
