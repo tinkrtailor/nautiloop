@@ -1,0 +1,62 @@
+{
+  "round": 4,
+  "source": "audit",
+  "issues": [
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "specs/mobile-dashboard.md",
+      "description": "FR-4a lists 'AuditVerdict' as one of the five stage output types containing token_usage. In the codebase, the audit stage stores its output as ReviewResultData (same wrapper as the review stage), not AuditVerdict. AuditVerdict is the inner verdict struct embedded within ReviewResultData. An implementor reading this spec would try to deserialize audit round output as AuditVerdict directly and fail.",
+      "suggestion": "Replace 'AuditVerdict' with 'ReviewResultData (used for both review and audit stages)' in the FR-4a token data paragraph, or clarify that audit rounds use ReviewResultData containing an AuditVerdict inner struct."
+    },
+    {
+      "severity": "medium",
+      "category": "clarity",
+      "file": "specs/mobile-dashboard.md",
+      "description": "Multiple occurrences of '{{SPEC}}' appear in FR-12c, FR-13b, and FR-15b where '&' (ampersand) was intended. Examples: 'cursor=<timestamp>{{SPEC}}limit=50' should be 'cursor=<timestamp>&limit=50'; 'token_usage: {{SPEC}}TokenUsage, model: {{SPEC}}str' should be 'token_usage: &TokenUsage, model: &str'. This is a rendering/escaping artifact that makes the spec ambiguous for implementors.",
+      "suggestion": "Replace all '{{SPEC}}' occurrences with the intended '&' character. Ensure the markdown source uses HTML entity '&amp;' or escapes the ampersand properly to prevent future rendering issues."
+    },
+    {
+      "severity": "medium",
+      "category": "completeness",
+      "file": "specs/mobile-dashboard.md",
+      "description": "FR-8b's /dashboard/state response includes fleet_summary (7-day aggregation with trends) and is polled every 5 seconds (FR-3d). This is an expensive query scanning all loops and rounds within a 7-day window. FR-14c explicitly adds 60s caching for /dashboard/stats, but no caching strategy is specified for /dashboard/state despite it containing the same fleet_summary data and being polled 12x more frequently.",
+      "suggestion": "Either (a) add explicit caching guidance for fleet_summary within /dashboard/state (e.g., cache fleet_summary for 60s, refresh loop-level data on every poll), or (b) move fleet_summary out of /dashboard/state into a separate endpoint or into /dashboard/stats, and have the JS fetch it on a slower cadence (e.g., 60s)."
+    },
+    {
+      "severity": "medium",
+      "category": "consistency",
+      "file": "specs/mobile-dashboard.md",
+      "description": "FR-15b specifies the stage-to-model mapping as 'Implement, Revise, Test stages → model_implementor' and 'Review, Audit (Harden) stages → model_reviewer'. However, the codebase round stages are stored as strings: 'implement', 'test', 'review', 'audit', 'revise'. The spec uses mixed terminology — 'Audit (Harden)' conflates the round stage name ('audit') with the LoopState ('Hardening'). An implementor might look for a stage called 'harden' in the rounds table and find nothing.",
+      "suggestion": "Clarify that the stage names in the rounds table are lowercase strings: 'implement', 'test', 'review', 'audit', 'revise'. Map 'audit' → model_reviewer (this is the stage that runs during the Hardening LoopState). Drop the '(Harden)' parenthetical or rewrite as 'Review and Audit stages (stage field values \"review\" and \"audit\") → model_reviewer'."
+    },
+    {
+      "severity": "medium",
+      "category": "completeness",
+      "file": "specs/mobile-dashboard.md",
+      "description": "FR-2b sets nautiloop_engineer as an HttpOnly cookie, which means JavaScript cannot read it. FR-3e says the 'Mine' filter matches against this cookie value. While server-side filtering via /dashboard/state works (the server reads the cookie), the card grid JS poll (FR-3d) does a client-side re-render. If the JS needs to know the current engineer name for client-side filter chip rendering (e.g., highlighting 'Mine' as active, or knowing which cards are 'mine' when in team view with Mine selected), it cannot read the HttpOnly cookie. The spec doesn't clarify how the JS knows the current engineer identity.",
+      "suggestion": "Either (a) make nautiloop_engineer a non-HttpOnly cookie (it's not a secret — it's a self-declared name), or (b) have the server embed the engineer name in the initial HTML page (e.g., a data attribute or inline script variable), or (c) have /dashboard/state return a 'viewer' field identifying the requesting engineer. Option (c) is cleanest since the server already reads the cookie."
+    },
+    {
+      "severity": "low",
+      "category": "completeness",
+      "file": "specs/mobile-dashboard.md",
+      "description": "FR-3b pulse indicator specifies animation for sub_state 'Running' and solid dot for 'all other states'. SubState has three variants: Dispatched, Running, Completed. A 'Dispatched' state (job submitted but not yet running) could benefit from a distinct visual indicator (e.g., pulsing slower) to differentiate from 'Running' (actively executing). The current spec treats Dispatched the same as Completed (solid dot).",
+      "suggestion": "Consider adding a third visual state for Dispatched (e.g., slow pulse or hollow dot) to give operators better visibility into job lifecycle. Or explicitly note that Dispatched is intentionally shown as solid."
+    },
+    {
+      "severity": "low",
+      "category": "completeness",
+      "file": "specs/mobile-dashboard.md",
+      "description": "The NautiloopConfig struct in the codebase has no [pricing] section currently. FR-15 adds one, but the spec doesn't mention whether a database migration or config struct change is needed. Since this is a config-only addition (nemo.toml parsed by serde), no migration is needed, but the spec should note that NautiloopConfig and its serde deserialization need to be extended with an optional PricingConfig field.",
+      "suggestion": "Add a brief note in FR-15 or 'Files Likely Touched' that control-plane/src/config/mod.rs needs a new optional `pricing: Option<PricingConfig>` field added to NautiloopConfig, with PricingConfig and per-model cost structs defined there."
+    },
+    {
+      "severity": "low",
+      "category": "clarity",
+      "file": "specs/mobile-dashboard.md",
+      "description": "FR-4a rounds table says 'Tapping a row expands full verdict details inline' but doesn't specify which stages have expandable verdict details. Only review and audit stages produce ReviewVerdict/AuditVerdict with issues arrays. Implement, test, and revise stages have simpler output (SHA, exit code, test results). The expand behavior for non-verdict stages is unspecified.",
+      "suggestion": "Clarify that verdict expansion applies to review and audit stage rows (which contain issues arrays, confidence scores, and summaries). For other stages, either show the raw output fields (exit_code, new_sha, test results) or note that expansion is a no-op."
+    }
+  ]
+}
