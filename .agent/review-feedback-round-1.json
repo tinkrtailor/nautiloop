@@ -1,0 +1,169 @@
+{
+  "round": 1,
+  "source": "review",
+  "issues": [
+    {
+      "severity": "high",
+      "category": "correctness",
+      "file": "cli/src/commands/helm/mod.rs",
+      "line": 920,
+      "description": "FR-3a: OpenPr action does not actually open the PR URL in a browser. The perform_loop_action handler for LoopCommand::OpenPr just returns a message string 'use o to open PR in browser' without invoking any browser-opening mechanism (e.g., open::that or webbrowser crate). Pressing 'o' triggers the action, validates the URL exists, but never opens it.",
+      "suggestion": "Use the `open` crate (or `webbrowser`) to call `open::that(url)` with the loop's `spec_pr_url`. Handle this case before calling `perform_loop_action` since it's a client-side action, not an API call. Extract the URL from the selected loop and open it directly."
+    },
+    {
+      "severity": "high",
+      "category": "correctness",
+      "file": "cli/src/commands/helm/mod.rs",
+      "line": 1711,
+      "description": "FR-2b/FR-7: Cost calculation in loops list hardcodes model as 'claude-sonnet-4-6'. The spec says cost should be computed from per-model token prices, but neither LoopSummary nor InspectResponse/RoundSummary exposes which model was actually used. The LoopRecord has model_implementor/model_reviewer fields but they are not surfaced in the API. This means cost will be wrong for any loop using a different model (Opus, Haiku, GPT-4o, etc.).",
+      "suggestion": "Add model information to the API responses (either per-loop in LoopSummary or per-round in RoundSummary) and use it for cost calculation. At minimum, add model_implementor to LoopSummary and use that instead of the hardcoded string."
+    },
+    {
+      "severity": "high",
+      "category": "correctness",
+      "file": "cli/src/commands/helm/rounds_table.rs",
+      "line": 89,
+      "description": "Same hardcoded model 'claude-sonnet-4-6' for cost calculation in rounds table. Affects FR-9b cost column accuracy.",
+      "suggestion": "See above — propagate actual model info through the API and use it here."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "cli/src/commands/helm/mod.rs",
+      "line": 1231,
+      "description": "spawn_batch_inspect_task fetches status for ALL loops every 5s with a blocking sequential loop over all branches. For N active loops, this makes N+1 serial HTTP requests every 5 seconds, which could take many seconds for large teams. Additionally, this duplicates the existing status polling (which already runs every 2s). The status fetch here may race with the main status poller, causing redundant network traffic.",
+      "suggestion": "Instead of re-fetching status inside the batch inspect task, share the existing loop list from the main status poller via a watch channel. Only fetch /inspect for each loop. Consider parallelizing the inspect fetches with futures::join_all."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "cli/src/commands/helm/mod.rs",
+      "line": 1238,
+      "description": "spawn_batch_inspect_task has inverted control flow with `&& event_tx.send(...).is_err()`. The `send` is inside an `if` condition chained with `&&`, meaning that if `send` succeeds (returns Ok, so is_err() is false), the `if` body is NOT entered... but there IS no if body because it just contains `return`. Actually the logic means: if branch is non-empty AND inspect succeeds AND send FAILS, then return. This is correct but extremely hard to read and will confuse future maintainers.",
+      "suggestion": "Restructure as explicit if-let chains with early returns for clarity."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "cli/src/commands/helm/summary.rs",
+      "line": 65,
+      "description": "Same hardcoded model 'claude-sonnet-4-6' for cost calculation in header summary. Affects FR-1a cost accuracy.",
+      "suggestion": "See model propagation suggestion above."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "cli/src/commands/helm/multi_view.rs",
+      "line": 27,
+      "description": "FR-6a says multi-loop view should show 'N most recently-active loops'. The implementation uses `.take(4)` on the iterator but the loops list order depends on the server's ordering. There's no sort by updated_at or last activity — it just takes the first 4 non-terminal loops from whatever order the server returns.",
+      "suggestion": "Sort active_loops by updated_at descending before taking 4, to show the most recently active loops as specified."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "cli/src/commands/helm/mod.rs",
+      "line": 505,
+      "description": "FR-3a spec maps 'r' to Resume (state in {PAUSED, AWAITING_REAUTH, transient FAILED}), but the previous implementation used 'r' for reconnect logs (now removed). This is fine per spec, BUT the spec also maps 'R' to rounds table view. These are different keys (lowercase vs uppercase), but users may find it confusing that 'r' resumes and 'R' shows rounds table with no visual indication of the case sensitivity.",
+      "suggestion": "This is acceptable per spec but consider adding case-sensitivity hints in the footer keybind display."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/handlers.rs",
+      "line": 933,
+      "description": "FR-5b spec says the diff endpoint should scope to a round's commit range when round query param is provided. The implementation has `let _ = query.round;` — it acknowledges the round parameter but ignores it entirely, always returning the full branch diff against origin/main. This means per-round diffing doesn't work.",
+      "suggestion": "Either implement round-scoped diffing using commit SHAs from the round records, or document this as a known limitation. The spec says 'returns unified diff text from git diff origin/main...<branch> scoped to the round's commit range'."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/git/mod.rs",
+      "line": 774,
+      "description": "The diff implementation uses `self.run_git(&[\"diff\", &diff_range]).await.unwrap_or_default()`. If the git command fails (e.g., branch doesn't exist, ref not found), it silently returns an empty string instead of propagating the error. The error is swallowed by unwrap_or_default().",
+      "suggestion": "Propagate the error with `?` and let the handler return an appropriate error response to the client."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "cli/src/commands/helm/mod.rs",
+      "line": 272,
+      "description": "detect_state_changes writes bell character to stdout during TUI rendering. Writing raw bytes to stdout while ratatui owns the terminal can cause display corruption. The bell should be written through the terminal backend or queued and written during the render flush.",
+      "suggestion": "Use crossterm's execute!(io::stdout(), crossterm::event::Event::...) or queue the bell for the next terminal flush cycle."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "cli/src/commands/helm/mod.rs",
+      "line": 263,
+      "description": "FR-4a spec says convergence notification should include PR URL: 'CONVERGED: agent/dev/foo → https://github.com/org/repo/pull/137'. The implementation only shows '{spec_name} -> {new_state}' without the PR URL.",
+      "suggestion": "Include loop_item.spec_pr_url in the status flash message when available."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "cli/src/commands/helm/mod.rs",
+      "description": "FR-4a spec says the terminal loop's row should have 'a one-second color flash, then returns to normal muted'. No row-flash animation is implemented — the convergence detection only sets a status flash message and rings the bell.",
+      "suggestion": "Add a timed highlight state per loop_id that render_loop_selector checks to apply a brief color flash to the affected row."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "cli/src/commands/helm/mod.rs",
+      "description": "FR-4b: Desktop notifications via notify-rust are completely absent from the implementation. No notify-rust dependency, no config loading for desktop_notifications setting, no notification code. While this is gated by config, the entire feature is missing.",
+      "suggestion": "Add notify-rust as an optional dependency and implement desktop notification dispatch when the config flag is set."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "cli/src/commands/helm/themes.rs",
+      "description": "FR-8a: Theme config is not loaded from ~/.nemo/config.toml [helm] theme setting. The theme always starts as Dark regardless of user config. ThemeName::from_str_opt exists but is dead code.",
+      "suggestion": "Load the theme setting from config at startup and use it as the initial theme_name."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "cli/src/commands/helm/cost.rs",
+      "description": "FR-7a: PricingConfig is not loaded from nemo.toml [pricing] section. PricingConfig::from_toml exists but is dead code. The pricing always uses hardcoded defaults.",
+      "suggestion": "Load pricing config from nemo.toml at startup and merge with defaults."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "cli/src/commands/helm/mod.rs",
+      "description": "FR-1c: The --team header behavior is implemented in build_header, but FR-1c says header should 'label accordingly' showing all engineers' loops. The header shows 'team view' prefix but doesn't break down by engineer.",
+      "suggestion": "Minor spec interpretation issue — the current 'team view' prefix may be sufficient, but the spec mentions labeling by engineer."
+    },
+    {
+      "severity": "low",
+      "category": "style",
+      "file": "cli/src/commands/helm/rounds_table.rs",
+      "line": 295,
+      "description": "extract_verdict returns hardcoded Color::Rgb values instead of using the theme. This means verdict colors won't change when cycling themes.",
+      "suggestion": "Pass the theme to extract_verdict and use theme.green/theme.amber instead of hardcoded RGB values."
+    },
+    {
+      "severity": "low",
+      "category": "style",
+      "file": "cli/src/commands/helm/mod.rs",
+      "line": 1682,
+      "description": "highlight_style uses hardcoded Color::Rgb(36, 35, 34) instead of deriving from theme. This highlight won't look right in light or high-contrast themes.",
+      "suggestion": "Add a highlight_bg field to Theme or derive it from the surface color."
+    },
+    {
+      "severity": "low",
+      "category": "performance",
+      "file": "cli/src/commands/helm/mod.rs",
+      "line": 808,
+      "description": "Log lines are cloned for both the selected loop's log buffer and the multi_logs map. For high-volume log streams this doubles memory allocation.",
+      "suggestion": "Use Rc<String> or Arc<String> to share log line ownership between both buffers."
+    },
+    {
+      "severity": "low",
+      "category": "style",
+      "file": "cli/src/commands/helm/cost.rs",
+      "line": 100,
+      "description": "format_tokens truncates rather than rounds: 52,999 tokens shows as '52K' not '53K'. This is a minor display inaccuracy.",
+      "suggestion": "Consider rounding: `(tokens + 500) / 1_000` for K format."
+    }
+  ]
+}
