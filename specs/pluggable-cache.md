@@ -46,9 +46,9 @@ These are all "give me a writable directory, I'll manage it." Nautiloop shouldn'
 
 ### FR-1: One shared cache PVC
 
-**FR-1a.** Terraform + dev manifests provision a **single** PVC named `nautiloop-cache` in `nautiloop-jobs` namespace. RWO. Default size: 50 GiB (bumped from #130's 20 GiB — covers several tools' cache worth on one volume).
+**FR-1a.** Terraform + dev manifests provision a **single** PVC named `nautiloop-cache` in `nautiloop-jobs` namespace. RWO. Default size: 50 GiB. Dev manifest bumped from 20 GiB to 50 GiB to match the existing Terraform default.
 
-**FR-1b.** Previous PVC name `nautiloop-cargo-cache` is renamed in-place. The terraform variable is renamed `cargo_cache_volume_size` → `cache_volume_size` with a deprecation alias for one release.
+**FR-1b.** Previous PVC name `nautiloop-cargo-cache` is renamed to `nautiloop-cache`. The terraform variable is renamed `cargo_cache_volume_size` → `cache_volume_size` with a deprecation alias for one release. Note: Terraform cannot rename a PVC in-place — changing the PVC name produces a destroy-then-create plan. Migration path: use `terraform state mv` to rename the resource in Terraform state before applying, or accept cache data loss (one cold refill). See also NFR-1 and AC-5.
 
 ### FR-2: Mount at `/cache` on implement + revise
 
@@ -93,11 +93,13 @@ GOMODCACHE = "/cache/go-mod"
 GRADLE_USER_HOME = "/cache/gradle"
 ```
 
-**FR-3b.** Default: when `[cache]` section is absent entirely, the control plane injects the sccache set (`RUSTC_WRAPPER=sccache`, `SCCACHE_DIR=/cache/sccache`, `SCCACHE_CACHE_SIZE=15G`, `SCCACHE_IDLE_TIMEOUT=0`). Byte-identical to #130.
+**FR-3b.** Default: when the `[cache]` section is absent entirely from nemo.toml, the control plane injects the sccache defaults (`RUSTC_WRAPPER=sccache`, `SCCACHE_DIR=/cache/sccache`, `SCCACHE_CACHE_SIZE=15G`, `SCCACHE_IDLE_TIMEOUT=0`). Byte-identical to #130. If `[cache]` is present but `[cache.env]` is absent or empty, no cache env vars are injected — the sccache defaults only apply when the entire `[cache]` section is missing. To get sccache behavior with an explicit `[cache]` section, list the sccache env vars in `[cache.env]`.
 
 **FR-3c.** No validation of env-var names or values. Typos are the operator's problem; a wrong env var just means that tool uses its default (usually `$HOME`-relative) path, missing the cache benefit — which shows up as a slow build, not a crash.
 
 **FR-3d.** `[cache] disabled = true` skips both the `/cache` mount and ALL cache env vars (including the default sccache ones). Single flag for "run without caching."
+
+**FR-3e.** Cache config is repo-level only. The `[cache]` section is read from the repo's nemo.toml; cluster and engineer configs do not contribute cache settings. If multi-layer cache config is needed in the future, env maps would merge with higher-priority layers winning per-key — but that is out of scope for this spec.
 
 ### FR-4: No validation of tool binary presence
 
@@ -142,13 +144,29 @@ Active env vars (from nemo.toml [cache.env] on origin/main):
   SCCACHE_CACHE_SIZE   = 15G
   SCCACHE_IDLE_TIMEOUT = 0
 
-Observed in recent loops (last 24h, last round per loop):
-  sccache hit rate:  82%  (1,247 hits / 1,523 compile requests)
+Subdirectory sizes:
   /cache/sccache:    1.8 GiB
-  /cache/npm:         340 MiB   (no STATS emitted — passthrough only)
+  /cache/npm:         340 MiB
 ```
 
-**FR-6b.** Backed by a new `GET /dashboard/cache` endpoint (read-only, no new state) that returns the resolved `[cache.env]` + `du -sh /cache/*` from the latest agent pod (via the existing pod-exec introspection, or just a one-shot `kubectl exec` on the most recent terminal pod) + the last N `SCCACHE_STATS:` lines parsed from the log_events table.
+If no agent pod with `/cache` is available for disk inspection:
+
+```
+Cache volume: nautiloop-cache (50 GiB)
+Disk usage:   unavailable (no recent pod)
+
+Active env vars (from nemo.toml [cache.env] on origin/main):
+  RUSTC_WRAPPER        = sccache
+  ...
+```
+
+**FR-6b.** Backed by a new `GET /dashboard/cache` endpoint (read-only, no new state) that returns:
+
+1. The resolved `[cache.env]` from the repo's nemo.toml (or the sccache defaults if `[cache]` is absent).
+2. Disk usage via `du -sh /cache/*` executed on the most recent completed or running agent pod that has the `/cache` mount. If no such pod is available (all pods garbage-collected or none have run yet), the disk-usage section is omitted and the CLI displays `Disk usage: unavailable (no recent pod)`. No ephemeral pod is spawned to inspect the PVC.
+3. Per-subdirectory size breakdown from the same `du` output.
+
+Hit-rate stats (e.g., sccache compile hit rate) are **descoped** from this spec. The log capture pipeline does not currently emit structured stats lines, and defining the format + parsing logic is non-trivial. Hit-rate display will be addressed in a follow-up spec. The example output in FR-6a is aspirational; the initial implementation omits the "Observed in recent loops" section and shows only config + disk usage.
 
 **FR-6c.** Read-only. Does not modify anything. To change config, engineers still edit `nemo.toml` in the target repo and commit. This is deliberate: cache config is a repo-level decision that should be versioned.
 
@@ -158,7 +176,7 @@ Observed in recent loops (last 24h, last round per loop):
 
 ### NFR-1: Backward compatibility
 
-Operator on #130 with no nemo.toml `[cache]` section gets identical env vars and behavior after upgrade. Terraform accepts `cargo_cache_volume_size` for one release. PVC is renamed in-place — terraform plans a rename; dev operators run `kubectl patch` or accept data-loss on the sccache cache (one slow first loop to refill).
+Operator on #130 with no nemo.toml `[cache]` section gets identical env vars and behavior after upgrade. Terraform accepts `cargo_cache_volume_size` for one release. PVC name changes from `nautiloop-cargo-cache` to `nautiloop-cache`. Terraform cannot rename a PVC in-place — a naive apply produces a destroy-then-create plan. Operators must either (a) run `terraform state mv` to remap the existing PVC to the new resource name before applying, or (b) accept cache data loss (one slow first loop to refill). Dev operators using `01-storage.yaml` can `kubectl delete pvc nautiloop-cargo-cache` and re-apply, accepting the cold refill.
 
 ### NFR-2: No backend enumeration in the control plane
 
@@ -169,6 +187,7 @@ Job_builder does NOT list known backends. It reads `[cache.env]`, iterates, and 
 - **Unit** (`control-plane/src/k8s/job_builder.rs`): `[cache.env]` with N entries produces N `EnvVar` entries on implement/revise pods; zero on review/audit/test.
 - **Unit**: `[cache] disabled = true` skips both mount and env vars.
 - **Unit**: absent `[cache]` section uses sccache defaults.
+- **Unit**: `[cache]` present with empty or missing `[cache.env]` produces zero cache env vars (sccache defaults do NOT apply).
 - **Integration**: build a job with a custom `[cache.env] FOO = "/cache/foo"`, verify `FOO` env var lands in the pod spec.
 
 ## Acceptance Criteria
@@ -177,8 +196,12 @@ Job_builder does NOT list known backends. It reads `[cache.env]`, iterates, and 
 2. Add `NPM_CONFIG_CACHE = "/cache/npm"` to nemo.toml `[cache.env]`. On a TypeScript-touching spec, `npm install` inside the agent pod writes to `/cache/npm`; second run hits the cache and is faster.
 3. Set `[cache] disabled = true`. Agent pods have no `/cache` mount and no cache env vars. Loops still work; slower cold builds.
 4. Set `RUSTC_WRAPPER = "sccache"` without installing sccache in the image. Cargo fails to spawn sccache, loop fails at implement stage with a clear cargo error in the log. (Demonstrates FR-4a.)
-5. Terraform upgrade from #130: existing `cargo_cache_volume_size = 20` still works, deprecation warning logged once. Apply produces no destructive plan for the PVC (in-place rename, not replacement).
-6. `nemo cache show` prints volume size, disk usage, active env vars from nemo.toml, and hit-rate stats from recent loops. `nemo cache show --json` emits structured output.
+5. Terraform upgrade from #130: existing `cargo_cache_volume_size = 20` still works, deprecation warning logged once. After running `terraform state mv` to remap the old PVC resource to the new name, `terraform plan` shows no destructive changes to the PVC.
+6. `nemo cache show` prints volume size, disk usage (or "unavailable" if no recent pod), and active env vars from nemo.toml. `nemo cache show --json` emits structured output. Hit-rate stats are deferred to a follow-up spec.
+
+## Implementation Notes
+
+**FR-6 is a separable milestone.** The CLI command and dashboard endpoint (FR-6) are architecturally distinct from the core PVC/config work (FR-1 through FR-5). FR-6 can be implemented and shipped independently after the core changes land. Implementation plans should treat FR-1–FR-5 as the primary deliverable and FR-6 as a follow-on.
 
 ## Out of Scope
 
