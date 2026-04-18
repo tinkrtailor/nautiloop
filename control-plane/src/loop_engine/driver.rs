@@ -624,97 +624,8 @@ impl ConvergentLoopDriver {
 
                 match verdict {
                     Some(v) if v.clean => {
-                        // Audit passed
-                        if record.harden_only {
-                            // Check if the branch has any commits ahead of the default branch.
-                            // If the spec was already clean on round 1 (no revise ran), the
-                            // branch has no new commits and GitHub will reject PR creation.
-                            let default_branch = self.default_branch_for(record);
-                            let branch_sha = self.git.get_branch_sha(&record.branch).await?;
-                            // Compare against origin/<default_branch> since the bare repo
-                            // uses remote-tracking refs, not local branch refs, for main.
-                            let remote_ref = format!("origin/{default_branch}");
-                            let default_sha = self.git.get_branch_sha(&remote_ref).await?;
-                            let has_commits = branch_sha != default_sha;
-
-                            if !has_commits {
-                                // Spec was already clean — no revisions needed, no PR to create.
-                                record.state = LoopState::Hardened;
-                                record.sub_state = None;
-                                record.active_job_name = None;
-                                record.hardened_spec_path = Some(record.spec_path.clone());
-                                self.store.update_loop(record).await?;
-                                tracing::info!(loop_id = %record.id, "Harden loop HARDENED (spec already clean, no PR needed)");
-                                return Ok(LoopState::Hardened);
-                            }
-
-                            // Clean up .agent/ artifacts before PR creation
-                            if let Err(e) = self.git.remove_path(&record.branch, ".agent").await {
-                                tracing::warn!(loop_id = %record.id, error = %e, "Failed to clean up .agent/ artifacts, proceeding with PR");
-                            }
-
-                            // Harden only: create spec PR, merge it, terminal HARDENED (FR-23)
-                            let pr_title = format!(
-                                "chore(spec): harden {} for {}",
-                                record.spec_path, record.engineer,
-                            );
-                            let pr_body = format!(
-                                "Spec hardening completed in {} round(s).\n\nSpec: {}\nBranch: {}",
-                                record.round, record.spec_path, record.branch,
-                            );
-                            let pr_url = self
-                                .git
-                                .create_pr(
-                                    &record.branch,
-                                    &pr_title,
-                                    &pr_body,
-                                    &default_branch,
-                                )
-                                .await?;
-                            record.spec_pr_url = Some(pr_url);
-
-                            if self.config.harden.auto_merge_spec_pr {
-                                let merge_sha = self
-                                    .git
-                                    .merge_pr(
-                                        &record.branch,
-                                        &self.config.harden.merge_strategy,
-                                        &default_branch,
-                                    )
-                                    .await?;
-                                record.merge_sha = Some(merge_sha);
-                                record.merged_at = Some(chrono::Utc::now());
-
-                                record.state = LoopState::Hardened;
-                                record.sub_state = None;
-                                record.active_job_name = None;
-                                record.hardened_spec_path = Some(record.spec_path.clone());
-                                self.store.update_loop(record).await?;
-                                tracing::info!(loop_id = %record.id, "Harden loop HARDENED (spec PR merged)");
-                                Ok(LoopState::Hardened)
-                            } else {
-                                // PR created but not auto-merged: still HARDENED
-                                // (hardening converged, PR is the deliverable)
-                                record.state = LoopState::Hardened;
-                                record.sub_state = None;
-                                record.active_job_name = None;
-                                record.hardened_spec_path = Some(record.spec_path.clone());
-                                self.store.update_loop(record).await?;
-                                tracing::info!(loop_id = %record.id, "Harden loop HARDENED (spec PR created, human merge required)");
-                                Ok(LoopState::Hardened)
-                            }
-                        } else if record.auto_approve {
-                            // Auto-approve: go to implementing
-                            self.start_implementing(record).await
-                        } else {
-                            // Need approval
-                            record.state = LoopState::AwaitingApproval;
-                            record.sub_state = None;
-                            record.active_job_name = None;
-                            self.store.update_loop(record).await?;
-                            tracing::info!(loop_id = %record.id, "Harden passed -> AWAITING_APPROVAL");
-                            Ok(LoopState::AwaitingApproval)
-                        }
+                        // Audit passed — use shared convergence helper
+                        return self.converge_harden_clean(record).await;
                     }
                     Some(v) => {
                         // Audit found issues — invoke the orchestrator judge (FR-1a)
@@ -749,24 +660,9 @@ impl ConvergentLoopDriver {
                                         reasoning = ?output.reasoning,
                                         "Judge overriding audit verdict to exit_clean (harden)"
                                     );
-                                    // Treat as clean — same path as v.clean == true
-                                    if record.harden_only {
-                                        record.state = LoopState::Hardened;
-                                        record.sub_state = None;
-                                        record.active_job_name = None;
-                                        record.hardened_spec_path =
-                                            Some(record.spec_path.clone());
-                                        self.store.update_loop(record).await?;
-                                        return Ok(LoopState::Hardened);
-                                    } else if record.auto_approve {
-                                        return self.start_implementing(record).await;
-                                    } else {
-                                        record.state = LoopState::AwaitingApproval;
-                                        record.sub_state = None;
-                                        record.active_job_name = None;
-                                        self.store.update_loop(record).await?;
-                                        return Ok(LoopState::AwaitingApproval);
-                                    }
+                                    // Treat as clean — reuse full convergence logic
+                                    // (spec PR creation, .agent/ cleanup, optional merge)
+                                    return self.converge_harden_clean(record).await;
                                 }
                             }
                             Some(ref output) if output.decision == JudgeDecision::ExitEscalate => {
@@ -799,7 +695,9 @@ impl ConvergentLoopDriver {
                         }
 
                         // Heuristic / judge-continue: dispatch revise with findings
-                        self.dispatch_revise(record, &v).await
+                        // Extract hint from judge decision if present (FR-3)
+                        let hint = judge_decision.and_then(|o| o.hint);
+                        self.dispatch_revise(record, &v, hint).await
                     }
                     None => {
                         // Verdict parse failure: retry per FR-9
@@ -1298,6 +1196,101 @@ impl ConvergentLoopDriver {
         }
     }
 
+    /// Extract the clean-harden convergence logic into a reusable helper.
+    /// Used both by the normal clean audit verdict path and by the judge's exit_clean override.
+    async fn converge_harden_clean(&self, record: &mut LoopRecord) -> Result<LoopState> {
+        if record.harden_only {
+            // Check if the branch has any commits ahead of the default branch.
+            // If the spec was already clean on round 1 (no revise ran), the
+            // branch has no new commits and GitHub will reject PR creation.
+            let default_branch = self.default_branch_for(record);
+            let branch_sha = self.git.get_branch_sha(&record.branch).await?;
+            // Compare against origin/<default_branch> since the bare repo
+            // uses remote-tracking refs, not local branch refs, for main.
+            let remote_ref = format!("origin/{default_branch}");
+            let default_sha = self.git.get_branch_sha(&remote_ref).await?;
+            let has_commits = branch_sha != default_sha;
+
+            if !has_commits {
+                // Spec was already clean — no revisions needed, no PR to create.
+                record.state = LoopState::Hardened;
+                record.sub_state = None;
+                record.active_job_name = None;
+                record.hardened_spec_path = Some(record.spec_path.clone());
+                self.store.update_loop(record).await?;
+                tracing::info!(loop_id = %record.id, "Harden loop HARDENED (spec already clean, no PR needed)");
+                return Ok(LoopState::Hardened);
+            }
+
+            // Clean up .agent/ artifacts before PR creation
+            if let Err(e) = self.git.remove_path(&record.branch, ".agent").await {
+                tracing::warn!(loop_id = %record.id, error = %e, "Failed to clean up .agent/ artifacts, proceeding with PR");
+            }
+
+            // Harden only: create spec PR, merge it, terminal HARDENED (FR-23)
+            let pr_title = format!(
+                "chore(spec): harden {} for {}",
+                record.spec_path, record.engineer,
+            );
+            let pr_body = format!(
+                "Spec hardening completed in {} round(s).\n\nSpec: {}\nBranch: {}",
+                record.round, record.spec_path, record.branch,
+            );
+            let pr_url = self
+                .git
+                .create_pr(
+                    &record.branch,
+                    &pr_title,
+                    &pr_body,
+                    &default_branch,
+                )
+                .await?;
+            record.spec_pr_url = Some(pr_url);
+
+            if self.config.harden.auto_merge_spec_pr {
+                let merge_sha = self
+                    .git
+                    .merge_pr(
+                        &record.branch,
+                        &self.config.harden.merge_strategy,
+                        &default_branch,
+                    )
+                    .await?;
+                record.merge_sha = Some(merge_sha);
+                record.merged_at = Some(chrono::Utc::now());
+
+                record.state = LoopState::Hardened;
+                record.sub_state = None;
+                record.active_job_name = None;
+                record.hardened_spec_path = Some(record.spec_path.clone());
+                self.store.update_loop(record).await?;
+                tracing::info!(loop_id = %record.id, "Harden loop HARDENED (spec PR merged)");
+                Ok(LoopState::Hardened)
+            } else {
+                // PR created but not auto-merged: still HARDENED
+                // (hardening converged, PR is the deliverable)
+                record.state = LoopState::Hardened;
+                record.sub_state = None;
+                record.active_job_name = None;
+                record.hardened_spec_path = Some(record.spec_path.clone());
+                self.store.update_loop(record).await?;
+                tracing::info!(loop_id = %record.id, "Harden loop HARDENED (spec PR created, human merge required)");
+                Ok(LoopState::Hardened)
+            }
+        } else if record.auto_approve {
+            // Auto-approve: go to implementing
+            self.start_implementing(record).await
+        } else {
+            // Need approval
+            record.state = LoopState::AwaitingApproval;
+            record.sub_state = None;
+            record.active_job_name = None;
+            self.store.update_loop(record).await?;
+            tracing::info!(loop_id = %record.id, "Harden passed -> AWAITING_APPROVAL");
+            Ok(LoopState::AwaitingApproval)
+        }
+    }
+
     /// Invoke the orchestrator judge for a review or harden phase transition.
     /// Returns None if the judge is disabled, not triggered, or fails (fallback to heuristic).
     async fn invoke_judge_for_phase(
@@ -1323,16 +1316,52 @@ impl ConvergentLoopDriver {
             "issues": current_issues,
         });
 
+        // FR-2: Load spec content for the judge to evaluate functional requirements
+        let spec_content = match self
+            .git
+            .read_file(&record.spec_path, &record.branch)
+            .await
+        {
+            Ok(content) => Some(content),
+            Err(e) => {
+                tracing::warn!(
+                    loop_id = %record.id,
+                    error = %e,
+                    spec_path = %record.spec_path,
+                    "Failed to load spec content for judge, proceeding without it"
+                );
+                None
+            }
+        };
+
+        // Load prompt template from .nautiloop/prompts/judge.md
+        let prompt_template = match self
+            .git
+            .read_file(".nautiloop/prompts/judge.md", &record.branch)
+            .await
+        {
+            Ok(template) => Some(template),
+            Err(e) => {
+                tracing::debug!(
+                    loop_id = %record.id,
+                    error = %e,
+                    "Judge prompt template not found, using hardcoded fallback"
+                );
+                None
+            }
+        };
+
         let context = judge::JudgeContext {
             loop_id: record.id,
             spec_path: record.spec_path.clone(),
-            spec_content: None,
+            spec_content,
             phase: phase.to_string(),
             round: record.round,
             max_rounds: record.max_rounds,
             rounds: judge::build_rounds_summary(rounds),
             current_verdict,
             recurring_findings: recurring_findings.to_vec(),
+            prompt_template,
         };
 
         judge.invoke(&context, &trigger).await
@@ -1828,6 +1857,7 @@ impl ConvergentLoopDriver {
         &self,
         record: &mut LoopRecord,
         audit_verdict: &AuditVerdict,
+        orchestrator_hint: Option<String>,
     ) -> Result<LoopState> {
         record.sub_state = Some(SubState::Dispatched);
         record.retry_count = 0;
@@ -1839,7 +1869,7 @@ impl ConvergentLoopDriver {
             source: FeedbackSource::Audit,
             issues: Some(audit_verdict.issues.clone()),
             failures: None,
-            orchestrator_hint: None,
+            orchestrator_hint,
         };
         let feedback_path = format!(".agent/audit-feedback-round-{}.json", record.round);
         let feedback_json = serde_json::to_string_pretty(&feedback).map_err(|e| {

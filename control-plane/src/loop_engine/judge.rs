@@ -46,7 +46,7 @@ impl std::fmt::Display for JudgeDecision {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JudgeOutput {
     pub decision: JudgeDecision,
-    pub confidence: Option<f64>,
+    pub confidence: Option<f32>,
     pub reasoning: Option<String>,
     pub hint: Option<String>,
 }
@@ -102,6 +102,11 @@ pub struct JudgeContext {
     pub rounds: Vec<RoundSummaryForJudge>,
     pub current_verdict: serde_json::Value,
     pub recurring_findings: Vec<RecurringFinding>,
+    /// Prompt template loaded from .nautiloop/prompts/judge.md.
+    /// When present, {{CONTEXT}} is substituted with the serialized context JSON.
+    /// When absent, the hardcoded fallback prompt is used.
+    #[serde(skip)]
+    pub prompt_template: Option<String>,
 }
 
 /// Simplified round summary for the judge input.
@@ -249,7 +254,7 @@ impl OrchestratorJudge {
             return Some(JudgeTrigger::NotClean);
         }
 
-        // verdict_clean && round > 1: still invoke to log the decision
+        // verdict_clean && round > 1: no trigger applies, skip judge
         None
     }
 
@@ -343,7 +348,7 @@ impl OrchestratorJudge {
             trigger: trigger.to_string(),
             input_json: serde_json::to_value(context).unwrap_or_default(),
             decision: output.decision.to_string(),
-            confidence: output.confidence.map(|c| c as f32),
+            confidence: output.confidence,
             reasoning: output.reasoning.clone(),
             hint: output.hint.clone(),
             duration_ms,
@@ -374,8 +379,17 @@ impl OrchestratorJudge {
     }
 
     /// Build the judge prompt from context.
+    /// Uses the prompt template from .nautiloop/prompts/judge.md if available,
+    /// falling back to a hardcoded prompt otherwise.
     fn build_prompt(&self, context: &JudgeContext) -> String {
         let context_json = serde_json::to_string_pretty(context).unwrap_or_default();
+
+        // Use template from .nautiloop/prompts/judge.md if loaded
+        if let Some(ref template) = context.prompt_template {
+            return template.replace("{{CONTEXT}}", &context_json);
+        }
+
+        // Fallback: hardcoded prompt (used when template file is missing)
         format!(
             r#"You are an orchestrator judge for a convergent software engineering loop. Your job is to decide whether the loop should continue iterating, accept the current state as clean, escalate to a human, or fail.
 
@@ -440,7 +454,8 @@ Decisions:
 
         let confidence = parsed
             .get("confidence")
-            .and_then(|v| v.as_f64());
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32);
 
         let reasoning = parsed
             .get("reasoning")
@@ -662,6 +677,7 @@ mod tests {
             rounds: vec![],
             current_verdict: serde_json::json!({"clean": false, "issues": []}),
             recurring_findings: vec![],
+            prompt_template: None,
         }
     }
 
