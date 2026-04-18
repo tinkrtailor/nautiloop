@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod dashboard;
 pub mod handlers;
 pub mod introspect;
 pub mod sse;
@@ -33,11 +34,14 @@ pub struct AppState {
 
 /// Build the axum router with all endpoints and auth middleware.
 /// The /health endpoint is outside the auth layer so K8s probes work without an API key.
+/// Dashboard routes live under /dashboard/* with their own cookie-based auth.
 pub fn build_router(state: AppState) -> Router {
     let authed = build_routes(state.clone()).layer(middleware::from_fn(auth::auth_middleware));
+    let dashboard = dashboard::build_dashboard_router(state.clone());
 
     Router::new()
         .route("/health", get(health))
+        .merge(dashboard)
         .merge(authed)
         .with_state(state)
 }

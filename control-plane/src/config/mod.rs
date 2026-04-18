@@ -34,6 +34,10 @@ pub struct NautiloopConfig {
     /// Observability configuration from `[observability]` in nemo.toml.
     #[serde(default)]
     pub observability: ObservabilityConfig,
+    /// Optional pricing configuration from `[pricing]` in nemo.toml (FR-15e).
+    /// When absent, all cost fields across the dashboard display `—`.
+    #[serde(default)]
+    pub pricing: Option<PricingConfig>,
 }
 
 /// Configuration for a single service in the monorepo.
@@ -421,6 +425,23 @@ fn default_reconcile_interval() -> u64 {
 }
 fn default_branch_name() -> String {
     "main".to_string()
+}
+
+/// Pricing configuration from `[pricing]` in nemo.toml (FR-15).
+/// Maps model names to per-token costs for computing dollar amounts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PricingConfig {
+    /// Per-model pricing: model name → input/output costs per million tokens.
+    pub models: HashMap<String, ModelPricing>,
+}
+
+/// Per-token costs for a single model (FR-15a).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelPricing {
+    /// Cost in USD per million input tokens.
+    pub input_per_million: f64,
+    /// Cost in USD per million output tokens.
+    pub output_per_million: f64,
 }
 
 /// Engineer-level configuration loaded from `~/.nemo/config.toml`.
