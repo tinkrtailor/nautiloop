@@ -61,20 +61,46 @@ impl PricingConfig {
     }
 }
 
-/// Calculate cost for a round given a loop's model info.
+/// Calculate cost for a round by splitting tokens between implementor and reviewer models.
 ///
-/// Uses the implementor model for cost since that dominates token usage.
-/// Falls back to reviewer model if implementor is not set.
+/// Implement/test stages use the implementor model pricing.
+/// Review/audit stages use the reviewer model pricing.
+/// Revise stages use the implementor model pricing (spec revision is implementor work).
+/// Returns None only if ALL token-producing stages lack pricing entries.
 pub fn calculate_loop_round_cost(
     pricing: &PricingConfig,
     model_implementor: Option<&str>,
     model_reviewer: Option<&str>,
-    input_tokens: u64,
-    output_tokens: u64,
+    round: &RoundSummary,
 ) -> Option<f64> {
-    // Try implementor model first (drives most token usage), then reviewer
-    let model = model_implementor.or(model_reviewer);
-    pricing.calculate_cost(model, input_tokens, output_tokens)
+    let mut total_cost = 0.0f64;
+    let mut any_priced = false;
+
+    // Implementor stages: implement, test, revise
+    for data in [&round.implement, &round.test, &round.revise].into_iter().flatten() {
+        let (inp, out) = extract_token_usage(data);
+        if inp > 0 || out > 0 {
+            let model = model_implementor.or(model_reviewer);
+            if let Some(c) = pricing.calculate_cost(model, inp, out) {
+                total_cost += c;
+                any_priced = true;
+            }
+        }
+    }
+
+    // Reviewer stages: review, audit
+    for data in [&round.review, &round.audit].into_iter().flatten() {
+        let (inp, out) = extract_token_usage(data);
+        if inp > 0 || out > 0 {
+            let model = model_reviewer.or(model_implementor);
+            if let Some(c) = pricing.calculate_cost(model, inp, out) {
+                total_cost += c;
+                any_priced = true;
+            }
+        }
+    }
+
+    if any_priced { Some(total_cost) } else { None }
 }
 
 /// Extract total token usage (input + output) from all stages of a round.
@@ -249,42 +275,81 @@ mod tests {
     }
 
     #[test]
-    fn calculate_loop_round_cost_uses_implementor() {
+    fn calculate_loop_round_cost_splits_by_stage() {
         let config = PricingConfig::default();
-        // With implementor model set, uses its pricing
+        // Implement tokens at Opus pricing, review tokens at Haiku pricing
+        let round = RoundSummary {
+            round: 1,
+            implement: Some(serde_json::json!({"token_usage": {"input": 80000, "output": 8000}})),
+            test: Some(serde_json::json!({"token_usage": {"input": 0, "output": 0}})),
+            review: Some(serde_json::json!({"verdict": {"clean": true, "token_usage": {"input": 20000, "output": 2000}}})),
+            audit: None,
+            revise: None,
+            implement_duration_secs: Some(120),
+            test_duration_secs: Some(30),
+            review_duration_secs: Some(60),
+            audit_duration_secs: None,
+            revise_duration_secs: None,
+        };
         let cost = calculate_loop_round_cost(
             &config,
             Some("claude-opus-4-6"),
             Some("claude-haiku-4-5"),
-            100_000,
-            10_000,
+            &round,
         );
         assert!(cost.is_some());
         let c = cost.unwrap();
-        // input: 100K * 15.0/1M = 1.50, output: 10K * 75.0/1M = 0.75
-        assert!((c - 2.25).abs() < 0.001);
+        // impl: input 80K * 15/1M = 1.20, output 8K * 75/1M = 0.60 → 1.80
+        // review: input 20K * 1/1M = 0.02, output 2K * 5/1M = 0.01 → 0.03
+        // total = 1.83
+        assert!((c - 1.83).abs() < 0.001);
     }
 
     #[test]
     fn calculate_loop_round_cost_falls_back_to_reviewer() {
         let config = PricingConfig::default();
+        let round = RoundSummary {
+            round: 1,
+            implement: Some(serde_json::json!({"token_usage": {"input": 100000, "output": 10000}})),
+            test: None,
+            review: None,
+            audit: None,
+            revise: None,
+            implement_duration_secs: None,
+            test_duration_secs: None,
+            review_duration_secs: None,
+            audit_duration_secs: None,
+            revise_duration_secs: None,
+        };
         let cost = calculate_loop_round_cost(
             &config,
             None,
             Some("claude-haiku-4-5"),
-            100_000,
-            10_000,
+            &round,
         );
         assert!(cost.is_some());
         let c = cost.unwrap();
-        // input: 100K * 1.0/1M = 0.10, output: 10K * 5.0/1M = 0.05
+        // impl falls back to reviewer: input 100K * 1.0/1M = 0.10, output 10K * 5.0/1M = 0.05
         assert!((c - 0.15).abs() < 0.001);
     }
 
     #[test]
     fn calculate_loop_round_cost_none_when_no_model() {
         let config = PricingConfig::default();
-        assert!(calculate_loop_round_cost(&config, None, None, 100_000, 10_000).is_none());
+        let round = RoundSummary {
+            round: 1,
+            implement: Some(serde_json::json!({"token_usage": {"input": 100000, "output": 10000}})),
+            test: None,
+            review: None,
+            audit: None,
+            revise: None,
+            implement_duration_secs: None,
+            test_duration_secs: None,
+            review_duration_secs: None,
+            audit_duration_secs: None,
+            revise_duration_secs: None,
+        };
+        assert!(calculate_loop_round_cost(&config, None, None, &round).is_none());
     }
 
     #[test]

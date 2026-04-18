@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -13,7 +14,7 @@ use super::themes::Theme;
 pub fn render(
     frame: &mut ratatui::Frame<'_>,
     loops: &[LoopSummary],
-    all_logs: &std::collections::HashMap<uuid::Uuid, VecDeque<String>>,
+    all_logs: &std::collections::HashMap<uuid::Uuid, VecDeque<Arc<String>>>,
     area: Rect,
     theme: &Theme,
 ) {
@@ -76,7 +77,7 @@ pub fn render(
                     .rev()
                     .take(visible)
                     .rev()
-                    .map(|line| Line::from(Span::styled(line.clone(), Style::default().fg(theme.text))))
+                    .map(|line| Line::from(Span::styled(line.as_str().to_owned(), Style::default().fg(theme.text))))
                     .collect()
             }
             _ => vec![Line::from(Span::styled(

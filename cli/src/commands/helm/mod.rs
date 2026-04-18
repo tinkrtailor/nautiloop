@@ -8,6 +8,7 @@ pub mod themes;
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Stdout};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -136,7 +137,7 @@ struct App {
     loops: Vec<LoopSummary>,
     list_state: ListState,
     selected_loop_id: Option<uuid::Uuid>,
-    logs: VecDeque<String>,
+    logs: VecDeque<Arc<String>>,
     log_source: LogSource,
     status_line: String,
     log_status: String,
@@ -158,8 +159,8 @@ struct App {
     rounds_table_selected: usize,
     rounds_table_scroll: usize,
     round_detail_scroll: usize,
-    // Multi-loop logs (FR-6)
-    multi_logs: HashMap<uuid::Uuid, VecDeque<String>>,
+    // Multi-loop logs (FR-6) - Arc<String> shared with main log buffer
+    multi_logs: HashMap<uuid::Uuid, VecDeque<Arc<String>>>,
     // Batch inspect for header summary (FR-1)
     all_inspect: HashMap<uuid::Uuid, InspectResponse>,
     // Convergence detection (FR-4)
@@ -168,8 +169,10 @@ struct App {
     row_flash: HashMap<uuid::Uuid, Instant>,
     // Status flash (FR-3d)
     status_flash: Option<(String, Instant)>,
-    // Cancel confirmation (FR-3b)
-    cancel_confirm_pending: bool,
+    // Cancel confirmation (FR-3b) with 3-second timeout
+    cancel_confirm_at: Option<Instant>,
+    // Bell queued for next render cycle (FR-4a)
+    pending_bell: bool,
     // Desktop notifications (FR-4b) - read behind `desktop-notifications` feature
     #[allow(dead_code)]
     desktop_notifications: bool,
@@ -226,7 +229,8 @@ impl App {
             previous_states: HashMap::new(),
             row_flash: HashMap::new(),
             status_flash: None,
-            cancel_confirm_pending: false,
+            cancel_confirm_at: None,
+            pending_bell: false,
             desktop_notifications: helm_config.desktop_notifications,
         }
     }
@@ -324,14 +328,14 @@ impl App {
 
         // Now apply side effects
         for (loop_id, spec_name, new_state, pr_url) in transitions {
-            // Ring terminal bell via crossterm (safe during TUI rendering)
-            let _ = crossterm::execute!(io::stdout(), crossterm::style::Print('\x07'));
+            // Queue bell for next render cycle (FR-4a)
+            self.pending_bell = true;
             // Set row flash for 1-second highlight (FR-4a)
             self.row_flash.insert(loop_id, Instant::now());
             // Build notification message with PR URL if available (FR-4a)
             let flash = match &pr_url {
                 Some(url) => format!("✓ {new_state}: {spec_name} → {url}"),
-                None => format!("{spec_name} → {new_state}"),
+                None => format!("✓ {new_state}: {spec_name}"),
             };
             self.set_status_flash(flash.clone());
 
@@ -461,7 +465,7 @@ impl App {
         };
     }
 
-    fn push_log_line(&mut self, line: String) {
+    fn push_log_line(&mut self, line: Arc<String>) {
         if self.logs.len() == MAX_LOG_LINES {
             self.logs.pop_front();
         }
@@ -475,9 +479,12 @@ impl App {
     }
 
     fn handle_input(&mut self, key: KeyEvent) -> AppAction {
-        // Cancel confirmation mode (FR-3b): only 'y' confirms, anything else cancels
-        if self.cancel_confirm_pending {
-            self.cancel_confirm_pending = false;
+        // Cancel confirmation mode (FR-3d): only 'y' within 3s confirms
+        if let Some(confirm_at) = self.cancel_confirm_at.take() {
+            if confirm_at.elapsed() > Duration::from_secs(3) {
+                self.set_status_flash("cancel confirmation timed out".to_string());
+                return AppAction::None;
+            }
             if key.code == KeyCode::Char('y') {
                 return AppAction::Trigger(LoopCommand::Cancel);
             }
@@ -561,12 +568,12 @@ impl App {
             KeyCode::Char('a') => AppAction::Trigger(LoopCommand::Approve),
             KeyCode::Char('r') => AppAction::Trigger(LoopCommand::Resume),
             KeyCode::Char('x') => {
-                // FR-3b: cancel requires y confirmation
+                // FR-3d: cancel requires y confirmation within 3s
                 if self.selected_loop().is_some_and(|loop_item| {
                     actions::validate_action(LoopCommand::Cancel, loop_item).is_ok()
                 }) {
-                    self.cancel_confirm_pending = true;
-                    self.set_status_flash("press y to confirm cancel".to_string());
+                    self.cancel_confirm_at = Some(Instant::now());
+                    self.set_status_flash("press y within 3s to confirm cancel".to_string());
                     return AppAction::None;
                 }
                 self.set_status_flash("cancel not available in current state".to_string());
@@ -654,6 +661,7 @@ async fn run_app(
     let (inspect_tx, inspect_rx) = watch::channel(None::<String>);
     let (introspect_tx, introspect_rx) = watch::channel(None::<uuid::Uuid>);
     let (diff_tx, diff_rx) = watch::channel(None::<(uuid::Uuid, String)>);
+    let (loops_tx, loops_rx) = watch::channel(Vec::<LoopSummary>::new());
 
     spawn_input_task(event_tx.clone());
     spawn_status_task(client.clone(), engineer.clone(), team, event_tx.clone());
@@ -661,12 +669,18 @@ async fn run_app(
     spawn_inspect_task(client.clone(), inspect_rx, event_tx.clone());
     spawn_introspect_task(client.clone(), introspect_rx, event_tx.clone());
     spawn_diff_task(client.clone(), diff_rx, event_tx.clone());
-    spawn_batch_inspect_task(client.clone(), event_tx.clone());
+    spawn_batch_inspect_task(client.clone(), loops_rx, event_tx.clone());
 
     let mut app = App::new(team, helm_config);
 
     loop {
         terminal.draw(|frame| render(frame, &mut app))?;
+
+        // Emit queued bell after render to avoid bypassing ratatui's pipeline (FR-4a)
+        if app.pending_bell {
+            app.pending_bell = false;
+            let _ = crossterm::execute!(io::stdout(), crossterm::style::Print('\x07'));
+        }
 
         let Some(event) = event_rx.recv().await else {
             break;
@@ -836,6 +850,8 @@ async fn run_app(
             },
             AppEvent::Resize => {}
             AppEvent::Status(loops) => {
+                // Share loop list with batch inspect task
+                let _ = loops_tx.send(loops.clone());
                 app.set_loops(loops);
                 app.detect_state_changes();
                 if app.current_log_selection() != previous_log_selection {
@@ -863,8 +879,9 @@ async fn run_app(
                 }
             }
             AppEvent::LogLine(loop_id, line) => {
+                let line = Arc::new(line);
                 if Some(loop_id) == app.selected_loop_id {
-                    app.push_log_line(line.clone());
+                    app.push_log_line(Arc::clone(&line));
                 }
                 // Also store in multi_logs for multi-loop view (FR-6)
                 let entry = app.multi_logs.entry(loop_id).or_default();
@@ -1290,25 +1307,46 @@ fn spawn_diff_task(
 }
 
 /// Spawn batch inspect polling for all active loops (FR-1b header summary).
+///
+/// Receives loop list from the main status poller via a watch channel
+/// to avoid duplicate status fetches. Parallelizes inspect calls.
 fn spawn_batch_inspect_task(
     client: NemoClient,
+    loops_rx: watch::Receiver<Vec<LoopSummary>>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
-        // Periodically fetch inspect for all active loops.
-        // Runs on a slower cadence (5s) to avoid hammering the API.
+        let mut loops_rx = loops_rx;
         loop {
-            if let Ok(status_resp) = status::fetch(&client, "", true).await {
-                for loop_item in &status_resp.loops {
-                    if loop_item.branch.is_empty() {
-                        continue;
-                    }
-                    let inspect_data = match inspect::fetch(&client, &loop_item.branch).await {
-                        Ok(data) => data,
-                        Err(_) => continue,
-                    };
+            // Collect branches to inspect from the shared loop list
+            let targets: Vec<(uuid::Uuid, String)> = loops_rx
+                .borrow()
+                .iter()
+                .filter(|l| !l.branch.is_empty())
+                .map(|l| (l.loop_id, l.branch.clone()))
+                .collect();
+
+            if !targets.is_empty() {
+                // Fetch all inspects in parallel
+                let futures: Vec<_> = targets
+                    .iter()
+                    .map(|(loop_id, branch)| {
+                        let client = client.clone();
+                        let branch = branch.clone();
+                        let loop_id = *loop_id;
+                        async move {
+                            match inspect::fetch(&client, &branch).await {
+                                Ok(data) => Some((loop_id, data)),
+                                Err(_) => None,
+                            }
+                        }
+                    })
+                    .collect();
+
+                let results = futures::future::join_all(futures).await;
+                for result in results.into_iter().flatten() {
                     if event_tx
-                        .send(AppEvent::BatchInspectLoaded(loop_item.loop_id, inspect_data))
+                        .send(AppEvent::BatchInspectLoaded(result.0, result.1))
                         .is_err()
                     {
                         return;
@@ -1317,6 +1355,10 @@ fn spawn_batch_inspect_task(
             }
 
             tokio::time::sleep(Duration::from_secs(5)).await;
+
+            // Wait for a change in the loop list or just proceed after sleep
+            // This ensures we pick up new loops when the status poller updates
+            let _ = tokio::time::timeout(Duration::from_secs(5), loops_rx.changed()).await;
         }
     });
 }
@@ -1776,24 +1818,26 @@ fn render_loop_selector(app: &App, theme: &Theme) -> List<'static> {
             .map(|loop_item| {
                 let stage = loop_item.current_stage.as_deref().unwrap_or("-");
 
-                // FR-2: Add token and cost columns
+                // FR-2: Add token and cost columns (per-round cost for accuracy)
                 let (tokens_str, cost_str) = if let Some(inspect_data) = app.all_inspect.get(&loop_item.loop_id) {
-                    let mut total_inp = 0u64;
-                    let mut total_out = 0u64;
+                    let mut total_tokens = 0u64;
+                    let mut total_cost = 0.0f64;
+                    let mut any_priced = false;
                     for round in &inspect_data.rounds {
                         let (inp, out) = round_total_tokens(round);
-                        total_inp += inp;
-                        total_out += out;
+                        total_tokens += inp + out;
+                        if let Some(c) = calculate_loop_round_cost(
+                            &app.pricing,
+                            loop_item.model_implementor.as_deref(),
+                            loop_item.model_reviewer.as_deref(),
+                            round,
+                        ) {
+                            total_cost += c;
+                            any_priced = true;
+                        }
                     }
-                    let tokens = format_tokens(total_inp + total_out);
-                    let cost_val = calculate_loop_round_cost(
-                        &app.pricing,
-                        loop_item.model_implementor.as_deref(),
-                        loop_item.model_reviewer.as_deref(),
-                        total_inp,
-                        total_out,
-                    );
-                    let cost = format_cost(cost_val);
+                    let tokens = format_tokens(total_tokens);
+                    let cost = format_cost(if any_priced { Some(total_cost) } else { None });
                     (tokens, cost)
                 } else {
                     ("-".to_string(), "-".to_string())
@@ -1841,7 +1885,7 @@ fn render_loop_selector(app: &App, theme: &Theme) -> List<'static> {
         .highlight_style(
             Style::default()
                 .fg(theme.text)
-                .bg(theme.surface)
+                .bg(theme.border)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("> ")
@@ -1921,7 +1965,7 @@ fn render_logs(app: &App, area: Rect, theme: &Theme) -> Paragraph<'static> {
     } else {
         app.logs
             .iter()
-            .map(|line| Line::from(Span::styled(line.clone(), Style::default().fg(theme.text))))
+            .map(|line| Line::from(Span::styled(line.as_str().to_owned(), Style::default().fg(theme.text))))
             .collect()
     };
 
@@ -2548,15 +2592,15 @@ mod tests {
             ..loop_summary(id, "alice", "2026-04-10T10:00:00Z")
         }]);
 
-        // Press x -> should set cancel_confirm_pending
+        // Press x -> should set cancel_confirm_at
         let action = app.handle_input(KeyEvent::from(KeyCode::Char('x')));
         assert_eq!(action, AppAction::None);
-        assert!(app.cancel_confirm_pending);
+        assert!(app.cancel_confirm_at.is_some());
 
         // Press y -> should trigger cancel
         let action = app.handle_input(KeyEvent::from(KeyCode::Char('y')));
         assert_eq!(action, AppAction::Trigger(LoopCommand::Cancel));
-        assert!(!app.cancel_confirm_pending);
+        assert!(app.cancel_confirm_at.is_none());
     }
 
     #[test]
@@ -2569,12 +2613,33 @@ mod tests {
         }]);
 
         app.handle_input(KeyEvent::from(KeyCode::Char('x')));
-        assert!(app.cancel_confirm_pending);
+        assert!(app.cancel_confirm_at.is_some());
 
         // Press 'n' -> should abort
         let action = app.handle_input(KeyEvent::from(KeyCode::Char('n')));
         assert_eq!(action, AppAction::None);
-        assert!(!app.cancel_confirm_pending);
+        assert!(app.cancel_confirm_at.is_none());
+    }
+
+    #[test]
+    fn cancel_confirmation_times_out_after_3s() {
+        let mut app = App::new(false, &default_helm_config());
+        let id = uuid::Uuid::new_v4();
+        app.set_loops(vec![LoopSummary {
+            state: "IMPLEMENTING".to_string(),
+            ..loop_summary(id, "alice", "2026-04-10T10:00:00Z")
+        }]);
+
+        app.handle_input(KeyEvent::from(KeyCode::Char('x')));
+        assert!(app.cancel_confirm_at.is_some());
+
+        // Simulate 4 seconds passing
+        app.cancel_confirm_at = Some(Instant::now() - Duration::from_secs(4));
+
+        // Press y after timeout -> should NOT trigger cancel
+        let action = app.handle_input(KeyEvent::from(KeyCode::Char('y')));
+        assert_eq!(action, AppAction::None);
+        assert!(app.cancel_confirm_at.is_none());
     }
 
     #[test]

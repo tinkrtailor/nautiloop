@@ -940,11 +940,52 @@ pub async fn diff(
     // FR-5d: truncate at 100KB
     let max_bytes: usize = 100 * 1024;
 
-    let _ = query.round; // Reserved for future per-round scoping
+    // Per-round scoping: if round is specified, diff only that round's commits
+    let (diff_branch, diff_base) = if let Some(round_num) = query.round {
+        // Look up round records to find commit SHAs
+        let rounds = state.store.get_rounds(id).await?;
+
+        // Find the latest SHA produced in the requested round (from implement or revise output)
+        let round_sha = rounds
+            .iter()
+            .filter(|r| r.round == round_num)
+            .filter_map(|r| {
+                r.output.as_ref().and_then(|o| {
+                    o.get("new_sha").and_then(|v| v.as_str().map(|s| s.to_string()))
+                })
+            })
+            .next_back();
+
+        let round_sha = round_sha.ok_or_else(|| {
+            NautiloopError::BadRequest(format!(
+                "No commit SHA found for round {round_num}. The round may not have completed an implement or revise stage."
+            ))
+        })?;
+
+        // Find the previous round's last SHA as the base
+        let prev_sha = if round_num > 1 {
+            rounds
+                .iter()
+                .filter(|r| r.round == round_num - 1)
+                .filter_map(|r| {
+                    r.output.as_ref().and_then(|o| {
+                        o.get("new_sha").and_then(|v| v.as_str().map(|s| s.to_string()))
+                    })
+                })
+                .next_back()
+                .unwrap_or_else(|| base_ref.clone())
+        } else {
+            base_ref.clone()
+        };
+
+        (round_sha, prev_sha)
+    } else {
+        (record.branch.clone(), base_ref)
+    };
 
     let diff_text = state
         .git
-        .diff(&record.branch, &base_ref, Some(max_bytes))
+        .diff(&diff_branch, &diff_base, Some(max_bytes))
         .await?;
 
     let truncated = diff_text.contains("[truncated");

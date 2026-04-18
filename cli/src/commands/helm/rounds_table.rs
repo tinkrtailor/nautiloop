@@ -89,8 +89,8 @@ pub fn render_table(cfg: &RoundsTableConfig<'_>) -> Paragraph<'static> {
         let total_tokens = inp + out;
         let tokens_text = format_tokens(total_tokens);
 
-        // Cost column
-        let cost = calculate_loop_round_cost(pricing, cfg.model_implementor, cfg.model_reviewer, inp, out);
+        // Cost column (split by stage: implementor vs reviewer pricing)
+        let cost = calculate_loop_round_cost(pricing, cfg.model_implementor, cfg.model_reviewer, round);
         let cost_text = format_cost(cost);
 
         // Duration column
@@ -107,16 +107,13 @@ pub fn render_table(cfg: &RoundsTableConfig<'_>) -> Paragraph<'static> {
         );
 
         let bg = if is_selected {
-            theme.surface
+            theme.border // distinct from surface for visible highlight
         } else {
             theme.bg
         };
 
-        let fg = if is_selected {
-            theme.text
-        } else {
-            verdict_color
-        };
+        // Keep verdict color visible for selected rows too
+        let fg = verdict_color;
 
         let mut style = Style::default().fg(fg).bg(bg);
         if is_selected {
@@ -176,7 +173,7 @@ pub fn render_detail(cfg: &RoundDetailConfig<'_>) -> Paragraph<'static> {
 
     // Summary info
     let (inp, out) = round_total_tokens(round);
-    let cost = calculate_loop_round_cost(pricing, *model_implementor, *model_reviewer, inp, out);
+    let cost = calculate_loop_round_cost(pricing, *model_implementor, *model_reviewer, round);
     let duration = round_duration_secs(round);
 
     lines.push(Line::from(vec![

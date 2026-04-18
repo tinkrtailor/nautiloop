@@ -63,8 +63,7 @@ pub fn build_header(
                     pricing,
                     l.model_implementor.as_deref(),
                     l.model_reviewer.as_deref(),
-                    inp,
-                    out,
+                    round,
                 );
                 match cost {
                     Some(c) => total_cost += c,
@@ -91,7 +90,19 @@ pub fn build_header(
     if harden_count > 0 { stage_parts.push(format!("{harden_count} harden")); }
     if awaiting_count > 0 { stage_parts.push(format!("{awaiting_count} awaiting")); }
 
-    let prefix = if team { "nautiloop · team view" } else { "nautiloop" };
+    let prefix = if team {
+        // FR-1c: label by engineer in team view
+        let mut engineer_counts: HashMap<&str, usize> = HashMap::new();
+        for l in &non_terminal {
+            *engineer_counts.entry(l.engineer.as_str()).or_default() += 1;
+        }
+        let mut engineers: Vec<_> = engineer_counts.into_iter().collect();
+        engineers.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        let eng_parts: Vec<String> = engineers.iter().map(|(e, c)| format!("{e}:{c}")).collect();
+        format!("nautiloop · team [{}]", eng_parts.join(" "))
+    } else {
+        "nautiloop".to_string()
+    };
     let stages = stage_parts.join(" · ");
 
     format!(
@@ -157,9 +168,21 @@ mod tests {
     }
 
     #[test]
-    fn header_team_view() {
+    fn header_team_view_empty() {
         let header = build_header(&[], &HashMap::new(), &PricingConfig::default(), true);
         assert!(header.contains("team view"));
+    }
+
+    #[test]
+    fn header_team_view_labels_engineers() {
+        let mut l1 = make_loop("IMPLEMENTING");
+        l1.engineer = "alice".to_string();
+        let mut l2 = make_loop("IMPLEMENTING");
+        l2.engineer = "bob".to_string();
+        let header = build_header(&[l1, l2], &HashMap::new(), &PricingConfig::default(), true);
+        assert!(header.contains("team"));
+        assert!(header.contains("alice:1"));
+        assert!(header.contains("bob:1"));
     }
 
     #[test]
