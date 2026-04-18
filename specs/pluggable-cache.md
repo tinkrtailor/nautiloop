@@ -46,7 +46,7 @@ These are all "give me a writable directory, I'll manage it." Nautiloop shouldn'
 
 ### FR-1: One shared cache PVC
 
-**FR-1a.** Terraform + dev manifests provision a **single** PVC named `nautiloop-cache` in `nautiloop-jobs` namespace. RWO. Default size: 50 GiB. Dev manifest bumped from 20 GiB to 50 GiB to match the existing Terraform default.
+**FR-1a.** Terraform + dev manifests provision a **single** PVC named `nautiloop-cache` in `nautiloop-jobs` namespace. RWO. Default size: 50 GiB. Dev manifest keeps its current 20 GiB size — dev clusters don't need 50 GiB of cache, and changing the size would require deleting and recreating the PVC since local-path provisioner does not support resize. Terraform default remains 50 GiB for production clusters.
 
 **FR-1b.** Previous PVC name `nautiloop-cargo-cache` is renamed to `nautiloop-cache`. The terraform variable is renamed `cargo_cache_volume_size` → `cache_volume_size` with a deprecation alias for one release. Note: Terraform cannot rename a PVC in-place — changing the PVC name produces a destroy-then-create plan. Migration path: use `terraform state mv` to rename the resource in Terraform state before applying, or accept cache data loss (one cold refill). See also NFR-1 and AC-5.
 
@@ -101,7 +101,7 @@ GRADLE_USER_HOME = "/cache/gradle"
 
 **FR-3d.** `[cache] disabled = true` skips both the `/cache` mount and ALL cache env vars (including the default sccache ones). Single flag for "run without caching."
 
-**FR-3e.** Cache config is repo-level only. The `[cache]` section is read from the repo's nemo.toml; cluster and engineer configs do not contribute cache settings. If `[cache]` appears in cluster or engineer configs, it is **silently ignored** — the repo-level nemo.toml is the sole source for cache configuration. The `CacheConfig` field should only be present on the repo-layer config struct, not on the cluster or engineer config structs, so serde never deserializes it from those layers. If multi-layer cache config is needed in the future, env maps would merge with higher-priority layers winning per-key — but that is out of scope for this spec.
+**FR-3e.** Cache config is repo-level only. The `[cache]` section is read from the repo's nemo.toml; cluster and engineer configs do not contribute cache settings. If `[cache]` appears in cluster or engineer configs, it is **silently ignored** — the repo-level nemo.toml is the sole source for cache configuration. The `CacheConfig` field should only be present on the repo-layer config struct (`RepoConfig` in `config/repo.rs`), not on the cluster or engineer config structs, so serde never deserializes it from those layers. At merge time, the `Option<CacheConfig>` from `RepoConfig` is copied onto `NautiloopConfig` (the runtime config struct used by the job builder). If multi-layer cache config is needed in the future, env maps would merge with higher-priority layers winning per-key — but that is out of scope for this spec.
 
 ### FR-4: No validation of tool binary presence
 
@@ -130,7 +130,7 @@ variable "cargo_cache_volume_size" {
 
 **FR-5b.** `terraform/modules/nautiloop/k8s.tf` provisions exactly one PVC named `nautiloop-cache` with size `coalesce(var.cargo_cache_volume_size, var.cache_volume_size)`.
 
-**FR-5c.** The #148 `cache_backends` map variable is removed (it never landed in a production deployment since #148's spec was not yet implemented). No migration needed.
+**FR-5c.** The #148 `cache_backends` design is superseded and will not be implemented. The `cache_backends` variable exists only in the earlier spec document — it was never implemented in terraform code. No code removal needed.
 
 ### FR-6: `nemo cache show` CLI command
 
@@ -140,7 +140,7 @@ variable "cargo_cache_volume_size" {
 Cache volume: nautiloop-cache (50 GiB)
 Disk usage:   2.1 GiB / 50 GiB (4%)
 
-Active env vars (from nemo.toml [cache.env] on origin/main):
+Active env vars (from control-plane config):
   RUSTC_WRAPPER        = sccache
   SCCACHE_DIR          = /cache/sccache
   SCCACHE_CACHE_SIZE   = 15G
@@ -159,15 +159,15 @@ If no running agent pod with `/cache` is available for disk inspection:
 Cache volume: nautiloop-cache (50 GiB)
 Disk usage:   unavailable (no running pod)
 
-Active env vars (from nemo.toml [cache.env] on origin/main):
+Active env vars (from control-plane config):
   RUSTC_WRAPPER        = sccache
   ...
 ```
 
 **FR-6b.** Backed by a new `GET /cache` endpoint (read-only, no new state). This follows the existing flat route pattern (`/start`, `/status`, `/logs/{id}`, etc.) rather than introducing a new `/dashboard` namespace. The endpoint returns:
 
-1. The resolved `[cache.env]` from the repo's nemo.toml (or the sccache defaults if `[cache]` is absent).
-2. Disk usage via `du -sh /cache/*` executed on the most recent **running** agent pod that has the `/cache` mount. Only running pods accept `kubectl exec`; completed pods have exited containers and cannot be exec'd into. Since agent pods typically complete quickly, the window for a running pod is small — disk usage will frequently be `unavailable`. If no running pod with `/cache` is found (all pods completed/garbage-collected or none have run yet), the disk-usage section is omitted and the CLI displays `Disk usage: unavailable (no running pod)`. No ephemeral pod or debug container is spawned to inspect the PVC.
+1. The resolved cache env vars **as loaded by the control plane process** (i.e., the config that would be applied to the next job), or the sccache defaults if `[cache]` is absent from the loaded config. This is the config from `NAUTILOOP_CONFIG_PATH` / `/etc/nautiloop/nemo.toml`, not read live from the git repo. If the repo's nemo.toml has been updated but the control plane hasn't reloaded, the endpoint shows the stale config — this is expected and matches how other config-driven behavior works.
+2. Disk usage via `du -sh /cache/*` executed on a running agent pod. **Pod selection:** list pods in `nautiloop-jobs` namespace with label `nautiloop.dev/stage` in (`implement`, `revise`) that are in `Running` phase, sorted by creation timestamp descending, and exec into the first one found. Only running pods accept `kubectl exec`; completed pods have exited containers and cannot be exec'd into. Since agent pods typically complete quickly, the window for a running pod is small — disk usage will frequently be `unavailable`. If no running pod is found (all pods completed/garbage-collected or none have run yet), the disk-usage section is omitted and the CLI displays `Disk usage: unavailable (no running pod)`. No ephemeral pod or debug container is spawned to inspect the PVC. If multiple running pods exist, the most recently created one is used (arbitrary but deterministic).
 3. Per-subdirectory size breakdown from the same `du` output.
 
 Hit-rate stats (e.g., sccache compile hit rate) are **descoped** from this spec. The log capture pipeline does not currently emit structured stats lines, and defining the format + parsing logic is non-trivial. Hit-rate display will be addressed in a follow-up spec. The example output in FR-6a is aspirational; the initial implementation omits the "Observed in recent loops" section and shows only config + disk usage.
@@ -188,10 +188,10 @@ Job_builder does NOT list known backends. It reads `[cache.env]`, iterates, and 
 
 ### NFR-3: Tests
 
-- **Unit** (`control-plane/src/k8s/job_builder.rs`): `[cache.env]` with N entries produces N `EnvVar` entries on implement/revise pods; zero on review/audit/test.
-- **Unit**: `[cache] disabled = true` skips both mount and env vars.
-- **Unit**: absent `[cache]` section uses sccache defaults.
-- **Unit**: `[cache]` present with empty or missing `[cache.env]` produces zero cache env vars (sccache defaults do NOT apply).
+- **Unit** (`control-plane/src/k8s/job_builder.rs`): `[cache.env]` with N entries produces N `EnvVar` entries on implement/revise pods; zero on review/audit/test. These tests construct `JobBuildConfig` directly with resolved cache config — they test env-var/mount injection, not default resolution.
+- **Unit**: `[cache] disabled = true` skips both mount and env vars (tested at `job_builder` level via `JobBuildConfig`).
+- **Unit** (`control-plane/src/config/mod.rs` or `config/repo.rs`): absent `[cache]` section (`Option<CacheConfig>` is `None`) → sccache defaults are injected. This tests the default-injection logic at the config resolution layer, where `NautiloopConfig` or `JobBuildConfig` is constructed from the parsed config.
+- **Unit**: `[cache]` present with empty or missing `[cache.env]` produces zero cache env vars (sccache defaults do NOT apply). Tested at the same config resolution layer.
 - **Integration**: build a job with a custom `[cache.env] FOO = "/cache/foo"`, verify `FOO` env var lands in the pod spec.
 
 ## Acceptance Criteria
@@ -220,8 +220,10 @@ Job_builder does NOT list known backends. It reads `[cache.env]`, iterates, and 
 
 ## Files Likely Touched
 
-- `control-plane/src/config/mod.rs` — add `Option<CacheConfig>` field to `NautiloopConfig` (see FR-3b implementation note). `CacheConfig` struct contains `disabled: bool` and `env: HashMap<String, String>`.
-- `control-plane/src/k8s/job_builder.rs` — rename volume claim reference, change mount path to `/cache`, replace hardcoded sccache env with iterate-over-config.
+- `control-plane/src/config/repo.rs` — add `Option<CacheConfig>` to `RepoConfig` (serde source for repo-layer nemo.toml). `CacheConfig` struct contains `disabled: bool` and `env: HashMap<String, String>`.
+- `control-plane/src/config/mod.rs` — add `Option<CacheConfig>` field to `NautiloopConfig` (runtime config, see FR-3b implementation note). Populated from `RepoConfig` during merge.
+- `control-plane/src/k8s/job_builder.rs` — rename volume claim reference, change mount path to `/cache`, replace hardcoded sccache env with iterate-over-config. `JobBuildConfig` struct needs a cache config field so resolved cache env vars and disabled flag flow from `NautiloopConfig` → `JobBuildConfig` → `build_agent_env_vars()` / `build_agent_mounts()`.
+- `control-plane/src/loop/driver.rs` — `job_build_config` method must populate the new cache config field on `JobBuildConfig` from `NautiloopConfig`.
 - `dev/k8s/01-storage.yaml` — rename PVC.
 - `terraform/modules/nautiloop/variables.tf` — rename variable, keep deprecated alias, remove #148 `cache_backends` map.
 - `terraform/modules/nautiloop/k8s.tf` — rename PVC.
