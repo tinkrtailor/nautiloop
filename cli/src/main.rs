@@ -53,7 +53,7 @@ enum Commands {
         #[arg(long)]
         no_harden: bool,
 
-        /// Deprecated: harden is now the default. This flag has no effect.
+        /// Deprecated: harden is now the default. Passing this flag only emits a deprecation warning.
         #[arg(long)]
         harden: bool,
 
@@ -224,6 +224,12 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    // Fail fast on contradictory flags before any side effects (config loading,
+    // credential checks, HTTP client construction).
+    if let Commands::Start { harden, no_harden, .. } = cli.command {
+        commands::start::validate_harden_flags(harden, no_harden)?;
+    }
+
     // Handle config command before loading config — a broken config file
     // must not prevent `nemo config --set` from working.
     if let Commands::Config { ref set, ref get } = cli.command {
@@ -306,9 +312,7 @@ async fn main() -> anyhow::Result<()> {
             model_impl,
             model_review,
         } => {
-            if harden && no_harden {
-                anyhow::bail!("Cannot use --harden and --no-harden together. --harden is deprecated; remove it.");
-            }
+            // Conflict check already done above (before config loading).
             if let Some(warning) = commands::start::deprecation_warning(harden) {
                 eprintln!("{warning}");
             }

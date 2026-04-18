@@ -113,13 +113,24 @@ fn phase_plan_label(args: &StartArgs<'_>) -> &'static str {
         "HARDEN"
     } else if args.harden {
         if args.auto_approve {
-            "HARDEN \u{2192} IMPLEMENT (add --no-harden to skip harden)"
+            "HARDEN \u{2192} IMPLEMENT"
         } else {
             "HARDEN \u{2192} AWAITING_APPROVAL \u{2192} IMPLEMENT (add --no-harden to skip harden)"
         }
     } else {
         "IMPLEMENT (harden skipped)"
     }
+}
+
+/// Validate that `--harden` and `--no-harden` are not both provided.
+/// Returns Ok(()) if valid, or an error with the spec-prescribed message.
+pub fn validate_harden_flags(harden: bool, no_harden: bool) -> Result<()> {
+    if harden && no_harden {
+        anyhow::bail!(
+            "Cannot use --harden and --no-harden together. --harden is deprecated; remove it."
+        );
+    }
+    Ok(())
 }
 
 /// Return a deprecation warning if the `--harden` flag was explicitly passed.
@@ -317,18 +328,38 @@ mod tests {
         assert_eq!(deprecation_warning(false), None);
     }
 
-    /// NFR-3: --harden --no-harden together parses but is caught by manual check.
-    /// The manual check in main.rs produces the spec-prescribed error message:
-    /// "Cannot use --harden and --no-harden together. --harden is deprecated; remove it."
+    /// NFR-3: --harden --no-harden together parses at clap level but is caught
+    /// by validate_harden_flags with the spec-prescribed error message.
     #[test]
     fn test_harden_and_no_harden_both_parse() {
         use clap::Parser;
 
-        // Both flags parse successfully (manual conflict check is in main.rs, not clap)
+        // Both flags parse successfully (conflict check is in validate_harden_flags, not clap)
         let cli = crate::Cli::try_parse_from([
             "nemo", "start", "specs/foo.md", "--harden", "--no-harden",
         ]);
         assert!(cli.is_ok(), "clap should parse both flags; conflict is checked manually");
+    }
+
+    /// NFR-3: validate_harden_flags returns the spec-prescribed error message
+    /// when both --harden and --no-harden are set.
+    #[test]
+    fn test_validate_harden_flags_both_set_returns_error() {
+        let result = validate_harden_flags(true, true);
+        assert!(result.is_err(), "both flags set must return error");
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert_eq!(
+            err_msg,
+            "Cannot use --harden and --no-harden together. --harden is deprecated; remove it."
+        );
+    }
+
+    /// NFR-3: validate_harden_flags accepts valid flag combinations.
+    #[test]
+    fn test_validate_harden_flags_valid_combinations() {
+        assert!(validate_harden_flags(false, false).is_ok(), "neither flag is valid");
+        assert!(validate_harden_flags(true, false).is_ok(), "--harden only is valid");
+        assert!(validate_harden_flags(false, true).is_ok(), "--no-harden only is valid");
     }
 
     /// FR-4a: default output shows HARDEN → AWAITING_APPROVAL → IMPLEMENT phase plan
@@ -381,7 +412,7 @@ mod tests {
         };
         assert_eq!(
             phase_plan_label(&args),
-            "HARDEN \u{2192} IMPLEMENT (add --no-harden to skip harden)"
+            "HARDEN \u{2192} IMPLEMENT"
         );
     }
 
