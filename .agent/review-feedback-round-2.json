@@ -1,0 +1,54 @@
+{
+  "round": 2,
+  "source": "review",
+  "issues": [
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "cli/src/commands/cache.rs",
+      "line": 46,
+      "description": "Double 'Disk usage:' output when disk_usage is Some but subdirectories is empty. Lines 31-34 print 'Disk usage: <total> / <cap> GiB', then line 46 prints 'Disk usage: empty (no cache subdirectories)'. The user sees two conflicting 'Disk usage:' lines.",
+      "suggestion": "Remove the second 'Disk usage:' line at line 46 or change it to a different label like 'Subdirectories: none'. Alternatively, restructure so only one 'Disk usage:' line is printed regardless of subdirectory state."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "cli/src/commands/cache.rs",
+      "line": 32,
+      "description": "FR-6a specifies 'Disk usage: 2.1 GiB / 50 GiB (4%)' with a percentage. The CLI prints 'Disk usage: {total} / {cap} GiB' without computing or displaying the percentage. The 'total' value comes from `du -sh` which outputs sizes like '2.1G' not '2.1 GiB', creating a unit mismatch ('2.1G / 50 GiB').",
+      "suggestion": "Parse the du output size to bytes, compute percentage against volume_capacity_gi, and format as 'Disk usage: 2.1 GiB / 50 GiB (4%)'. Normalize the du output unit to GiB for consistency."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/cache.rs",
+      "line": 27,
+      "description": "When cache is disabled (resolved.disabled == true), the endpoint still returns volume_name and attempts PVC/pod inspection via kube API. FR-3d says disabled skips both mount and env vars. The API response with disabled=true should arguably skip the disk usage lookup since no /cache mount exists, but it wastes a kube API call looking for PVC capacity and running pods that won't have /cache mounted.",
+      "suggestion": "Short-circuit before the kube API calls when resolved.disabled is true: set disk_usage=None and volume_capacity_gi=None, avoiding unnecessary API calls."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/config/repo.rs",
+      "line": 133,
+      "description": "The doc comment on RepoConfig.cache says 'Uses `Option` (not `#[serde(default)]`)' but the field has `#[serde(default)]` attribute. The spec's FR-3b implementation note says this about NautiloopConfig (which is correct — no #[serde(default)] there), but the RepoConfig doc comment is a copy-paste that contradicts the actual code. While functionally harmless (Option<T> defaults to None either way), the self-contradictory documentation could confuse future maintainers.",
+      "suggestion": "Either remove `#[serde(default)]` from the RepoConfig.cache field (it's redundant for Option), or update the doc comment to not claim it's absent."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "control-plane/src/api/cache.rs",
+      "line": 189,
+      "description": "The exec call converts &[&str] to Vec<String> via `.iter().map(|s| s.to_string()).collect::<Vec<_>>()`. kube-rs exec accepts `impl IntoIterator<Item = impl Into<String>>`, so the slice could be passed more directly. Minor ergonomic issue.",
+      "suggestion": "Pass `command` directly or use a simpler conversion. Not a correctness issue."
+    },
+    {
+      "severity": "low",
+      "category": "style",
+      "file": "control-plane/src/api/cache.rs",
+      "line": 175,
+      "description": "Function is named `exec_du` but it's a generic exec helper that could run any command. The name is misleading since it's called for both 'du -sh /cache' and 'du -sh /cache/*'.",
+      "suggestion": "Rename to `exec_command` or `exec_in_pod` for clarity, or keep as-is since it's only used for du commands in this module."
+    }
+  ]
+}
