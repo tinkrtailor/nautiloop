@@ -40,7 +40,6 @@ pub struct NautiloopConfig {
     /// `None` = absent from nemo.toml → sccache defaults injected at resolution time.
     /// `Some` with empty env → no cache env vars. Uses `Option` (not `#[serde(default)]`)
     /// so absent vs present-but-empty are distinguishable (FR-3b).
-    #[serde(default)]
     pub cache: Option<CacheConfig>,
 }
 

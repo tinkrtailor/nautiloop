@@ -25,24 +25,69 @@ pub async fn cache_show(
     Query(_query): Query<CacheQuery>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let resolved = state.config.resolved_cache_config();
+    let namespace = &state.config.cluster.jobs_namespace;
 
-    // Attempt disk usage from a running pod if we have a kube client.
-    let disk_usage = if let Some(ref client) = state.kube_client {
-        get_cache_disk_usage(client, &state.config.cluster.jobs_namespace).await
+    let (disk_usage, volume_capacity_gi) = if let Some(ref client) = state.kube_client {
+        let disk = get_cache_disk_usage(client, namespace).await;
+        let cap = get_pvc_capacity(client, namespace).await;
+        (disk, cap)
     } else {
-        None
+        (None, None)
     };
 
     let response = CacheResponse {
         disabled: resolved.disabled,
         env: resolved.env,
+        volume_name: "nautiloop-cache".to_string(),
+        volume_capacity_gi,
         disk_usage,
     };
 
     Ok((StatusCode::OK, Json(response)))
 }
 
-/// Exec `du -sh /cache/*` on a running implement/revise pod.
+/// Read the PVC's `status.capacity["storage"]` to get the provisioned size in GiB.
+async fn get_pvc_capacity(client: &kube::Client, namespace: &str) -> Option<u64> {
+    use k8s_openapi::api::core::v1::PersistentVolumeClaim;
+    use kube::api::Api;
+
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), namespace);
+
+    let pvc = match pvcs.get("nautiloop-cache").await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!("Failed to get nautiloop-cache PVC: {e}");
+            return None;
+        }
+    };
+
+    // Read from status.capacity.storage (the actual provisioned size).
+    let storage = pvc
+        .status?
+        .capacity?
+        .get("storage")?
+        .0
+        .clone();
+
+    // Parse quantity string like "50Gi" or "20Gi" → u64 GiB.
+    parse_gi_quantity(&storage)
+}
+
+/// Parse a Kubernetes quantity string (e.g. "50Gi", "20Gi") to GiB as u64.
+fn parse_gi_quantity(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Some(num) = s.strip_suffix("Gi") {
+        num.parse().ok()
+    } else if let Some(num) = s.strip_suffix("G") {
+        // G = 10^9 bytes, Gi = 2^30 bytes. Approximate.
+        num.parse::<u64>().ok()
+    } else {
+        // Try parsing as raw bytes and convert to GiB.
+        s.parse::<u64>().ok().map(|b| b / (1024 * 1024 * 1024))
+    }
+}
+
+/// Exec `du` on a running implement/revise pod to get cache disk usage.
 /// Returns None if no running pod is found or exec fails.
 ///
 /// Since agent pods typically complete quickly, the window for a running pod is
@@ -53,7 +98,7 @@ async fn get_cache_disk_usage(
     namespace: &str,
 ) -> Option<CacheDiskUsage> {
     use k8s_openapi::api::core::v1::Pod;
-    use kube::api::{Api, AttachParams, ListParams};
+    use kube::api::{Api, ListParams};
 
     let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
 
@@ -90,56 +135,85 @@ async fn get_cache_disk_usage(
     let pod = running_pods.first()?;
     let pod_name = pod.metadata.name.as_deref()?;
 
-    // Exec `du -sh /cache/*` in the agent container.
-    let ap = AttachParams::default()
-        .container("agent")
-        .stdout(true)
-        .stderr(true);
-
-    let mut exec = match pods
-        .exec(pod_name, vec!["du", "-sh", "/cache/*"], &ap)
+    // Get total size first: `du -sh /cache`
+    let total = exec_du(&pods, pod_name, &["sh", "-c", "du -sh /cache 2>/dev/null"])
         .await
-    {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::debug!("Failed to exec into pod {pod_name} for cache disk usage: {e}");
-            return None;
-        }
-    };
+        .and_then(|output| {
+            output.lines().next().and_then(|line| {
+                let parts: Vec<&str> = line.split('\t').collect();
+                if parts.len() == 2 {
+                    Some(parts[0].to_string())
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or_else(|| "0".to_string());
 
-    // Read stdout using the kube-rs async reader.
-    use tokio::io::AsyncReadExt;
-    let stdout = exec.stdout()?;
-    let mut buf = vec![0u8; 65536];
-    let output = match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        async {
-            let mut reader = stdout;
-            reader.read(&mut buf).await
-        },
-    )
-    .await
-    {
-        Ok(Ok(n)) => String::from_utf8_lossy(&buf[..n]).to_string(),
-        _ => {
-            tracing::debug!("Timeout or error reading du output from pod {pod_name}");
-            return None;
-        }
-    };
-
-    // Parse du output: "1.8G\t/cache/sccache\n340M\t/cache/npm\n"
-    let mut subdirectories = std::collections::HashMap::new();
-    for line in output.lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() == 2 {
-            subdirectories.insert(parts[1].to_string(), parts[0].to_string());
-        }
-    }
-
-    let total = format!("{} subdirectories", subdirectories.len());
+    // Get per-subdirectory sizes: `du -sh /cache/*` (needs shell for glob expansion)
+    let subdirectories = exec_du(&pods, pod_name, &["sh", "-c", "du -sh /cache/* 2>/dev/null"])
+        .await
+        .map(|output| {
+            let mut dirs = std::collections::HashMap::new();
+            for line in output.lines() {
+                let parts: Vec<&str> = line.split('\t').collect();
+                if parts.len() == 2 {
+                    dirs.insert(parts[1].to_string(), parts[0].to_string());
+                }
+            }
+            dirs
+        })
+        .unwrap_or_default();
 
     Some(CacheDiskUsage {
         subdirectories,
         total,
     })
+}
+
+/// Execute a command in the agent container of a pod and return stdout as a string.
+async fn exec_du(
+    pods: &kube::api::Api<k8s_openapi::api::core::v1::Pod>,
+    pod_name: &str,
+    command: &[&str],
+) -> Option<String> {
+    use kube::api::AttachParams;
+    use tokio::io::AsyncReadExt;
+
+    let ap = AttachParams::default()
+        .container("agent")
+        .stdout(true)
+        .stderr(false);
+
+    let mut exec = match pods
+        .exec(pod_name, command.iter().map(|s| s.to_string()).collect::<Vec<_>>(), &ap)
+        .await
+    {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::debug!("Failed to exec into pod {pod_name}: {e}");
+            return None;
+        }
+    };
+
+    // Read all stdout using the kube-rs async reader.
+    let stdout = exec.stdout()?;
+    let mut output = String::new();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        async {
+            let mut reader = stdout;
+            reader.read_to_string(&mut output).await
+        },
+    )
+    .await;
+
+    match result {
+        Ok(Ok(_)) => Some(output),
+        _ => {
+            tracing::debug!("Timeout or error reading exec output from pod {pod_name}");
+            // Return whatever we got so far, if anything.
+            if output.is_empty() { None } else { Some(output) }
+        }
+    }
 }

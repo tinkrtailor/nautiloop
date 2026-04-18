@@ -81,6 +81,9 @@ pub struct WorktreeInfo {
 pub struct CacheResponse {
     pub disabled: bool,
     pub env: std::collections::HashMap<String, String>,
+    pub volume_name: String,
+    #[serde(default)]
+    pub volume_capacity_gi: Option<u64>,
     pub disk_usage: Option<CacheDiskUsage>,
 }
 
