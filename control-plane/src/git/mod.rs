@@ -83,6 +83,10 @@ pub trait GitOperations: Send + Sync + 'static {
     /// Delete a branch from the remote. Used to clean up orphaned remote branches
     /// when a post-push step (e.g., set_current_sha) fails.
     async fn delete_remote_branch(&self, branch: &str) -> Result<()>;
+
+    /// Compute a unified diff between a branch and its base (origin/main).
+    /// Returns the diff text, truncated to `max_bytes` if specified.
+    async fn diff(&self, branch: &str, base_ref: &str, max_bytes: Option<usize>) -> Result<String>;
 }
 
 /// Real git operations on a bare repository.
@@ -780,6 +784,24 @@ pub mod bare {
                 })?;
             Ok(())
         }
+
+        async fn diff(&self, branch: &str, base_ref: &str, max_bytes: Option<usize>) -> Result<String> {
+            let diff_range = format!("{base_ref}...{branch}");
+            let output = self.run_git(&["diff", &diff_range]).await.map_err(|e| {
+                crate::error::NautiloopError::Git(format!(
+                    "Failed to compute diff {diff_range}: {e}"
+                ))
+            })?;
+            match max_bytes {
+                Some(max) if output.len() > max => {
+                    let truncated = &output[..max];
+                    // Find last newline to avoid cutting mid-line
+                    let cut = truncated.rfind('\n').unwrap_or(max);
+                    Ok(format!("{}\n\n[truncated — open PR for full diff]", &output[..cut]))
+                }
+                _ => Ok(output),
+            }
+        }
     }
 }
 
@@ -1008,6 +1030,10 @@ pub mod mock {
 
         async fn delete_remote_branch(&self, _branch: &str) -> Result<()> {
             Ok(())
+        }
+
+        async fn diff(&self, _branch: &str, _base_ref: &str, _max_bytes: Option<usize>) -> Result<String> {
+            Ok(String::new())
         }
     }
 }
