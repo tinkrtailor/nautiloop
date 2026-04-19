@@ -249,6 +249,52 @@ mod tests {
     }
 
     #[test]
+    fn json_and_markdown_content_parity() {
+        let json = build_json();
+
+        // Verify workflow count and names match between JSON and Markdown.
+        let json_workflows = json["workflows"].as_array().unwrap();
+        let json_workflow_names: Vec<&str> = json_workflows
+            .iter()
+            .map(|w| w["name"].as_str().unwrap())
+            .collect();
+
+        // The Markdown template has "### Workflow N: <name>" headings.
+        let md_workflow_count = HELP_AI_TEMPLATE
+            .lines()
+            .filter(|l| l.starts_with("### Workflow"))
+            .count();
+
+        assert_eq!(
+            json_workflow_names.len(),
+            md_workflow_count,
+            "JSON has {} workflows but Markdown has {} workflow headings",
+            json_workflow_names.len(),
+            md_workflow_count,
+        );
+
+        // Verify all state names in JSON appear in the Markdown template.
+        let json_states = json["state_machine"]["states"].as_array().unwrap();
+        for state in json_states {
+            let name = state["name"].as_str().unwrap();
+            assert!(
+                HELP_AI_TEMPLATE.contains(name),
+                "JSON state {name} not found in Markdown template"
+            );
+        }
+
+        // Verify recovery playbook states in JSON match headings in Markdown.
+        let json_playbooks = json["recovery_playbooks"].as_array().unwrap();
+        for playbook in json_playbooks {
+            let state = playbook["state"].as_str().unwrap();
+            assert!(
+                HELP_AI_TEMPLATE.contains(state),
+                "JSON recovery playbook state {state} not found in Markdown template"
+            );
+        }
+    }
+
+    #[test]
     fn json_state_machine_has_all_states() {
         let json = build_json();
         let states = json["state_machine"]["states"].as_array().unwrap();

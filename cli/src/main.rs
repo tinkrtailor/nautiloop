@@ -655,29 +655,22 @@ fn build_help_all_json(root: &clap::Command) -> serde_json::Value {
 }
 
 /// Build the help-all Markdown output.
+///
+/// Uses clap's `render_long_help()` for each subcommand so the output matches
+/// what `nemo help <cmd>` produces (including flags, positional args, and usage).
 fn build_help_all_markdown(root: &clap::Command) -> String {
     let mut out = String::new();
     for sub in root.get_subcommands() {
         let name = sub.get_name();
         out.push_str(&format!("## {name}\n\n"));
-        let text = sub
-            .get_long_about()
-            .or_else(|| sub.get_about())
-            .map(|a| a.to_string())
-            .unwrap_or_default();
-        out.push_str(&text);
+        out.push_str(&sub.clone().render_long_help().to_string());
         out.push_str("\n\n");
 
         // Nested subcommands
         for nested in sub.get_subcommands() {
             let nested_name = nested.get_name();
             out.push_str(&format!("### {name} {nested_name}\n\n"));
-            let nested_text = nested
-                .get_long_about()
-                .or_else(|| nested.get_about())
-                .map(|a| a.to_string())
-                .unwrap_or_default();
-            out.push_str(&nested_text);
+            out.push_str(&nested.clone().render_long_help().to_string());
             out.push_str("\n\n");
         }
     }
