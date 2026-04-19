@@ -1,0 +1,54 @@
+{
+  "round": 10,
+  "source": "review",
+  "issues": [
+    {
+      "severity": "high",
+      "category": "correctness",
+      "file": "cli/src/commands/help_ai.md",
+      "line": 18,
+      "description": "ASCII state machine diagram routes PENDING → (ship/auto) arrow to AWAITING_APPROVAL box (line 31), but the spec requires PENDING → IMPLEMENTING for ship mode / auto-approve. The third vertical line from PENDING feeds into the AWAITING_APPROVAL box alongside the (no-harden) line. This teaches LLMs the wrong mental model: they will believe ship mode requires approval. The transitions table at line 100 is correct ('PENDING | IMPLEMENTING | ship mode / auto-approve'), but the visual diagram — the first thing LLMs read — contradicts it.",
+      "suggestion": "Redraw the ASCII diagram so the (ship/auto) arrow from PENDING bypasses AWAITING_APPROVAL and connects directly to the IMPLEMENTING box. One approach: run the third vertical line from PENDING all the way down to IMPLEMENTING with a label, separate from the other two lines that converge at AWAITING_APPROVAL."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "cli/src/main.rs",
+      "line": 735,
+      "description": "`nemo help` (no args) calls `cmd.print_help()` (short help), but the spec says it should render 'the same output as `nemo --help`'. Clap's `--help` flag invokes `print_long_help()` (long help). While the root Cli struct has no `long_about` so content is nearly identical, the footer text differs: short help shows 'Print help' while long help shows 'Print help (see a summary with -h)'. This is a minor but observable spec violation.",
+      "suggestion": "Change `cmd.print_help()?` to `cmd.print_long_help()?` on line 735 to exactly match `nemo --help` output."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "cli/src/commands/help_ai.rs",
+      "line": 210,
+      "description": "The LoopState drift guard test uses a manual list of 13 variants with a count assertion. If a variant is added to LoopState but someone updates the count AND adds the new variant to the manual list without updating help_ai.md, the test passes incorrectly. The spec recommends using `strum::IntoEnumIterator` or similar for automatic enumeration. More importantly, since the test already imports `nautiloop_control_plane::types::LoopState`, if LoopState derives strum::EnumIter, the manual list becomes unnecessary and the count assertion is automatic.",
+      "suggestion": "If strum is available, derive EnumIter on LoopState and use `LoopState::iter()` instead of a manual list. This eliminates the need for the count assertion since the iterator always matches the enum. If strum is not desirable as a dependency, the current approach is acceptable but fragile."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "cli/src/commands/help_ai.md",
+      "line": 155,
+      "description": "The stale cluster recovery playbook recommends `--server` to override the control plane URL. The spec's FR-1a says 'Stale kubectl context? Don't switch, use `--context=<name>` per command.' These are different concepts: `--server` overrides the nemo API URL, while `--context` is a kubectl flag. However, nemo communicates via its own API, not kubectl directly, so `--server` is actually what nemo can control. The spec's `--context` suggestion appears to be a spec error since nemo has no such flag. The implementation's `--server` advice is more correct than the spec here, but the framing ('Stale cluster connection') is misleading since `--server` doesn't fix kubectl context staleness.",
+      "suggestion": "Reframe the recovery playbook: 'If the control plane URL has changed or you manage multiple clusters, use `--server <url>` to target a specific control plane.' Drop the 'stale cluster' framing since that implies kubectl context issues which are outside nemo's scope."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "cli/src/commands/help_ai.rs",
+      "line": 12,
+      "description": "The help_ai.md Markdown template and the help_ai.rs JSON builder are maintained independently. The json_and_markdown_content_parity test checks workflow counts and state names, but does not verify transition count parity, recovery playbook command parity, or config hierarchy level parity. If someone adds a transition to the Markdown table but forgets the JSON, the test won't catch it.",
+      "suggestion": "Extend the parity test to also check that the JSON transitions array has the same count as table rows in the Markdown under '### All Transitions', and that recovery playbook counts match."
+    },
+    {
+      "severity": "low",
+      "category": "style",
+      "file": "cli/src/commands/auth.rs",
+      "line": 35,
+      "description": "The `#[allow(clippy::too_many_arguments)]` annotation was added to accommodate the new `json` parameter (7 args total). This is a code smell suggesting the function would benefit from a parameter struct.",
+      "suggestion": "Consider grouping parameters into an `AuthOptions` struct if more parameters are added in the future. Acceptable for now with 7 args."
+    }
+  ]
+}
