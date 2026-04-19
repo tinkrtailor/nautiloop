@@ -97,7 +97,7 @@ An LLM can parse that. But a friendlier error would name the recovery path: "Loo
 - **Terminal states**: CONVERGED, HARDENED, FAILED, CANCELLED, SHIPPED — what each means. Note: FAILED is terminal but recoverable via `nemo extend` (which resets max_rounds and resumes the loop from its failed_from_state). The mega-primer should clearly distinguish "terminal unless explicitly extended" so LLM consumers can reason about state reachability.
 - **Typical workflow 1 (implement)**: `nemo start spec.md` → `nemo approve <id>` → `nemo logs <id>` → wait → PR.
 - **Typical workflow 2 (harden-first)**: `nemo start spec.md` → review hardened spec PR → `nemo approve <id>` → watch → PR. (Harden is the default; use `--no-harden` to skip it. The `--harden` flag is deprecated and emits a warning.)
-- **Typical workflow 3 (ship)**: `nemo ship spec.md` → (no approval, no human) → auto-merged PR.
+- **Typical workflow 3 (ship)**: `nemo ship spec.md` → (no approval, no human) → auto-merged PR. Ship skips hardening by default. Use `nemo ship --harden spec.md` to harden first. (This differs from `start`, which hardens by default.)
 - **Recovery playbooks**: AWAITING_REAUTH → `nemo auth --claude` then `nemo resume <id>` (Claude token expiry surfaces as this state, not as an HTTP error — the loop engine detects it internally and transitions the loop). PAUSED → `nemo resume`. FAILED (max rounds) → `nemo extend --add 10 <id>` OR investigate. Stale kubectl context? Don't switch, use `--context=<name>` per command.
 - **Config hierarchy**: engineer (`~/.nemo/config.toml`) > repo (`nemo.toml` on main) > cluster (control plane ConfigMap). Explain which lives where.
 - **Command catalog**: full list with one-line descriptions, same as `nemo --help`, but grouped into categories: loop lifecycle, observability, identity, config.
@@ -209,6 +209,8 @@ See also: nemo status (find loop IDs), nemo logs (watch after approve).
 - `nemo auth --json` — push results as JSON
 - `nemo cache show --json` — **already implemented**; preserve existing output schema
 
+> **Note on excluded commands**: `ps`, `logs`, `helm`, `start`, `ship`, `harden`, `init`, and `config` do not get `--json` in this spec. `ps` output is ephemeral pod-level data primarily useful for debugging, not for agent automation workflows. `logs` streams text. `helm` is a TUI. `start`/`ship`/`harden` are fire-and-forget submission commands whose response is a simple acknowledgment (the loop ID is printed to stdout and is trivially parseable). `init` and `config` are local setup commands. If agent demand emerges for structured `ps` output, it can be added as a follow-up.
+
 > **Note**: `status` and `cache show` already support `--json` with established output schemas. Do not change their existing field names or structure. New `--json` implementations on other commands should follow the same conventions (snake_case keys, `serde_json::to_string_pretty`).
 
 **FR-3b.** JSON output schema documented in `nemo help ai` (FR-1). Stable field names, no presentation-level keys. The JSON output schemas for newly added `--json` commands are:
@@ -297,6 +299,8 @@ See also: nemo status (find loop IDs), nemo logs (watch after approve).
 
 > **SSH provider**: `nemo auth` pushes credentials for three providers by default: `claude`, `openai`, and `ssh`. All three appear in the JSON output. The `messages` field is an array (not a single string) because the auth flow can produce multiple diagnostic messages per provider (e.g., `["disk credentials stale", "using fresh keychain entry"]`).
 
+> **Provider filtering**: When provider-specific flags are passed (e.g., `nemo auth --claude --json`), only the requested providers appear in the `results` array. When no provider flags are passed (default: all providers), all three providers (`claude`, `openai`, `ssh`) appear in the output.
+
 > All schemas use snake_case keys and are emitted via `serde_json::to_string_pretty`, consistent with existing `status` and `cache show` output.
 
 **FR-3c.** `--json` always emits JSON regardless of TTY status. Without `--json`, output is always plain text regardless of TTY status (no auto-detection). There is no implicit format switching based on whether stdout is a terminal.
@@ -328,7 +332,20 @@ Matching rules:
 
 **FR-4c.** `--no-hints` is a **global flag** on the top-level `Cli` struct (alongside `--server` and `--insecure`), since error hints can appear on any command that hits the API. It suppresses recovery hints for scripting contexts where stable error output matters.
 
-> **Integration point**: The hint system is a top-level error handler in `main()`. When the CLI's `run()` function returns an error, `main()` inspects the `anyhow` error string, calls `error_hints::find_hint(status_code, &error_message)`, and appends any matching hint to stderr before exiting. When `--no-hints` is set, the hint lookup is skipped and the raw error is printed unchanged. This keeps the hint logic out of individual command handlers and the client layer.
+> **Integration point**: The hint system is a top-level error handler in `main()`. When the CLI's `run()` function returns an error, `main()` downcasts the `anyhow` error to `ApiError` (see below), calls `error_hints::find_hint(status_code, &error_message)`, and appends any matching hint to stderr before exiting. When `--no-hints` is set, the hint lookup is skipped and the raw error is printed unchanged. This keeps the hint logic out of individual command handlers and the client layer.
+
+> **Structured error type**: To provide `find_hint` with structured fields (HTTP status code and error body) without fragile string parsing, introduce an `ApiError` struct in `cli/src/client.rs`:
+>
+> ```rust
+> #[derive(Debug, thiserror::Error)]
+> #[error("API error ({status}): {body}")]
+> pub struct ApiError {
+>     pub status: u16,
+>     pub body: String,
+> }
+> ```
+>
+> The client returns `ApiError` wrapped in `anyhow::Error` on non-2xx responses (replacing the current `anyhow!("API error ...")` string). In `main()`, the hint system downcasts via `err.downcast_ref::<ApiError>()` to extract `status` and `body`. Non-API errors (network failures, config errors, etc.) are not `ApiError` and skip the hint system entirely. This is an internal refactor to `client.rs` error construction — the `Display` output is identical to the current format, so external CLI behavior (NFR-1) is preserved.
 
 ### FR-5: `nemo help --all`
 
@@ -429,6 +446,7 @@ The `--help` flag on individual subcommands continues to use clap's built-in `--
 | `nemo help --all ai` | Error: `--all and a specific topic are mutually exclusive` |
 | `nemo help --all <cmd>` | Error: `--all and a specific command are mutually exclusive` |
 | `nemo help cache` | Renders `cache`'s help (includes its subcommand listing) |
+| `nemo help <cmd> --format=json` | Error: `--format is only supported with --all or 'ai'` |
 | `nemo help cache show` | Renders `cache show`'s `long_about` (drills into nested subcommand) |
 
 ## Non-Functional Requirements
@@ -437,7 +455,11 @@ The `--help` flag on individual subcommands continues to use clap's built-in `--
 
 All existing command invocations produce identical stdout/stderr, except that `nemo --help` will list additional subcommands (`capabilities`) and the custom `help` subcommand with its new flags. The new flags (`--json`, `--no-hints`, `--all`, `--format=json`) are additive. The existing one-line-per-command help output format is preserved.
 
-### NFR-2: Tests
+### NFR-2: `help` and `capabilities` bypass config and auth
+
+`nemo help` (all variants: `help ai`, `help --all`, `help <cmd>`) and `nemo capabilities` must be dispatched **before** config loading and API key validation in `main()`. Currently, `main()` calls `config::load_config()` and exits with an error if `api_key` is missing (main.rs:260-272). Only `Init` and `Config` are special-cased before this gate. The `Help` and `Capabilities` commands must be added to this early-exit pattern so that unconfigured users and agents — the primary audience for these commands — can run them without a valid config file or API key.
+
+### NFR-3: Tests
 
 - **Unit** (`cli/src/commands/help_ai.rs`): `nemo help ai` renders with no errors; contains section headings for state machine, workflows, recovery.
 - **Unit** (`cli/src/commands/*.rs`): each command's `long_about` contains "Example:" substring.
