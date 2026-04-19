@@ -1,0 +1,94 @@
+{
+  "round": 9,
+  "source": "review",
+  "issues": [
+    {
+      "severity": "medium",
+      "category": "performance",
+      "file": "control-plane/src/api/dashboard/aggregate.rs",
+      "line": 654,
+      "description": "build_feed_response calls store.get_all_loops(true, None) which loads the ENTIRE loops table from Postgres with no time bound or row limit. For long-lived deployments with thousands of historical loops, this unbounded query runs on every feed page load and every 'Load more' click. The specs endpoint (line 766) has the same problem — it loads all loops then filters by spec_path in Rust instead of SQL.",
+      "suggestion": "For the feed: add a reasonable time window (e.g., 90 days) or pass a since parameter. For the specs endpoint: add a get_loops_by_spec_path(spec_path, limit, offset) method to StateStore that pushes the WHERE clause to SQL instead of loading the full table and filtering in Rust."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/templates.rs",
+      "line": 690,
+      "description": "Feed page per-engineer filter chips generate URLs using the legacy ?filter= parameter (e.g., /dashboard/feed?filter=alice). The resolve_feed_filters function maps 'converged' and 'failed' to state filters before checking engineer names. If an engineer is literally named 'converged' or 'failed', their filter chip becomes a state filter instead — showing all converged/failed loops rather than that engineer's loops. The new state_filter/engineer_filter params exist to fix this, but the HTML template still generates legacy filter= URLs.",
+      "suggestion": "Change the engineer chip onclick URLs to use the explicit engineer_filter param: /dashboard/feed?engineer_filter=<name>. Similarly, change state chips to use ?state_filter=converged. This avoids the ambiguity entirely while the legacy fallback continues to work for old bookmarks."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/mod.rs",
+      "line": 36,
+      "description": "The authed Router<DashboardState> is converted to Router<()> via .with_state(dash_state), then merged into public Router<AppState>. In axum, merging Router<()> into Router<S> works, but the parent build_router() later calls .with_state(state) on the entire merged router. Public route handlers (login_page, login_submit, etc.) that don't extract State work fine, but the type progression is fragile — any future handler added to the 'public' router that needs AppState will silently fail to compile, with a confusing error about AppState vs ().",
+      "suggestion": "Add a comment documenting the type conversion chain, or restructure so public routes that might need AppState in the future use .with_state(app_state.clone()) explicitly."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/assets/dashboard.js",
+      "line": 424,
+      "description": "restoreFeedFilter checks feedList.children.length === 0 to detect empty results and clear the stale filter. But feed-list contains both .feed-item elements and potentially the .empty-state div (which IS a child). When the feed has no results but the server renders the empty-state div, children.length is 1 (not 0), so the stale-filter-clearing logic never triggers. User gets stuck seeing 'No events match this filter' with no way to clear it except manually editing localStorage.",
+      "suggestion": "Check for the presence of .feed-item children specifically: feedList.querySelectorAll('.feed-item').length === 0. Or check for the .empty-state element as the indicator."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/handlers.rs",
+      "line": 256,
+      "description": "The dashboard_stream SSE handler for active loops calls store.get_logs(id, None, None) to get all logs, then skips to the last 200. For loops with thousands of log lines, this loads the entire log history into memory just to take the tail. This happens on every detail page load for active loops.",
+      "suggestion": "Add a get_recent_logs(loop_id, limit) method to StateStore that uses ORDER BY timestamp DESC LIMIT 200 in SQL, then reverse the results in Rust. This avoids loading the full log history."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/handlers.rs",
+      "line": 200,
+      "description": "The loop detail page handler also calls store.get_logs(id, None, None) to load ALL logs for the log pane's initial render. For a loop with 50K log lines, this loads all 50K into memory just to show the last 200. Combined with the SSE handler doing the same thing, a detail page load for an active loop executes two full-log-history queries.",
+      "suggestion": "Same fix: use a LIMIT query for the initial log pane render. The SSE handler's initial batch should also use the limited query."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/state/postgres.rs",
+      "line": 481,
+      "description": "get_all_loops(true, None) executes 'SELECT * FROM loops ORDER BY created_at DESC' with no LIMIT. Combined with the fact that build_feed_response and build_specs_response both call this with None, long-lived deployments accumulate unbounded data. The project guidelines say 'Postgres not SQLite: Multi-pod future, concurrent access' — multiple dashboard users hitting feed/specs simultaneously would each trigger a full table scan.",
+      "suggestion": "Add a safety LIMIT (e.g., 10000) to the (true, None) branch with a tracing::warn when the limit is hit. Or require callers to always provide a since parameter by removing the None option."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "control-plane/assets/dashboard.js",
+      "line": 163,
+      "description": "The kill switch button is visible when engineerFilter !== 'mine' (including individual engineer views), but FR-10d says it should only be visible 'when viewing team mode, NOT in Mine'. Showing it for individual engineer views (e.g., viewing just alice's loops) is a spec deviation — the kill switch would cancel ALL active loops, not just the displayed engineer's loops, which is confusing UX.",
+      "suggestion": "Change the condition to: killBtn.style.display = engineerFilter === 'team' ? '' : 'none'. This restricts the kill switch to team mode only, matching the spec."
+    },
+    {
+      "severity": "low",
+      "category": "style",
+      "file": "control-plane/src/state/postgres.rs",
+      "line": 467,
+      "description": "get_all_loops uses runtime sqlx::query() instead of compile-time sqlx::query!() for all three query branches. The project guidelines specify 'Compile-time query checking where possible.'",
+      "suggestion": "Use sqlx::query!() with separate static queries for each branch to get compile-time SQL checking."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/templates.rs",
+      "line": 690,
+      "description": "Feed filter chip onclick handlers use inline onclick attributes which won't fire if Content-Security-Policy restricts inline event handlers. While no CSP is currently set, this is fragile for future security hardening.",
+      "suggestion": "Use data attributes and addEventListener in dashboard.js instead of inline onclick handlers, consistent with how other interactive elements are wired."
+    },
+    {
+      "severity": "low",
+      "category": "style",
+      "file": "control-plane/src/api/dashboard/aggregate.rs",
+      "line": 980,
+      "description": "The manual Deserialize implementation for StatsResponse (referenced in round 8 review) appears to have been removed in favor of Clone derive. However, StatsResponse still doesn't derive Deserialize, which means it can't be deserialized from external sources if needed in the future.",
+      "suggestion": "Consider deriving Deserialize on StatsResponse for completeness, though it's not strictly needed if only Clone is used for caching."
+    }
+  ]
+}
