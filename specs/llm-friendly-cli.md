@@ -69,12 +69,36 @@ An LLM can parse that. But a friendlier error would name the recovery path: "Loo
 > **Note on state names**: The authoritative state enum is `LoopState` in `control-plane/src/types/mod.rs`. At time of writing it contains: Pending, Hardening, AwaitingApproval, Implementing, Testing, Reviewing, Converged, Failed, Cancelled, Paused, AwaitingReauth, Hardened, Shipped. The `help_ai.md` template must reflect whatever states exist in that enum at implementation time.
 
 - **What nautiloop is**: one paragraph. Convergent loop orchestrator, cross-model adversarial review, self-hosted.
-- **State machine diagram** (ASCII): the full loop lifecycle with every transition.
-- **Terminal states**: CONVERGED, HARDENED, FAILED, CANCELLED, SHIPPED — what each means.
+- **State machine diagram** (ASCII): the full loop lifecycle with every transition. The authoritative transitions to include (derived from the loop engine driver's reconcile logic) are:
+
+  | From | To | Trigger |
+  |---|---|---|
+  | PENDING | HARDENING | Reconciler picks up loop (harden mode) |
+  | PENDING | AWAITING_APPROVAL | Reconciler picks up loop (no-harden mode) |
+  | HARDENING | AWAITING_APPROVAL | Harden job completes |
+  | AWAITING_APPROVAL | IMPLEMENTING | Engineer approves (`nemo approve`) |
+  | IMPLEMENTING | TESTING | Implementation job completes |
+  | TESTING | REVIEWING | Test job completes (tests pass) |
+  | TESTING | IMPLEMENTING | Test job completes (tests fail) |
+  | REVIEWING | CONVERGED | Reviewer approves |
+  | REVIEWING | IMPLEMENTING | Reviewer requests changes |
+  | IMPLEMENTING | FAILED | Max rounds exceeded |
+  | REVIEWING | FAILED | Max rounds exceeded |
+  | TESTING | FAILED | Max rounds exceeded |
+  | FAILED | IMPLEMENTING | `nemo extend` (resumes from failed_from_state) |
+  | CONVERGED | SHIPPED | `nemo ship` auto-merge completes |
+  | Any non-terminal | CANCELLED | `nemo cancel` |
+  | Any non-terminal | PAUSED | Internal pause trigger |
+  | PAUSED | (previous state) | `nemo resume` |
+  | Any active | AWAITING_REAUTH | Loop engine detects expired model credentials |
+  | AWAITING_REAUTH | (previous state) | `nemo auth` + `nemo resume` |
+
+  The implementer should render this as an ASCII diagram in the Markdown template. The exact visual layout is left to the implementer, but all transitions above must be represented.
+- **Terminal states**: CONVERGED, HARDENED, FAILED, CANCELLED, SHIPPED — what each means. Note: FAILED is terminal but recoverable via `nemo extend` (which resets max_rounds and resumes the loop from its failed_from_state). The mega-primer should clearly distinguish "terminal unless explicitly extended" so LLM consumers can reason about state reachability.
 - **Typical workflow 1 (implement)**: `nemo start spec.md` → `nemo approve <id>` → `nemo logs <id>` → wait → PR.
 - **Typical workflow 2 (harden-first)**: `nemo start spec.md` → review hardened spec PR → `nemo approve <id>` → watch → PR. (Harden is the default; use `--no-harden` to skip it. The `--harden` flag is deprecated and emits a warning.)
 - **Typical workflow 3 (ship)**: `nemo ship spec.md` → (no approval, no human) → auto-merged PR.
-- **Recovery playbooks**: AWAITING_REAUTH → `nemo auth --claude && nemo resume <id>`. PAUSED → `nemo resume`. FAILED (max rounds) → `nemo extend --add 10 <id>` OR investigate. Stale kubectl context? Don't switch, use `--context=<name>` per command.
+- **Recovery playbooks**: AWAITING_REAUTH → `nemo auth --claude` then `nemo resume <id>` (Claude token expiry surfaces as this state, not as an HTTP error — the loop engine detects it internally and transitions the loop). PAUSED → `nemo resume`. FAILED (max rounds) → `nemo extend --add 10 <id>` OR investigate. Stale kubectl context? Don't switch, use `--context=<name>` per command.
 - **Config hierarchy**: engineer (`~/.nemo/config.toml`) > repo (`nemo.toml` on main) > cluster (control plane ConfigMap). Explain which lives where.
 - **Command catalog**: full list with one-line descriptions, same as `nemo --help`, but grouped into categories: loop lifecycle, observability, identity, config.
 - **Example spec structure**: the minimum skeleton a spec needs — overview, FRs, acceptance criteria. Points at `docs/spec-authoring.md` (future) if it exists.
@@ -199,7 +223,9 @@ See also: nemo status (find loop IDs), nemo logs (watch after approve).
 }
 ```
 
-> **Field mapping note**: The `state` and `approve_requested` fields mirror the server's `ApproveResponse` struct directly. `state` is the loop's state at the time the action was processed. `approve_requested` is `true` when the approve was accepted. The CLI does not synthesize `previous_state`/`new_state` fields — the server API does not return transition information, and a pre-fetch would introduce a race condition.
+> **Field mapping note**: The `state` and `approve_requested` fields mirror the server's `ApproveResponse` struct directly. `state` is the loop's state at the time the action was processed. `approve_requested` is `true` when the approve was accepted. The CLI does not synthesize `previous_state`/`new_state` fields — the server API does not return transition information, and a pre-fetch would introduce a race condition. The `message` field is synthesized CLI-side and is not part of the server response — the CLI constructs this human-readable string after a successful API call.
+
+> **Note on `message` field**: All `--json` response schemas for action commands (`approve`, `cancel`, `resume`, `extend`) include a `message` field. This field is always CLI-synthesized (not from the server response) and provides a human-readable summary of the action taken. The remaining fields are passed through from the server's response struct.
 
 **`nemo cancel <id> --json`:**
 ```json
@@ -284,8 +310,11 @@ See also: nemo status (find loop IDs), nemo logs (watch after approve).
 | 409 | "Cannot approve: loop is in IMPLEMENTING" | "Loops in IMPLEMENTING are already running. Run `nemo logs <id>` to watch." |
 | 409 | "Cannot cancel: loop is in CONVERGED" | "This loop has already completed. Check the PR with `nemo inspect <branch>`." |
 | 409 | "Cannot approve: loop is in PENDING" | "Wait ~5s for the reconciler to advance PENDING → AWAITING_APPROVAL, then retry." |
-| 401 | "Claude token expired" | "Run `nemo auth --claude` to refresh cluster credentials. If the local token is also stale, open Claude Code to refresh then retry." |
+| 401 | "Authentication failed" | "Check your API key with `nemo config`. If expired, regenerate and update ~/.nemo/config.toml." |
+| 401 | "Unknown engineer" | "Run `nemo auth` to register your engineer identity with the cluster." |
 | 404 | "Spec not found" / "not found" (on start/ship) | "Ensure the spec file exists at the given path. Run `nemo start --help` for usage." |
+
+> **Note on Claude token expiry**: The server error "Claude token expired" is internal to the loop engine's auth-error detection (in `driver.rs`) and surfaces as an AWAITING_REAUTH state transition, not as a 401 HTTP error to the CLI. Recovery for token expiry is covered in the AWAITING_REAUTH recovery playbook in FR-1a, not here.
 
 **FR-4b.** Recovery hints are CLI-side; server doesn't change. Each hint lives in `cli/src/commands/error_hints.rs` as `(pattern, hint)` pairs. Unknown errors pass through unchanged.
 
@@ -339,7 +368,7 @@ Matching rules:
 - `commands` is a map from command name to command descriptor.
 - `short`: the one-line `about` string.
 - `long`: the full `long_about` text (including examples, see-also).
-- `options`: array of flag/option descriptors. `short` is null if no short flag. `type` is one of `"string"`, `"bool"`, `"integer"`.
+- `options`: array of flag/option descriptors. `short` is null if no short flag. `type` is one of `"bool"` or `"string"` — derived from clap's `ArgAction`: `SetTrue`/`SetFalse` → `"bool"`, everything else (`Set`, `Append`, `Count`) → `"string"`. There is no `"integer"` type; distinguishing integers from strings would require inspecting clap's value parser internals, which do not reliably expose type names at runtime. Consumers that need numeric types should parse based on the argument name and context.
 - `positional_args`: array of positional argument descriptors. Omitted (or empty array) if the command takes no positional args.
 
 ### FR-6: Version + capability report
@@ -382,6 +411,8 @@ The built-in clap `help` subcommand must be replaced with a custom `Help` subcom
 
 > **Implementation note for `help <cmd>`**: Use `Cli::command().find_subcommand(name)` to retrieve the target subcommand's `Command` object, then render its help via `cmd.render_long_help()`. This uses clap's own rendering engine, so the output is identical to what `nemo <cmd> --help` would produce. No separate help text registry is needed.
 
+> **Nested subcommand handling**: The positional argument for `help` accepts multiple values (e.g., `nemo help cache show`). For lookup, tokens are resolved by chaining `find_subcommand` calls: first `find_subcommand("cache")`, then on the result `find_subcommand("show")`. If the chain resolves to a valid subcommand, render its help. If only the parent resolves (e.g., `nemo help cache`), render the parent's help (which includes its subcommand listing via clap's default rendering). If no subcommand matches, emit an error: `Unknown command: <tokens>. Run 'nemo help' for a list of commands.`
+
 The `--help` flag on individual subcommands continues to use clap's built-in `--help` handler, which naturally displays `long_about` when set.
 
 **Flag interaction rules for the `help` subcommand:**
@@ -397,6 +428,8 @@ The `--help` flag on individual subcommands continues to use clap's built-in `--
 | `nemo help --format=json` (no `--all`, no positional) | Error: `--format requires --all or a topic (e.g., 'ai')` |
 | `nemo help --all ai` | Error: `--all and a specific topic are mutually exclusive` |
 | `nemo help --all <cmd>` | Error: `--all and a specific command are mutually exclusive` |
+| `nemo help cache` | Renders `cache`'s help (includes its subcommand listing) |
+| `nemo help cache show` | Renders `cache show`'s `long_about` (drills into nested subcommand) |
 
 ## Non-Functional Requirements
 
