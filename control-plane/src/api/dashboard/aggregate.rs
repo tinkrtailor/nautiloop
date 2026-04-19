@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use chrono::{DateTime, Duration, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -128,7 +128,7 @@ pub struct SpecAggregates {
     pub total_cost: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatsResponse {
     pub window: String,
     pub headline: StatsHeadline,
@@ -137,7 +137,7 @@ pub struct StatsResponse {
     pub time_series: Vec<DayStats>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatsHeadline {
     pub total_loops: u64,
     pub total_cost: Option<f64>,
@@ -145,7 +145,7 @@ pub struct StatsHeadline {
     pub avg_rounds: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineerStats {
     pub engineer: String,
     pub loops: u64,
@@ -153,7 +153,7 @@ pub struct EngineerStats {
     pub converge_rate: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpecStats {
     pub spec_path: String,
     pub runs: u64,
@@ -162,7 +162,7 @@ pub struct SpecStats {
     pub avg_rounds: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DayStats {
     pub date: String,
     pub started: u64,
