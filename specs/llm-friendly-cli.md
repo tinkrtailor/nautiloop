@@ -170,7 +170,7 @@ See also: nemo status (find loop IDs), nemo logs (watch after approve).
 
 > **Implementation note**: Clap displays `long_about` for both `--help` and `help <cmd>` by default. No custom help template is needed for this requirement. The short description (from `about`) is shown only in the parent command's subcommand listing (e.g., `nemo --help`).
 
-**FR-2c.** Applied to ALL subcommands: harden, start, ship, status, helm, logs, ps, cancel, approve, inspect, resume, extend, init, auth, models, config, cache show (the actionable subcommand — the `cache` parent uses clap's auto-generated subcommand listing and does not need a custom `long_about`).
+**FR-2c.** Applied to ALL subcommands: harden, start, ship, status, helm, logs, ps, cancel, approve, inspect, resume, extend, init, auth, models, config, capabilities, cache show (the actionable subcommand — the `cache` parent uses clap's auto-generated subcommand listing and does not need a custom `long_about`). The `help` subcommand itself does not need a custom `long_about` since it IS the help system.
 
 ### FR-3: `--json` output mode on every stateful command
 
@@ -193,66 +193,83 @@ See also: nemo status (find loop IDs), nemo logs (watch after approve).
 ```json
 {
   "loop_id": "uuid-string",
-  "previous_state": "AWAITING_APPROVAL",
-  "new_state": "IMPLEMENTING",
+  "state": "AWAITING_APPROVAL",
+  "approve_requested": true,
   "message": "Approved loop — implementation will start on next reconciliation tick."
 }
 ```
+
+> **Field mapping note**: The `state` and `approve_requested` fields mirror the server's `ApproveResponse` struct directly. `state` is the loop's state at the time the action was processed. `approve_requested` is `true` when the approve was accepted. The CLI does not synthesize `previous_state`/`new_state` fields — the server API does not return transition information, and a pre-fetch would introduce a race condition.
 
 **`nemo cancel <id> --json`:**
 ```json
 {
   "loop_id": "uuid-string",
-  "previous_state": "IMPLEMENTING",
-  "new_state": "CANCELLED",
+  "state": "IMPLEMENTING",
+  "cancel_requested": true,
   "message": "Loop cancelled."
 }
 ```
+
+> Same field convention as `approve`: `state` is the loop's state at action time; `cancel_requested` confirms the cancellation was accepted.
 
 **`nemo resume <id> --json`:**
 ```json
 {
   "loop_id": "uuid-string",
-  "previous_state": "PAUSED",
-  "new_state": "IMPLEMENTING",
+  "state": "PAUSED",
+  "resume_requested": true,
   "message": "Loop resumed."
 }
 ```
+
+> Same field convention: `state` at action time; `resume_requested` confirms acceptance.
 
 **`nemo extend <id> --json`:**
 ```json
 {
   "loop_id": "uuid-string",
-  "previous_rounds": 10,
-  "new_rounds": 20,
-  "state": "IMPLEMENTING",
+  "prior_max_rounds": 10,
+  "new_max_rounds": 20,
+  "resumed_to_state": "IMPLEMENTING",
   "message": "Extended by 10 rounds."
 }
 ```
+
+> **Field mapping note**: Field names mirror the server's `ExtendResponse` struct directly (`prior_max_rounds`, `new_max_rounds`, `resumed_to_state`). The CLI passes these through without renaming to avoid a translation layer and reduce confusion when debugging against API responses.
 
 **`nemo models --json`:**
 ```json
 {
   "providers": [
     {
-      "name": "anthropic",
-      "models": [
-        { "id": "claude-sonnet-4-20250514", "roles": ["implementer", "reviewer"] }
-      ]
+      "name": "claude",
+      "models": ["claude-opus-4", "claude-sonnet-4", "claude-haiku-4"],
+      "credential_status": { "valid": true, "updated_at": "2025-01-15T10:30:00Z" }
+    },
+    {
+      "name": "openai",
+      "models": ["gpt-5.4", "gpt-4o", "o1-preview", "o1-mini"],
+      "credential_status": { "valid": false, "updated_at": null }
     }
   ]
 }
 ```
 
+> **Provider naming**: Uses `"claude"` (not `"anthropic"`) to match the codebase's internal provider naming convention (consistent with `nemo auth --claude`). Models are listed as flat string arrays from the hardcoded `CLAUDE_MODELS` / `OPENAI_MODELS` constants — there is no per-model role assignment since any model can serve any role. `credential_status` is included because it is the primary value of the `models` command (showing whether credentials are configured and valid); it is sourced from the control plane's `ProviderInfo` data.
+
 **`nemo auth --json`:**
 ```json
 {
   "results": [
-    { "provider": "claude", "status": "ok", "message": "Token pushed to cluster." },
-    { "provider": "openai", "status": "skipped", "message": "No local token found." }
+    { "provider": "claude", "status": "ok", "messages": ["Token pushed to cluster."] },
+    { "provider": "openai", "status": "skipped", "messages": ["No local token found."] },
+    { "provider": "ssh", "status": "ok", "messages": ["Key pushed to cluster."] }
   ]
 }
 ```
+
+> **SSH provider**: `nemo auth` pushes credentials for three providers by default: `claude`, `openai`, and `ssh`. All three appear in the JSON output. The `messages` field is an array (not a single string) because the auth flow can produce multiple diagnostic messages per provider (e.g., `["disk credentials stale", "using fresh keychain entry"]`).
 
 > All schemas use snake_case keys and are emitted via `serde_json::to_string_pretty`, consistent with existing `status` and `cache show` output.
 
@@ -268,7 +285,7 @@ See also: nemo status (find loop IDs), nemo logs (watch after approve).
 | 409 | "Cannot cancel: loop is in CONVERGED" | "This loop has already completed. Check the PR with `nemo inspect <branch>`." |
 | 409 | "Cannot approve: loop is in PENDING" | "Wait ~5s for the reconciler to advance PENDING → AWAITING_APPROVAL, then retry." |
 | 401 | "Claude token expired" | "Run `nemo auth --claude` to refresh cluster credentials. If the local token is also stale, open Claude Code to refresh then retry." |
-| 404 | "Spec not found" / "not found" (on start/ship) | "Spec must exist on the repo's default branch, or be uploaded via `--local-spec` (see `nemo start --help`)." |
+| 404 | "Spec not found" / "not found" (on start/ship) | "Ensure the spec file exists at the given path. Run `nemo start --help` for usage." |
 
 **FR-4b.** Recovery hints are CLI-side; server doesn't change. Each hint lives in `cli/src/commands/error_hints.rs` as `(pattern, hint)` pairs. Unknown errors pass through unchanged.
 
@@ -280,7 +297,9 @@ Matching rules:
 
 > **Fragility note**: String-based pattern matching is inherently coupled to server error message wording. This is acceptable for v1 since the server and CLI are co-versioned. If the server adds structured error codes in the future, hints should migrate to code-based matching.
 
-**FR-4c.** `--no-hints` flag suppresses the hints for scripting contexts where stable error output matters.
+**FR-4c.** `--no-hints` is a **global flag** on the top-level `Cli` struct (alongside `--server` and `--insecure`), since error hints can appear on any command that hits the API. It suppresses recovery hints for scripting contexts where stable error output matters.
+
+> **Integration point**: The hint system is a top-level error handler in `main()`. When the CLI's `run()` function returns an error, `main()` inspects the `anyhow` error string, calls `error_hints::find_hint(status_code, &error_message)`, and appends any matching hint to stderr before exiting. When `--no-hints` is set, the hint lookup is skipped and the raw error is printed unchanged. This keeps the hint logic out of individual command handlers and the client layer.
 
 ### FR-5: `nemo help --all`
 
@@ -349,7 +368,7 @@ Matching rules:
 
 **FR-6c.** Lets an agent check `nemo capabilities` once at startup and know what it can and cannot rely on in this CLI version. Avoids version-sniffing via `nemo --version` + external lookup.
 
-> **Implementation note**: Feature flags in `cli/src/capabilities.rs` are hardcoded boolean constants, updated manually when features ship. They are NOT Cargo feature gates — they represent server-side/product-level capability presence, not compile-time conditional compilation. The `commands` array is derived from the clap `Command` definition at build time (iterate subcommands), so it is always self-consistent and automatically includes new subcommands like `capabilities` itself.
+> **Implementation note**: Feature flags in `cli/src/capabilities.rs` are hardcoded boolean constants, updated manually when features ship. They are NOT Cargo feature gates — they represent server-side/product-level capability presence, not compile-time conditional compilation. The `commands` array is derived from the clap `Command` definition at runtime (iterate `Cli::command().get_subcommands()`), so it is always self-consistent and automatically includes new subcommands like `capabilities` itself. The clap `Command` tree is constructed at runtime via the derive macro's generated code — this is runtime iteration, not a build script or proc macro.
 
 ### Implementation Note: Custom Help Subcommand
 
@@ -360,6 +379,8 @@ The built-in clap `help` subcommand must be replaced with a custom `Help` subcom
 - `help --format=json` — JSON output for FR-1c and FR-5c
 - `help <cmd>` — falls back to rendering the matching subcommand's `long_about` (or `about` if no `long_about` is set)
 - `help` (no args) — renders the same output as `nemo --help` (subcommand listing)
+
+> **Implementation note for `help <cmd>`**: Use `Cli::command().find_subcommand(name)` to retrieve the target subcommand's `Command` object, then render its help via `cmd.render_long_help()`. This uses clap's own rendering engine, so the output is identical to what `nemo <cmd> --help` would produce. No separate help text registry is needed.
 
 The `--help` flag on individual subcommands continues to use clap's built-in `--help` handler, which naturally displays `long_about` when set.
 
