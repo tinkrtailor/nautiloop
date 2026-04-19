@@ -9,7 +9,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use super::aggregate::{self, FleetSummaryCache, StatsCache};
-use super::auth::extract_cookie_value;
+use crate::util::extract_cookie_value;
 use super::templates;
 use crate::api::AppState;
 use crate::error::NautiloopError;
@@ -538,6 +538,18 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
+    /// Mutex to serialize tests that modify the NAUTILOOP_API_KEY env var,
+    /// preventing races when cargo test runs them in parallel.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Set the API key env var under the mutex lock. Returns the guard
+    /// which must be held for the duration of the test.
+    fn set_test_api_key(key: &str) -> std::sync::MutexGuard<'static, ()> {
+        let guard = ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::set_var("NAUTILOOP_API_KEY", key) };
+        guard
+    }
+
     fn make_test_loop(engineer: &str, state: LoopState) -> LoopRecord {
         LoopRecord {
             id: Uuid::new_v4(),
@@ -641,7 +653,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_login_submit_invalid_key() {
-        unsafe { std::env::set_var("NAUTILOOP_API_KEY", "test-secret-key") };
+        let _guard = set_test_api_key("test-secret-key");
         let (app, _) = build_test_app();
         let response = app
             .oneshot(
@@ -665,7 +677,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_login_submit_valid_key() {
-        unsafe { std::env::set_var("NAUTILOOP_API_KEY", "test-secret-key") };
+        let _guard = set_test_api_key("test-secret-key");
         let (app, _) = build_test_app();
         let response = app
             .oneshot(
@@ -700,7 +712,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dashboard_redirects_without_auth() {
-        unsafe { std::env::set_var("NAUTILOOP_API_KEY", "test-secret-key") };
+        let _guard = set_test_api_key("test-secret-key");
         let (app, _) = build_test_app();
         let response = app
             .oneshot(
@@ -717,7 +729,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dashboard_renders_with_cookie() {
-        unsafe { std::env::set_var("NAUTILOOP_API_KEY", "test-secret-key") };
+        let _guard = set_test_api_key("test-secret-key");
         let (app, store) = build_test_app();
 
         // Add a test loop
@@ -745,7 +757,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dashboard_state_json() {
-        unsafe { std::env::set_var("NAUTILOOP_API_KEY", "test-secret-key") };
+        let _guard = set_test_api_key("test-secret-key");
         let (app, store) = build_test_app();
 
         let loop_record = make_test_loop("alice", LoopState::Implementing);
@@ -779,7 +791,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_loop_detail_page() {
-        unsafe { std::env::set_var("NAUTILOOP_API_KEY", "test-secret-key") };
+        let _guard = set_test_api_key("test-secret-key");
         let (app, store) = build_test_app();
 
         let loop_record = make_test_loop("alice", LoopState::Implementing);
@@ -811,7 +823,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_feed_page() {
-        unsafe { std::env::set_var("NAUTILOOP_API_KEY", "test-secret-key") };
+        let _guard = set_test_api_key("test-secret-key");
         let (app, store) = build_test_app();
 
         let mut loop_record = make_test_loop("alice", LoopState::Converged);
@@ -833,7 +845,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_feed_json() {
-        unsafe { std::env::set_var("NAUTILOOP_API_KEY", "test-secret-key") };
+        let _guard = set_test_api_key("test-secret-key");
         let (app, store) = build_test_app();
 
         let mut loop_record = make_test_loop("alice", LoopState::Converged);
@@ -861,7 +873,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_specs_page_no_path() {
-        unsafe { std::env::set_var("NAUTILOOP_API_KEY", "test-secret-key") };
+        let _guard = set_test_api_key("test-secret-key");
         let (app, _) = build_test_app();
 
         let response = app
@@ -884,7 +896,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_page() {
-        unsafe { std::env::set_var("NAUTILOOP_API_KEY", "test-secret-key") };
+        let _guard = set_test_api_key("test-secret-key");
         let (app, _) = build_test_app();
 
         let response = app
@@ -902,7 +914,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_json() {
-        unsafe { std::env::set_var("NAUTILOOP_API_KEY", "test-secret-key") };
+        let _guard = set_test_api_key("test-secret-key");
         let (app, _) = build_test_app();
 
         let response = app
@@ -994,7 +1006,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dashboard_state_bearer_auth() {
-        unsafe { std::env::set_var("NAUTILOOP_API_KEY", "test-secret-key") };
+        let _guard = set_test_api_key("test-secret-key");
         let (app, _) = build_test_app();
 
         let response = app

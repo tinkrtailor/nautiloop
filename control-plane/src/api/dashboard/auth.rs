@@ -3,7 +3,7 @@ use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
 
-use crate::util::constant_time_eq;
+use crate::util::{constant_time_eq, extract_bearer, extract_cookie_value};
 
 /// Dashboard auth middleware: accepts cookie OR Bearer header.
 /// On failure, redirects to `/dashboard/login` for browser requests,
@@ -42,48 +42,9 @@ pub async fn dashboard_auth_middleware(
     }
 }
 
-/// Extract a cookie value by name from the Cookie header.
-pub fn extract_cookie_value(
-    headers: &axum::http::HeaderMap,
-    name: &str,
-) -> Option<String> {
-    headers
-        .get("cookie")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|cookies| {
-            cookies.split(';').find_map(|pair| {
-                let pair = pair.trim();
-                let (k, v) = pair.split_once('=')?;
-                if k.trim() == name {
-                    Some(v.trim().to_string())
-                } else {
-                    None
-                }
-            })
-        })
-}
-
-fn extract_bearer(headers: &axum::http::HeaderMap) -> Option<String> {
-    headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|header| {
-            if header.len() > 7 && header[..7].eq_ignore_ascii_case("bearer ") {
-                let key = &header[7..];
-                if key.is_empty() {
-                    None
-                } else {
-                    Some(key.to_string())
-                }
-            } else {
-                None
-            }
-        })
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::util::{extract_bearer, extract_cookie_value};
     use axum::http::HeaderMap;
 
     #[test]

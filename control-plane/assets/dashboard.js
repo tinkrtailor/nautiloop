@@ -520,10 +520,19 @@
   }
 
   // On feed page load, apply saved filter if no explicit filter is in the URL.
+  // If the restored filter yields an empty feed, clear the localStorage value
+  // and redirect to the unfiltered view so the user is not stuck.
   function restoreFeedFilter() {
     const feedList = document.getElementById("feed-list");
     if (!feedList) return;
     const params = new URLSearchParams(location.search);
+    // If we navigated with a saved filter and the feed is empty, clear it.
+    if (params.has("filter") && feedList.children.length === 0) {
+      try { localStorage.removeItem("nautiloop_feed_filter"); } catch(e) {}
+      // Redirect to unfiltered feed so user sees content
+      location.href = "/dashboard/feed";
+      return;
+    }
     // Only restore if user navigated to /dashboard/feed without a filter param.
     if (!params.has("filter") && !params.has("cursor")) {
       try {

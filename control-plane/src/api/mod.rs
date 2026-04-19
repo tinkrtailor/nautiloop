@@ -150,6 +150,9 @@ mod tests {
         ) -> crate::error::Result<Vec<LoopRecord>> {
             unimplemented!()
         }
+        async fn get_all_loops(&self, _: bool) -> crate::error::Result<Vec<LoopRecord>> {
+            unimplemented!()
+        }
         async fn update_loop_state(
             &self,
             _: Uuid,

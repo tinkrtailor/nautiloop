@@ -3,7 +3,7 @@ use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::Response;
 
-use crate::util::constant_time_eq;
+use crate::util::{constant_time_eq, extract_bearer, extract_cookie_value};
 
 /// Auth middleware: validates API key from `Authorization: Bearer <key>` header
 /// OR from the `nautiloop_api_key` cookie (FR-4b).
@@ -30,49 +30,9 @@ pub async fn auth_middleware(request: Request, next: Next) -> Result<Response, S
     }
 }
 
-/// Extract a cookie value by name from the Cookie header.
-fn extract_cookie_value(
-    headers: &axum::http::HeaderMap,
-    name: &str,
-) -> Option<String> {
-    headers
-        .get("cookie")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|cookies| {
-            cookies.split(';').find_map(|pair| {
-                let pair = pair.trim();
-                let (k, v) = pair.split_once('=')?;
-                if k.trim() == name {
-                    Some(v.trim().to_string())
-                } else {
-                    None
-                }
-            })
-        })
-}
-
-/// Extract API key from Authorization: Bearer <key> header.
-fn extract_bearer(headers: &axum::http::HeaderMap) -> Option<String> {
-    headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|header| {
-            if header.len() > 7 && header[..7].eq_ignore_ascii_case("bearer ") {
-                let key = &header[7..];
-                if key.is_empty() {
-                    None
-                } else {
-                    Some(key.to_string())
-                }
-            } else {
-                None
-            }
-        })
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::util::{extract_bearer, extract_cookie_value};
 
     #[test]
     fn test_extract_cookie_value() {

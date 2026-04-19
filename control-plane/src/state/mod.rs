@@ -29,12 +29,19 @@ pub trait StateStore: Send + Sync + 'static {
 
     /// Get loops for an engineer, optionally filtered by team (all engineers).
     /// If `include_terminal` is false, only returns active (non-terminal) loops.
+    /// Limited to 100 results for CLI/UI display. For aggregation (dashboard
+    /// fleet summary, stats, feed), use `get_all_loops` instead.
     async fn get_loops_for_engineer(
         &self,
         engineer: Option<&str>,
         team: bool,
         include_terminal: bool,
     ) -> Result<Vec<LoopRecord>>;
+
+    /// Get all loops without a row limit, for aggregation endpoints that must
+    /// compute over the full dataset (fleet summary, stats, feed, specs).
+    /// If `include_terminal` is false, only returns active (non-terminal) loops.
+    async fn get_all_loops(&self, include_terminal: bool) -> Result<Vec<LoopRecord>>;
 
     /// Update loop state and sub-state. Also updates `updated_at`.
     async fn update_loop_state(
@@ -261,6 +268,15 @@ pub mod memory {
                     };
                     eng_match && (include_terminal || !l.state.is_terminal())
                 })
+                .cloned()
+                .collect())
+        }
+
+        async fn get_all_loops(&self, include_terminal: bool) -> Result<Vec<LoopRecord>> {
+            let loops = self.loops.read().await;
+            Ok(loops
+                .values()
+                .filter(|l| include_terminal || !l.state.is_terminal())
                 .cloned()
                 .collect())
         }

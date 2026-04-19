@@ -16,6 +16,7 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 fn layout(title: &str, viewer: &str, body_content: Markup, extra_attrs: &str) -> String {
@@ -716,7 +717,14 @@ pub fn render_feed(data: &FeedResponse, viewer: &str, current_filter: Option<&st
 
         div #feed-list class="feed-list" {
             @if data.events.is_empty() {
-                div class="empty-state" { "No terminal events yet." }
+                div class="empty-state" {
+                    @if current_filter.is_some() {
+                        "No events match this filter. "
+                        a href="/dashboard/feed" { "Clear filter" }
+                    } @else {
+                        "No terminal events yet."
+                    }
+                }
             }
             @for ev in &data.events {
                 (render_feed_item(ev))
@@ -929,20 +937,20 @@ pub fn render_stats(data: &StatsResponse, viewer: &str) -> String {
         div class="stats-section" {
             h3 id="time-series" { "Daily Activity" }
             @for day in &data.time_series {
-                @let max_val = day.started.max(1);
+                @let max_val = day.started.max(1) as f64;
                 div class="ts-row" {
                     span class="ts-label" { (day.date) }
                     div class="ts-bars" {
                         div class="ts-bar ts-bar-converged"
-                            style=(format!("width:{}%", day.converged * 100 / max_val))
+                            style=(format!("width:{:.1}%", day.converged as f64 * 100.0 / max_val))
                             title=(format!("{} converged", day.converged)) {}
                         div class="ts-bar ts-bar-failed"
-                            style=(format!("width:{}%", day.failed * 100 / max_val))
+                            style=(format!("width:{:.1}%", day.failed as f64 * 100.0 / max_val))
                             title=(format!("{} failed", day.failed)) {}
-                        @let other = day.started.saturating_sub(day.converged + day.failed);
+                        @let other = day.started.saturating_sub(day.converged.saturating_add(day.failed));
                         @if other > 0 {
                             div class="ts-bar ts-bar-started"
-                                style=(format!("width:{}%", other * 100 / max_val))
+                                style=(format!("width:{:.1}%", other as f64 * 100.0 / max_val))
                                 title=(format!("{} other", other)) {}
                         }
                     }

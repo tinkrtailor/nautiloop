@@ -128,7 +128,7 @@ pub struct SpecAggregates {
     pub total_cost: Option<f64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StatsResponse {
     pub window: String,
     pub headline: StatsHeadline,
@@ -137,7 +137,7 @@ pub struct StatsResponse {
     pub time_series: Vec<DayStats>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StatsHeadline {
     pub total_loops: u64,
     pub total_cost: Option<f64>,
@@ -145,7 +145,7 @@ pub struct StatsHeadline {
     pub avg_rounds: Option<f64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EngineerStats {
     pub engineer: String,
     pub loops: u64,
@@ -153,7 +153,7 @@ pub struct EngineerStats {
     pub converge_rate: Option<f64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SpecStats {
     pub spec_path: String,
     pub runs: u64,
@@ -162,7 +162,7 @@ pub struct SpecStats {
     pub avg_rounds: Option<f64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DayStats {
     pub date: String,
     pub started: u64,
@@ -229,10 +229,7 @@ impl StatsCache {
         let guard = self.inner.read().await;
         guard.get(window).and_then(|(resp, ts)| {
             if ts.elapsed().as_secs() < 60 {
-                // StatsResponse doesn't implement Clone, so we serialize/deserialize
-                serde_json::to_value(resp)
-                    .ok()
-                    .and_then(|v| serde_json::from_value(v).ok())
+                Some(resp.clone())
             } else {
                 None
             }
@@ -240,12 +237,8 @@ impl StatsCache {
     }
 
     pub async fn set(&self, window: String, resp: &StatsResponse) {
-        if let Ok(cloned) = serde_json::to_value(resp)
-            .and_then(serde_json::from_value::<StatsResponse>)
-        {
-            let mut guard = self.inner.write().await;
-            guard.insert(window, (cloned, Instant::now()));
-        }
+        let mut guard = self.inner.write().await;
+        guard.insert(window, (resp.clone(), Instant::now()));
     }
 }
 
@@ -532,7 +525,7 @@ async fn build_fleet_summary(
 
     // Get all loops (including terminal) for the window
     let all_loops = store
-        .get_loops_for_engineer(None, true, true)
+        .get_all_loops(true)
         .await?;
 
     let current_window: Vec<&LoopRecord> = all_loops
@@ -656,35 +649,33 @@ pub async fn build_feed_response(
     filter: Option<&str>,
 ) -> crate::error::Result<FeedResponse> {
     let all_loops = store
-        .get_loops_for_engineer(None, true, true)
+        .get_all_loops(true)
         .await?;
 
     // Collect distinct engineers from all terminal loops for feed filter chips (FR-12b).
+    // Engineers are collected independently of cursor/filter so chips always show
+    // all available engineers regardless of the current page or filter selection.
     let mut engineers_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for l in &all_loops {
+        if l.state.is_terminal() {
+            engineers_set.insert(l.engineer.clone());
+        }
+    }
 
+    // Step 1: filter to terminal loops only
+    // Step 2: apply content filter (state/engineer)
+    // Step 3: apply cursor exclusion (pagination)
+    // This ordering ensures that cursor-excluded items that match the filter
+    // are only those already shown on previous pages, not items filtered out
+    // by a different criterion.
     let mut terminal: Vec<&LoopRecord> = all_loops
         .iter()
         .filter(|l| {
             if !l.state.is_terminal() {
                 return false;
             }
-            engineers_set.insert(l.engineer.clone());
-            // Compound cursor pagination: exclude items at or before the cursor
-            // position. Items are sorted by (updated_at DESC, id DESC). An item
-            // is "before" the cursor when its timestamp is strictly later than the
-            // cursor timestamp, OR when timestamps match and its id is >= the
-            // cursor id (the cursor id itself was the last item on the prev page).
-            if let Some((cursor_ts, cursor_id)) = cursor {
-                if l.updated_at > cursor_ts {
-                    // Strictly after cursor in desc order — already shown
-                    return false;
-                }
-                if l.updated_at == cursor_ts && l.id >= cursor_id {
-                    // Same timestamp: exclude the cursor item and anything "above" it
-                    return false;
-                }
-            }
-            match filter {
+            // Apply content filter
+            let passes_filter = match filter {
                 Some("converged") => matches!(
                     l.state,
                     LoopState::Converged | LoopState::Hardened | LoopState::Shipped
@@ -692,7 +683,20 @@ pub async fn build_feed_response(
                 Some("failed") => matches!(l.state, LoopState::Failed | LoopState::Cancelled),
                 Some(eng) => l.engineer == eng,
                 None => true,
+            };
+            if !passes_filter {
+                return false;
             }
+            // Apply cursor exclusion after filter
+            if let Some((cursor_ts, cursor_id)) = cursor {
+                if l.updated_at > cursor_ts {
+                    return false;
+                }
+                if l.updated_at == cursor_ts && l.id >= cursor_id {
+                    return false;
+                }
+            }
+            true
         })
         .collect();
 
@@ -750,7 +754,7 @@ pub async fn build_specs_response(
     limit: usize,
 ) -> crate::error::Result<SpecsResponse> {
     let all_loops = store
-        .get_loops_for_engineer(None, true, true)
+        .get_all_loops(true)
         .await?;
 
     let mut matching: Vec<&LoopRecord> = all_loops
@@ -845,7 +849,7 @@ pub async fn build_stats_response(
     let cutoff = now - Duration::days(window_days);
 
     let all_loops = store
-        .get_loops_for_engineer(None, true, true)
+        .get_all_loops(true)
         .await?;
 
     let window_loops: Vec<&LoopRecord> = all_loops

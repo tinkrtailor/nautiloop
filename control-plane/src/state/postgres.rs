@@ -459,6 +459,20 @@ impl StateStore for PgStateStore {
         rows.iter().map(row_to_loop_record).collect()
     }
 
+    async fn get_all_loops(&self, include_terminal: bool) -> Result<Vec<LoopRecord>> {
+        let terminal_filter = if include_terminal {
+            ""
+        } else {
+            " AND state NOT IN ('CONVERGED', 'FAILED', 'CANCELLED', 'HARDENED', 'SHIPPED')"
+        };
+
+        let q = format!(
+            "SELECT * FROM loops WHERE true{terminal_filter} ORDER BY created_at DESC"
+        );
+        let rows = sqlx::query(&q).fetch_all(&self.pool).await?;
+        rows.iter().map(row_to_loop_record).collect()
+    }
+
     async fn update_loop_state(
         &self,
         id: Uuid,
