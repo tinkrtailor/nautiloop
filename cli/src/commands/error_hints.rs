@@ -38,7 +38,7 @@ const HINT_RULES: &[HintRule] = &[
     },
     HintRule {
         status: Some(404),
-        pattern: "not found",
+        pattern: "spec not found",
         hint: "The spec path was not found in the git repository. Verify the branch and path are correct. Run `nemo start --help` for usage.",
     },
 ];
@@ -104,9 +104,16 @@ mod tests {
     }
 
     #[test]
-    fn hint_not_found() {
+    fn hint_spec_not_found() {
         let hint = find_hint(404, r#"{"error":"Spec not found: path/to/spec.md"}"#);
         assert!(hint.unwrap().contains("spec path was not found"));
+    }
+
+    #[test]
+    fn no_hint_generic_not_found() {
+        // A generic 404 "not found" should NOT match the spec-specific hint
+        let hint = find_hint(404, r#"{"error":"Loop not found"}"#);
+        assert!(hint.is_none());
     }
 
     #[test]

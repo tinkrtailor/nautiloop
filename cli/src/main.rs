@@ -5,7 +5,7 @@ mod commands;
 mod config;
 mod project_config;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -708,6 +708,9 @@ fn handle_help(topic: &[String], all: bool, format: Option<&str>) -> anyhow::Res
 
     // nemo help ai / nemo help llm
     if !topic.is_empty() && (topic[0] == "ai" || topic[0] == "llm") {
+        if topic.len() > 1 {
+            anyhow::bail!("'nemo help {}' does not accept additional arguments", topic[0]);
+        }
         if is_json {
             return commands::help_ai::render_json();
         }
@@ -755,15 +758,13 @@ fn handle_help(topic: &[String], all: bool, format: Option<&str>) -> anyhow::Res
     }
 
     // Render the found subcommand's long help
-    let mut help_cmd = current.clone();
-    help_cmd.print_long_help()?;
+    current.print_long_help()?;
     Ok(())
 }
 
 /// The inner run function that dispatches commands. Returns errors that main()
 /// will handle (including ApiError for hint enrichment).
-async fn run() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+async fn run(cli: Cli) -> anyhow::Result<()> {
 
     // Fail fast on contradictory flags before any side effects (config loading,
     // credential checks, HTTP client construction).
@@ -1053,8 +1054,6 @@ async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-use clap::CommandFactory;
-
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -1064,10 +1063,10 @@ async fn main() {
         )
         .init();
 
-    // Parse CLI early to check --no-hints before running
-    let no_hints = std::env::args().any(|a| a == "--no-hints");
+    let cli = Cli::parse();
+    let no_hints = cli.no_hints;
 
-    if let Err(err) = run().await {
+    if let Err(err) = run(cli).await {
         // Try to extract ApiError for hint enrichment
         if !no_hints
             && let Some(api_err) = err.downcast_ref::<client::ApiError>()
@@ -1085,7 +1084,6 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
 
     /// Verify that every subcommand has a long_about containing "Example:".
     #[test]

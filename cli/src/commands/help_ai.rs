@@ -203,27 +203,36 @@ mod tests {
         // Drift guard: every LoopState variant name must appear in the template.
         // If a new state is added to the enum, this test will fail, reminding
         // the developer to update help_ai.md.
-        let state_names = [
-            "PENDING",
-            "HARDENING",
-            "AWAITING_APPROVAL",
-            "IMPLEMENTING",
-            "TESTING",
-            "REVIEWING",
-            "CONVERGED",
-            "FAILED",
-            "CANCELLED",
-            "PAUSED",
-            "AWAITING_REAUTH",
-            "HARDENED",
-            "SHIPPED",
+        //
+        // Uses the actual LoopState enum from control-plane to prevent silent
+        // drift when new states are added without updating the template.
+        use nautiloop_control_plane::types::LoopState;
+        let all_states: &[LoopState] = &[
+            LoopState::Pending,
+            LoopState::Hardening,
+            LoopState::AwaitingApproval,
+            LoopState::Implementing,
+            LoopState::Testing,
+            LoopState::Reviewing,
+            LoopState::Converged,
+            LoopState::Failed,
+            LoopState::Cancelled,
+            LoopState::Paused,
+            LoopState::AwaitingReauth,
+            LoopState::Hardened,
+            LoopState::Shipped,
         ];
-        for state in state_names {
+        for state in all_states {
+            let name = state.to_string();
             assert!(
-                HELP_AI_TEMPLATE.contains(state),
-                "LoopState variant {state} not found in help_ai.md template"
+                HELP_AI_TEMPLATE.contains(&name),
+                "LoopState variant {name} not found in help_ai.md template"
             );
         }
+        // Also verify the count matches — if a variant is added to the enum
+        // but not to the list above, this assertion catches it. The count must
+        // match the number of variants in the LoopState enum.
+        assert_eq!(all_states.len(), 13, "LoopState variant count changed — update this test and help_ai.md");
     }
 
     #[test]
