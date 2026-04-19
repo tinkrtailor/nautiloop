@@ -441,6 +441,9 @@ impl StateStore for PgStateStore {
             " AND state NOT IN ('CONVERGED', 'FAILED', 'CANCELLED', 'HARDENED', 'SHIPPED')"
         };
 
+        // Runtime sqlx::query() because the WHERE clause varies based on terminal_filter
+        // (conditional state exclusion) and engineer scoping — not expressible in a single
+        // compile-time sqlx::query!().
         let rows = match engineer {
             Some(eng) if !team => {
                 let q = format!(
@@ -464,15 +467,19 @@ impl StateStore for PgStateStore {
         include_terminal: bool,
         since: Option<DateTime<Utc>>,
     ) -> Result<Vec<LoopRecord>> {
-        // Use separate static queries for each combination instead of
-        // runtime format!() string interpolation.
+        // Runtime sqlx::query() for each branch because the WHERE clause structure differs
+        // based on include_terminal and since — not expressible in a single compile-time
+        // sqlx::query!().
         let rows = match (include_terminal, since) {
             (true, Some(cutoff)) => {
-                // All loops created after cutoff, plus all active loops regardless of age.
+                // All loops created OR updated after cutoff, plus all active loops regardless
+                // of age. Using (created_at > $1 OR updated_at > $1) ensures that long-running
+                // loops which terminated recently (updated_at within window but created_at
+                // outside it) are still included — important for Converged/Failed filter chips.
                 // Safety LIMIT of 10000 to prevent unbounded result sets on long-lived
                 // deployments with high loop throughput.
                 let rows = sqlx::query(
-                    "SELECT * FROM loops WHERE created_at > $1 \
+                    "SELECT * FROM loops WHERE (created_at > $1 OR updated_at > $1) \
                      OR state NOT IN ('CONVERGED', 'FAILED', 'CANCELLED', 'HARDENED', 'SHIPPED') \
                      ORDER BY created_at DESC LIMIT 10000",
                 )
@@ -773,6 +780,7 @@ impl StateStore for PgStateStore {
         limit: usize,
     ) -> Result<Vec<LogEvent>> {
         // Fetch the last N logs by ordering DESC with LIMIT, then reverse in Rust.
+        // Runtime sqlx::query() because the LIMIT is a dynamic parameter.
         let rows = sqlx::query(
             "SELECT * FROM log_events WHERE loop_id = $1 \
              ORDER BY timestamp DESC, id DESC LIMIT $2",
@@ -804,6 +812,9 @@ impl StateStore for PgStateStore {
         spec_path: &str,
         limit: usize,
     ) -> Result<Vec<LoopRecord>> {
+        // Runtime sqlx::query() because the LIMIT is a dynamic parameter.
+        // Callers (e.g. build_specs_response) pass limit=10000 as a safety bound;
+        // aggregates are computed in Rust over the full result set.
         let rows = sqlx::query(
             "SELECT * FROM loops WHERE spec_path = $1 ORDER BY created_at DESC LIMIT $2",
         )
@@ -834,8 +845,9 @@ impl StateStore for PgStateStore {
         };
         let filter_states = state_whitelist.as_deref().unwrap_or(&terminal_states);
 
-        // Build query dynamically but safely with bind parameters.
-        // sqlx doesn't natively support IN ($1...) with Vec, so we use ANY($1).
+        // Runtime sqlx::query() because the WHERE clause is built dynamically based on
+        // optional filters (since, engineer, cursor) — not expressible in compile-time
+        // sqlx::query!(). All values are bound as parameters, never interpolated.
         let mut query_str = String::from(
             "SELECT * FROM loops WHERE state::text = ANY($1)",
         );
@@ -850,6 +862,9 @@ impl StateStore for PgStateStore {
             param_idx += 1;
         }
         if cursor.is_some() {
+            // Cursor clause: $param_idx is intentionally referenced twice (in both < and =
+            // comparisons) because it binds cursor_ts once. The bind order is:
+            // $1=states, [$2=since], [$N=engineer], [$N=cursor_ts, $N+1=cursor_id], $last=limit
             query_str.push_str(&format!(
                 " AND (updated_at < ${} OR (updated_at = ${} AND id < ${}))",
                 param_idx,

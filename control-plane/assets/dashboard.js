@@ -350,9 +350,11 @@
           .then(() => { showToast("Resumed"); location.reload(); })
           .catch(err => showToast("Error: " + err.message));
       } else if (action === "extend") {
-        actionFetch("/extend/" + loopId, "POST", { add_rounds: 10 })
-          .then(() => { showToast("Extended +10 rounds"); location.reload(); })
-          .catch(err => showToast("Error: " + err.message));
+        showConfirmModal("Extend +10 rounds?", "This will add 10 rounds and resume the loop.", function() {
+          actionFetch("/extend/" + loopId, "POST", { add_rounds: 10 })
+            .then(() => { showToast("Extended +10 rounds"); location.reload(); })
+            .catch(err => showToast("Error: " + err.message));
+        });
       } else if (action === "cancel-all") {
         // Fetch current active loop IDs from /dashboard/state before cancelling
         fetch("/dashboard/state?team=true", { credentials: "same-origin" })
@@ -616,10 +618,16 @@
   let bellEnabled = false;
   try { bellEnabled = localStorage.getItem("nautiloop_bell") === "on"; } catch(e) {}
 
+  // Reuse a single AudioContext to avoid hitting browser instance limits (typically 6-8).
+  let bellAudioCtx = null;
   function playBell() {
     if (!bellEnabled) return;
     try {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      if (!bellAudioCtx) {
+        bellAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      const ctx = bellAudioCtx;
+      if (ctx.state === "suspended") { ctx.resume(); }
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.connect(gain);
