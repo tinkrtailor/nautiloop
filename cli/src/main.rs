@@ -11,24 +11,41 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "nemo",
     about = "Nemo CLI - Convergent loop orchestrator",
-    version
+    version,
+    disable_help_subcommand = true
 )]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
 
     /// API server URL override
-    #[arg(long, global = true)]
+    #[arg(long, short = 's', global = true)]
     server: Option<String>,
 
     /// Disable TLS certificate verification (dev/self-signed certs only)
     #[arg(long, global = true)]
     insecure: bool,
+
+    /// Suppress recovery hints on API errors (for scripting)
+    #[arg(long, global = true)]
+    no_hints: bool,
 }
 
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Harden spec, merge spec PR. Terminal: HARDENED
+    #[command(long_about = "Harden spec, merge spec PR. Terminal: HARDENED\n\n\
+        Runs the harden phase (audit + optional revise) on a spec without proceeding\n\
+        to implementation. The loop terminates at HARDENED once the spec PR is ready.\n\
+        Use this for spec refinement before implementation.\n\n\
+        Lifecycle: PENDING \u{2192} HARDENING \u{2192} HARDENED\n\n\
+        Example:\n  \
+          $ nemo harden spec.md\n  \
+          Loop ID: 8cb88352-5cf4-4dda-9cd0-6a0d6851ba92\n  \
+          Branch: agent/alice/my-feature-a1b2c3d4\n  \
+          Phase plan: HARDEN (terminal)\n\n  \
+          # Review the hardened spec PR when HARDENED.\n\n\
+        See also: nemo start (harden + implement), nemo ship (harden + implement + merge).")]
     Harden {
         /// Path to the spec file
         spec_path: String,
@@ -43,6 +60,22 @@ enum Commands {
     },
 
     /// Implement spec, create PR. Terminal: CONVERGED
+    #[command(long_about = "Implement spec, create PR. Terminal: CONVERGED\n\n\
+        Submits a spec for implementation. By default, the spec is hardened first\n\
+        (audit + optional revise), then moves to AWAITING_APPROVAL for engineer\n\
+        sign-off before implementation begins. Use --no-harden to skip hardening.\n\n\
+        Lifecycle: PENDING \u{2192} HARDENING \u{2192} AWAITING_APPROVAL \u{2192} IMPLEMENTING \u{2192} \
+        TESTING \u{2192} REVIEWING \u{2192} CONVERGED\n\n\
+        Example:\n  \
+          $ nemo start spec.md\n  \
+          Loop ID: 8cb88352-5cf4-4dda-9cd0-6a0d6851ba92\n  \
+          Branch: agent/alice/my-feature-a1b2c3d4\n  \
+          Phase plan: HARDEN \u{2192} APPROVE \u{2192} IMPLEMENT\n\n  \
+          $ nemo start spec.md --no-harden\n  \
+          Phase plan: APPROVE \u{2192} IMPLEMENT\n\n  \
+          $ nemo start spec.md --auto-approve --no-harden\n  \
+          Phase plan: IMPLEMENT (no approval gate)\n\n\
+        See also: nemo approve (approve after hardening), nemo logs (watch progress).")]
     Start {
         /// Path to the spec file
         spec_path: String,
@@ -71,6 +104,18 @@ enum Commands {
     },
 
     /// Implement + auto-merge. Terminal: SHIPPED
+    #[command(long_about = "Implement + auto-merge. Terminal: SHIPPED\n\n\
+        Fully autonomous mode: submits a spec, skips the approval gate, and auto-merges\n\
+        the PR when the loop converges. Skips hardening by default; use --harden to\n\
+        harden first.\n\n\
+        Lifecycle: PENDING \u{2192} IMPLEMENTING \u{2192} TESTING \u{2192} REVIEWING \u{2192} CONVERGED \u{2192} SHIPPED\n\n\
+        Example:\n  \
+          $ nemo ship spec.md\n  \
+          Loop ID: 8cb88352-5cf4-4dda-9cd0-6a0d6851ba92\n  \
+          Phase plan: IMPLEMENT \u{2192} SHIP\n\n  \
+          $ nemo ship --harden spec.md\n  \
+          Phase plan: HARDEN \u{2192} IMPLEMENT \u{2192} SHIP\n\n\
+        See also: nemo start (with approval gate), nemo status (check progress).")]
     Ship {
         /// Path to the spec file
         spec_path: String,
@@ -89,6 +134,18 @@ enum Commands {
     },
 
     /// Show your running loops
+    #[command(long_about = "Show your running loops.\n\n\
+        Displays a table of all active loops for the current engineer (or all\n\
+        engineers with --team). Shows loop ID, state, stage, spec path, and round.\n\n\
+        Example:\n  \
+          $ nemo status\n  \
+          LOOP_ID                              STATE               STAGE       ENGINEER  SPEC                    ROUND\n  \
+          8cb88352-5cf4-4dda-9cd0-6a0d6851ba92 IMPLEMENTING        implement   alice     specs/invoice-cancel.md 3\n\n  \
+          $ nemo status --json\n  \
+          [{\"loop_id\": \"8cb88352-...\", \"state\": \"IMPLEMENTING\", ...}]\n\n  \
+          $ nemo status --team\n  \
+          # Shows all engineers' loops\n\n\
+        See also: nemo logs (stream logs), nemo inspect (detailed state), nemo helm (TUI).")]
     Status {
         /// Show all engineers' loops
         #[arg(long)]
@@ -100,6 +157,16 @@ enum Commands {
     },
 
     /// K9s-style loop overview with live logs
+    #[command(long_about = "K9s-style loop overview with live logs.\n\n\
+        Opens an interactive terminal UI showing all active loops with real-time\n\
+        log streaming, round history, diffs, and cost tracking. Supports keyboard\n\
+        navigation and loop actions (approve, cancel, resume).\n\n\
+        Example:\n  \
+          $ nemo helm\n  \
+          # Opens TUI for your loops\n\n  \
+          $ nemo helm --team\n  \
+          # Shows all engineers' loops in the TUI\n\n\
+        See also: nemo status (non-interactive), nemo logs (single loop).")]
     Helm {
         /// Show all engineers' loops
         #[arg(long)]
@@ -107,6 +174,19 @@ enum Commands {
     },
 
     /// Stream logs for a loop
+    #[command(long_about = "Stream logs for a loop.\n\n\
+        Streams real-time logs from a running loop via SSE, or fetches historical\n\
+        logs from completed rounds. Filter by round and stage to narrow output.\n\
+        Use --tail for raw pod container stdout (live only).\n\n\
+        Example:\n  \
+          $ nemo logs 8cb88352-5cf4-4dda-9cd0-6a0d6851ba92\n  \
+          [implement/r1] Setting up worktree...\n  \
+          [implement/r1] Running agent...\n\n  \
+          $ nemo logs 8cb88352-... --round 2 --stage review\n  \
+          [review/r2] Reviewing implementation...\n\n  \
+          $ nemo logs 8cb88352-... --tail\n  \
+          # Raw pod stdout (live container output)\n\n\
+        See also: nemo status (find loop IDs), nemo ps (pod-level introspection).")]
     Logs {
         /// Loop ID
         loop_id: String,
@@ -134,6 +214,17 @@ enum Commands {
     },
 
     /// Show live processes and runtime state of an active loop's pod
+    #[command(long_about = "Show live processes and runtime state of an active loop's pod.\n\n\
+        Displays a snapshot of the active pod's CPU/memory usage, running processes,\n\
+        worktree state, and container stats. Use --watch for live updating display.\n\n\
+        Example:\n  \
+          $ nemo ps 8cb88352-5cf4-4dda-9cd0-6a0d6851ba92\n  \
+          Pod: nemo-8cb88352-r3-implement   Phase: Running\n  \
+          CPU: 250m   Memory: 512Mi\n  \
+          ...\n\n  \
+          $ nemo ps 8cb88352-... --watch\n  \
+          # Live updating view (press q to quit)\n\n\
+        See also: nemo logs (log output), nemo inspect (round history).")]
     Ps {
         /// Loop ID
         loop_id: String,
@@ -144,39 +235,123 @@ enum Commands {
     },
 
     /// Cancel a running loop
+    #[command(long_about = "Cancel a running loop.\n\n\
+        Requests cancellation of an active loop. The loop engine will transition it\n\
+        to CANCELLED on the next reconciliation tick. Only works on non-terminal loops.\n\n\
+        Example:\n  \
+          $ nemo cancel 8cb88352-5cf4-4dda-9cd0-6a0d6851ba92\n  \
+          Cancel requested for loop 8cb88352-5cf4-4dda-9cd0-6a0d6851ba92\n  \
+            Current state: IMPLEMENTING\n  \
+            The loop engine will cancel the loop on the next tick.\n\n\
+        See also: nemo status (find loop IDs), nemo resume (un-pause instead).")]
     Cancel {
         /// Loop ID
         loop_id: String,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Approve a loop awaiting approval
+    #[command(long_about = "Approve a loop awaiting approval.\n\n\
+        Moves a loop from AWAITING_APPROVAL to the next active stage. Required for:\n\
+        - Loops started with `nemo start` (PENDING \u{2192} AWAITING_APPROVAL \u{2192} approve \u{2192} IMPLEMENTING)\n\
+        - Loops that hardened first and are waiting for engineer review of the hardened spec\n\n\
+        Does nothing useful on any other state; errors with 409 Conflict.\n\n\
+        Example:\n  \
+          $ nemo approve 8cb88352-5cf4-4dda-9cd0-6a0d6851ba92\n  \
+          Approved loop 8cb88352-5cf4-4dda-9cd0-6a0d6851ba92\n  \
+            State: AWAITING_APPROVAL\n  \
+            Implementation will start on next reconciliation tick.\n\n\
+        See also: nemo status (find loop IDs), nemo logs (watch after approve).")]
     Approve {
         /// Loop ID
         loop_id: String,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Show detailed loop state, round history, and verdicts
+    #[command(long_about = "Show detailed loop state, round history, and verdicts.\n\n\
+        Fetches the full inspection payload for a loop identified by its branch path.\n\
+        Output is always JSON. Includes round-by-round stage results, durations, and\n\
+        judge decisions. The \"agent/\" prefix is auto-prepended if not present.\n\n\
+        Example:\n  \
+          $ nemo inspect alice/invoice-cancel-a1b2c3d4\n  \
+          {\n  \
+            \"loop_id\": \"8cb88352-...\",\n  \
+            \"state\": \"IMPLEMENTING\",\n  \
+            \"rounds\": [...],\n  \
+            \"judge_decisions\": [...]\n  \
+          }\n\n\
+        See also: nemo status (list loops), nemo logs (stream logs).")]
     Inspect {
         /// Branch path (e.g., "alice/invoice-cancel-a1b2c3d4" or "agent/alice/invoice-cancel-a1b2c3d4")
         path: String,
+
+        /// Accept --json for consistency (output is always JSON)
+        #[arg(long)]
+        json: bool,
     },
 
     /// Resume a PAUSED, AWAITING_REAUTH, or transient-FAILED loop
+    #[command(long_about = "Resume a PAUSED, AWAITING_REAUTH, or transient-FAILED loop.\n\n\
+        Resumes a loop that has been paused or is waiting for re-authentication.\n\
+        For AWAITING_REAUTH, push fresh credentials with `nemo auth` first.\n\n\
+        Example:\n  \
+          $ nemo resume 8cb88352-5cf4-4dda-9cd0-6a0d6851ba92\n  \
+          Resumed loop 8cb88352-5cf4-4dda-9cd0-6a0d6851ba92\n  \
+            State: PAUSED\n  \
+            Loop will resume on next reconciliation tick.\n\n\
+        See also: nemo auth (re-push credentials), nemo extend (for FAILED loops).")]
     Resume {
         /// Loop ID
         loop_id: String,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Extend a FAILED loop's max_rounds and resume it from the last stage
+    #[command(long_about = "Extend a FAILED loop's max_rounds and resume it from the last stage.\n\n\
+        Adds rounds to a FAILED loop and resumes it from the stage it was in when it\n\
+        failed (failed_from_state). Use this to recover from max-rounds exhaustion\n\
+        without starting over.\n\n\
+        Example:\n  \
+          $ nemo extend 8cb88352-5cf4-4dda-9cd0-6a0d6851ba92 --add 10\n  \
+          Extended loop 8cb88352-5cf4-4dda-9cd0-6a0d6851ba92\n  \
+            max_rounds: 10 -> 20 (+10)\n  \
+            Resuming at: IMPLEMENTING\n  \
+            Loop will continue on next reconciliation tick.\n\n\
+        See also: nemo inspect (check what went wrong), nemo logs (review failures).")]
     Extend {
         /// Loop ID
         loop_id: String,
         /// Number of rounds to add to max_rounds
         #[arg(long, default_value_t = 5)]
         add: u32,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Scan monorepo, generate nemo.toml
+    #[command(long_about = "Scan monorepo, generate nemo.toml.\n\n\
+        Auto-detects the repository name, default branch, and project structure to\n\
+        generate a nemo.toml configuration file. Use --force to overwrite an existing\n\
+        config.\n\n\
+        Example:\n  \
+          $ nemo init\n  \
+          Detected repo: my-project (branch: main)\n  \
+          Generated nemo.toml\n\n  \
+          $ nemo init --force\n  \
+          Overwriting existing nemo.toml\n\n\
+        See also: nemo config (edit engineer config), nemo auth (push credentials).")]
     Init {
         /// Overwrite existing nemo.toml
         #[arg(long)]
@@ -184,6 +359,20 @@ enum Commands {
     },
 
     /// Push local model credentials to cluster
+    #[command(long_about = "Push local model credentials to cluster.\n\n\
+        Reads local credential files for Claude, OpenAI, and SSH, validates them,\n\
+        and registers them with the control plane. Required for loops to authenticate\n\
+        with model providers. Use provider-specific flags to push only one provider.\n\n\
+        Example:\n  \
+          $ nemo auth\n  \
+          Registered claude credentials with control plane\n  \
+          Registered openai credentials with control plane\n  \
+          Registered ssh credentials with control plane\n\n  \
+          $ nemo auth --claude\n  \
+          Registered claude credentials with control plane\n\n  \
+          $ nemo auth --json\n  \
+          {\"results\": [{\"provider\": \"claude\", \"status\": \"ok\", ...}]}\n\n\
+        See also: nemo models (check provider status), nemo resume (resume after re-auth).")]
     Auth {
         /// Push Claude/Anthropic credentials only
         #[arg(long)]
@@ -196,10 +385,31 @@ enum Commands {
         /// Push SSH key only
         #[arg(long)]
         ssh: bool,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Show authenticated providers and available models
-    Models,
+    #[command(long_about = "Show authenticated providers and available models.\n\n\
+        Displays which model providers (Claude, OpenAI, SSH) have valid credentials\n\
+        registered with the control plane, plus the catalog of available models.\n\n\
+        Example:\n  \
+          $ nemo models\n  \
+          Authenticated Providers\n  \
+          ========================\n  \
+            \u{2713} claude   ~/.claude/.credentials.json [control plane: valid]\n  \
+            \u{2717} openai   not found\n  \
+            \u{2713} ssh      ~/.ssh/id_ed25519 [control plane: valid]\n\n  \
+          $ nemo models --json\n  \
+          {\"providers\": [{\"provider\": \"claude\", \"models\": [...], \"valid\": true, ...}]}\n\n\
+        See also: nemo auth (push credentials), nemo config (set model preferences).")]
+    Models {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Show cache configuration and disk usage
     Cache {
@@ -208,6 +418,20 @@ enum Commands {
     },
 
     /// Edit ~/.nemo/config.toml
+    #[command(long_about = "Edit ~/.nemo/config.toml.\n\n\
+        View or modify engineer-level configuration (server URL, API key, engineer name,\n\
+        model preferences). Without arguments, displays current config. Use --get to\n\
+        read a specific key, --set to write one.\n\n\
+        Example:\n  \
+          $ nemo config\n  \
+          server_url: https://nemo.example.com:8080\n  \
+          engineer: alice\n  \
+          api_key: ****\n\n  \
+          $ nemo config --get engineer\n  \
+          alice\n\n  \
+          $ nemo config --set engineer=bob\n  \
+          Updated engineer = bob\n\n\
+        See also: nemo init (generate nemo.toml), nemo auth (push credentials).")]
     Config {
         /// Set a config value
         #[arg(long)]
@@ -217,11 +441,63 @@ enum Commands {
         #[arg(long)]
         get: Option<String>,
     },
+
+    /// Show CLI version and supported features
+    #[command(long_about = "Show CLI version and supported features.\n\n\
+        Outputs a JSON object describing which features this CLI version supports.\n\
+        Agents can check this once at startup to know what commands and capabilities\n\
+        are available without version-sniffing.\n\n\
+        Example:\n  \
+          $ nemo capabilities\n  \
+          {\n  \
+            \"version\": \"0.6.0\",\n  \
+            \"commands\": [\"harden\", \"start\", ...],\n  \
+            \"features\": {\n  \
+              \"qa_stage\": false,\n  \
+              \"harden_by_default\": true,\n  \
+              ...\n  \
+            }\n  \
+          }\n\n\
+        See also: nemo help ai (full LLM operator guide).")]
+    Capabilities,
+
+    /// Show help for nemo or a specific command
+    #[command(
+        name = "help",
+        long_about = "Show help for nemo or a specific command.\n\n\
+            Use `nemo help ai` for the full LLM operator guide.\n\
+            Use `nemo help --all` to dump all command documentation.\n\
+            Use `nemo help <command>` for help on a specific command."
+    )]
+    Help {
+        /// Command or topic to show help for (e.g., "ai", "approve", "cache show")
+        #[arg(num_args = 0..)]
+        topic: Vec<String>,
+
+        /// Dump all commands' help text
+        #[arg(long)]
+        all: bool,
+
+        /// Output format (json)
+        #[arg(long)]
+        format: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum CacheAction {
     /// Show active cache configuration and disk usage
+    #[command(long_about = "Show active cache configuration and disk usage.\n\n\
+        Displays the current cache backend configuration, volume details, and\n\
+        per-subdirectory disk usage breakdown.\n\n\
+        Example:\n  \
+          $ nemo cache show\n  \
+          Cache: enabled\n  \
+          Volume: nemo-cache (10 Gi)\n  \
+          Disk usage: 2.3 GB\n\n  \
+          $ nemo cache show --json\n  \
+          {\"disabled\": false, \"volume_name\": \"nemo-cache\", ...}\n\n\
+        See also: nemo config (general configuration).")]
     Show {
         /// Output as JSON
         #[arg(long)]
@@ -229,21 +505,288 @@ enum CacheAction {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .init();
+/// Build the help-all JSON output from clap's Command tree.
+fn build_help_all_json(root: &clap::Command) -> serde_json::Value {
+    let mut global_options = Vec::new();
+    for arg in root.get_arguments() {
+        if arg.get_id() == "help" || arg.get_id() == "version" {
+            continue;
+        }
+        let long = arg
+            .get_long()
+            .map(|l| format!("--{l}"))
+            .unwrap_or_default();
+        if long.is_empty() {
+            continue;
+        }
+        let short = arg.get_short().map(|s| format!("-{s}"));
+        let arg_type = match arg.get_action() {
+            clap::ArgAction::SetTrue | clap::ArgAction::SetFalse => "bool",
+            _ => "string",
+        };
+        global_options.push(serde_json::json!({
+            "name": long,
+            "short": short,
+            "type": arg_type,
+            "required": arg.is_required_set(),
+            "description": arg.get_help().map(|h| h.to_string()).unwrap_or_default(),
+        }));
+    }
 
+    let mut commands_map = serde_json::Map::new();
+    for sub in root.get_subcommands() {
+        let name = sub.get_name().to_string();
+        let short = sub
+            .get_about()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        let long = sub
+            .get_long_about()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| short.clone());
+
+        let mut options = Vec::new();
+        let mut positional_args = Vec::new();
+
+        for arg in sub.get_arguments() {
+            if arg.get_id() == "help" || arg.get_id() == "version" {
+                continue;
+            }
+            let is_positional = arg.get_long().is_none() && arg.get_short().is_none();
+            let arg_type = match arg.get_action() {
+                clap::ArgAction::SetTrue | clap::ArgAction::SetFalse => "bool",
+                _ => "string",
+            };
+
+            if is_positional {
+                positional_args.push(serde_json::json!({
+                    "name": arg.get_id().to_string().to_uppercase(),
+                    "required": arg.is_required_set(),
+                    "description": arg.get_help().map(|h| h.to_string()).unwrap_or_default(),
+                }));
+            } else {
+                let long_name = arg
+                    .get_long()
+                    .map(|l| format!("--{l}"))
+                    .unwrap_or_default();
+                let short_name = arg.get_short().map(|s| format!("-{s}"));
+                options.push(serde_json::json!({
+                    "name": long_name,
+                    "short": short_name,
+                    "type": arg_type,
+                    "required": arg.is_required_set(),
+                    "description": arg.get_help().map(|h| h.to_string()).unwrap_or_default(),
+                }));
+            }
+        }
+
+        // Handle nested subcommands (e.g., cache show)
+        for nested_sub in sub.get_subcommands() {
+            let nested_name = format!("{} {}", name, nested_sub.get_name());
+            let nested_short = nested_sub
+                .get_about()
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            let nested_long = nested_sub
+                .get_long_about()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| nested_short.clone());
+
+            let mut nested_options = Vec::new();
+            let mut nested_positional = Vec::new();
+
+            for arg in nested_sub.get_arguments() {
+                if arg.get_id() == "help" || arg.get_id() == "version" {
+                    continue;
+                }
+                let is_positional = arg.get_long().is_none() && arg.get_short().is_none();
+                let arg_type = match arg.get_action() {
+                    clap::ArgAction::SetTrue | clap::ArgAction::SetFalse => "bool",
+                    _ => "string",
+                };
+                if is_positional {
+                    nested_positional.push(serde_json::json!({
+                        "name": arg.get_id().to_string().to_uppercase(),
+                        "required": arg.is_required_set(),
+                        "description": arg.get_help().map(|h| h.to_string()).unwrap_or_default(),
+                    }));
+                } else {
+                    let long_name = arg
+                        .get_long()
+                        .map(|l| format!("--{l}"))
+                        .unwrap_or_default();
+                    let short_name = arg.get_short().map(|s| format!("-{s}"));
+                    nested_options.push(serde_json::json!({
+                        "name": long_name,
+                        "short": short_name,
+                        "type": arg_type,
+                        "required": arg.is_required_set(),
+                        "description": arg.get_help().map(|h| h.to_string()).unwrap_or_default(),
+                    }));
+                }
+            }
+
+            commands_map.insert(
+                nested_name,
+                serde_json::json!({
+                    "short": nested_short,
+                    "long": nested_long,
+                    "options": nested_options,
+                    "positional_args": nested_positional,
+                }),
+            );
+        }
+
+        commands_map.insert(
+            name,
+            serde_json::json!({
+                "short": short,
+                "long": long,
+                "options": options,
+                "positional_args": positional_args,
+            }),
+        );
+    }
+
+    serde_json::json!({
+        "global_options": global_options,
+        "commands": commands_map,
+    })
+}
+
+/// Build the help-all Markdown output.
+fn build_help_all_markdown(root: &clap::Command) -> String {
+    let mut out = String::new();
+    for sub in root.get_subcommands() {
+        let name = sub.get_name();
+        out.push_str(&format!("## {name}\n\n"));
+        let text = sub
+            .get_long_about()
+            .or_else(|| sub.get_about())
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        out.push_str(&text);
+        out.push_str("\n\n");
+
+        // Nested subcommands
+        for nested in sub.get_subcommands() {
+            let nested_name = nested.get_name();
+            out.push_str(&format!("### {name} {nested_name}\n\n"));
+            let nested_text = nested
+                .get_long_about()
+                .or_else(|| nested.get_about())
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            out.push_str(&nested_text);
+            out.push_str("\n\n");
+        }
+    }
+    out
+}
+
+/// Handle the custom help subcommand.
+fn handle_help(topic: &[String], all: bool, format: Option<&str>) -> anyhow::Result<()> {
+    let is_json = format.map(|f| f == "json").unwrap_or(false);
+
+    // Validate format value
+    if let Some(f) = format
+        && f != "json"
+    {
+        anyhow::bail!("Unknown format: {f}. Supported: json");
+    }
+
+    // Error: --all and a topic are mutually exclusive
+    if all && !topic.is_empty() {
+        let topic_str = topic.join(" ");
+        anyhow::bail!("--all and a specific {} are mutually exclusive", if topic_str == "ai" || topic_str == "llm" { "topic" } else { "command" });
+    }
+
+    // Error: --format without --all or ai topic
+    if format.is_some() && !all && topic.is_empty() {
+        anyhow::bail!("--format requires --all or a topic (e.g., 'ai')");
+    }
+
+    // nemo help ai / nemo help llm
+    if !topic.is_empty() && (topic[0] == "ai" || topic[0] == "llm") {
+        if is_json {
+            return commands::help_ai::render_json();
+        }
+        commands::help_ai::render_markdown();
+        return Ok(());
+    }
+
+    // Error: --format with a specific command
+    if format.is_some() && !topic.is_empty() {
+        anyhow::bail!("--format is only supported with --all or 'ai'");
+    }
+
+    let root = Cli::command();
+
+    // nemo help --all
+    if all {
+        if is_json {
+            let json = build_help_all_json(&root);
+            println!("{}", serde_json::to_string_pretty(&json)?);
+        } else {
+            print!("{}", build_help_all_markdown(&root));
+        }
+        return Ok(());
+    }
+
+    // nemo help (no args) — same as nemo --help
+    if topic.is_empty() {
+        let mut cmd = Cli::command();
+        cmd.print_help()?;
+        return Ok(());
+    }
+
+    // nemo help <cmd> [subcmd] — resolve nested subcommand chain
+    let mut current = root;
+    for token in topic {
+        match current.find_subcommand(token) {
+            Some(sub) => current = sub.clone(),
+            None => {
+                let topic_str = topic.join(" ");
+                anyhow::bail!(
+                    "Unknown command: {topic_str}. Run 'nemo help' for a list of commands."
+                );
+            }
+        }
+    }
+
+    // Render the found subcommand's long help
+    let mut help_cmd = current.clone();
+    help_cmd.print_long_help()?;
+    Ok(())
+}
+
+/// The inner run function that dispatches commands. Returns errors that main()
+/// will handle (including ApiError for hint enrichment).
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Fail fast on contradictory flags before any side effects (config loading,
     // credential checks, HTTP client construction).
     if let Commands::Start { harden, no_harden, .. } = cli.command {
         commands::start::validate_harden_flags(harden, no_harden)?;
+    }
+
+    // --- NFR-2: Help and Capabilities bypass config and auth ---
+
+    // Handle help subcommand before config loading
+    if let Commands::Help {
+        ref topic,
+        all,
+        ref format,
+    } = cli.command
+    {
+        return handle_help(topic, all, format.as_deref());
+    }
+
+    // Handle capabilities before config loading
+    if let Commands::Capabilities = cli.command {
+        let cmd = Cli::command();
+        return commands::capabilities::run(&cmd);
     }
 
     // Handle config command before loading config — a broken config file
@@ -449,20 +992,20 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(exit_code);
             }
         }
-        Commands::Cancel { loop_id } => {
-            commands::cancel::run(&http_client, &loop_id).await?;
+        Commands::Cancel { loop_id, json } => {
+            commands::cancel::run(&http_client, &loop_id, json).await?;
         }
-        Commands::Approve { loop_id } => {
-            commands::approve::run(&http_client, &loop_id).await?;
+        Commands::Approve { loop_id, json } => {
+            commands::approve::run(&http_client, &loop_id, json).await?;
         }
-        Commands::Inspect { path } => {
-            commands::inspect::run(&http_client, &path).await?;
+        Commands::Inspect { path, json } => {
+            commands::inspect::run(&http_client, &path, json).await?;
         }
-        Commands::Resume { loop_id } => {
-            commands::resume::run(&http_client, &loop_id).await?;
+        Commands::Resume { loop_id, json } => {
+            commands::resume::run(&http_client, &loop_id, json).await?;
         }
-        Commands::Extend { loop_id, add } => {
-            commands::extend::run(&http_client, &loop_id, add).await?;
+        Commands::Extend { loop_id, add, json } => {
+            commands::extend::run(&http_client, &loop_id, add, json).await?;
         }
         Commands::Init { .. } => {
             // Handled above before config loading
@@ -472,6 +1015,7 @@ async fn main() -> anyhow::Result<()> {
             claude,
             openai,
             ssh,
+            json,
         } => {
             commands::auth::run(
                 &http_client,
@@ -481,6 +1025,7 @@ async fn main() -> anyhow::Result<()> {
                 claude,
                 openai,
                 ssh,
+                json,
             )
             .await?;
         }
@@ -489,13 +1034,132 @@ async fn main() -> anyhow::Result<()> {
                 commands::cache::run(&http_client, json).await?;
             }
         },
-        Commands::Models => {
-            commands::models::run(&http_client, &eng_config).await?;
+        Commands::Models { json } => {
+            commands::models::run(&http_client, &eng_config, json).await?;
         }
         Commands::Config { set, get } => {
             commands::config::run(set, get)?;
         }
+        Commands::Help { .. } => {
+            // Handled above before config loading
+            unreachable!("Help is dispatched before config loading");
+        }
+        Commands::Capabilities => {
+            // Handled above before config loading
+            unreachable!("Capabilities is dispatched before config loading");
+        }
     }
 
     Ok(())
+}
+
+use clap::CommandFactory;
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .init();
+
+    // Parse CLI early to check --no-hints before running
+    let no_hints = std::env::args().any(|a| a == "--no-hints");
+
+    if let Err(err) = run().await {
+        // Try to extract ApiError for hint enrichment
+        if !no_hints
+            && let Some(api_err) = err.downcast_ref::<client::ApiError>()
+            && let Some(hint) = commands::error_hints::find_hint(api_err.status, &api_err.body)
+        {
+            eprintln!("Error: {api_err}");
+            eprintln!("Hint: {hint}");
+            std::process::exit(1);
+        }
+        eprintln!("Error: {err}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Verify that every subcommand has a long_about containing "Example:".
+    #[test]
+    fn all_commands_have_examples() {
+        let cmd = Cli::command();
+        for sub in cmd.get_subcommands() {
+            let name = sub.get_name();
+            // help doesn't need examples in long_about (it IS the help system)
+            // cache parent doesn't need examples (cache show does)
+            if name == "help" || name == "cache" {
+                continue;
+            }
+            let long = sub
+                .get_long_about()
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            assert!(
+                long.contains("Example:"),
+                "Command '{name}' is missing 'Example:' in long_about"
+            );
+        }
+    }
+
+    /// Verify that nested subcommands (cache show) have examples too.
+    #[test]
+    fn nested_commands_have_examples() {
+        let cmd = Cli::command();
+        let cache = cmd.find_subcommand("cache").expect("cache subcommand");
+        for nested in cache.get_subcommands() {
+            let name = nested.get_name();
+            let long = nested
+                .get_long_about()
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            assert!(
+                long.contains("Example:"),
+                "Nested command 'cache {name}' is missing 'Example:' in long_about"
+            );
+        }
+    }
+
+    /// Verify help --all --format=json produces valid JSON with expected keys.
+    #[test]
+    fn help_all_json_has_expected_structure() {
+        let root = Cli::command();
+        let json = build_help_all_json(&root);
+        assert!(json.get("global_options").is_some());
+        assert!(json.get("commands").is_some());
+
+        let commands = json["commands"].as_object().unwrap();
+        // Spot-check some commands exist
+        assert!(commands.contains_key("approve"));
+        assert!(commands.contains_key("status"));
+        assert!(commands.contains_key("capabilities"));
+        assert!(commands.contains_key("help"));
+
+        // Check structure of one command
+        let approve = &commands["approve"];
+        assert!(approve.get("short").is_some());
+        assert!(approve.get("long").is_some());
+        assert!(approve.get("options").is_some());
+        assert!(approve.get("positional_args").is_some());
+    }
+
+    /// Verify capabilities command's commands list matches actual subcommands.
+    #[test]
+    fn capabilities_commands_match_subcommands() {
+        let root = Cli::command();
+        let subcommand_names: Vec<String> = root
+            .get_subcommands()
+            .map(|c| c.get_name().to_string())
+            .collect();
+        // Should include capabilities and help
+        assert!(subcommand_names.contains(&"capabilities".to_string()));
+        assert!(subcommand_names.contains(&"help".to_string()));
+    }
 }

@@ -41,19 +41,46 @@ fn has_local_credentials(provider: &str) -> (bool, Option<String>) {
     (false, None)
 }
 
+/// JSON output type for `nemo models --json`.
+#[derive(serde::Serialize)]
+struct ModelsJsonOutput {
+    providers: Vec<ModelsJsonProvider>,
+}
+
+#[derive(serde::Serialize)]
+struct ModelsJsonProvider {
+    provider: String,
+    models: Vec<String>,
+    valid: bool,
+    updated_at: String,
+}
+
+fn build_models_json(cp_providers: &[ProviderInfo]) -> ModelsJsonOutput {
+    let provider_configs: &[(&str, &[&str])] = &[
+        ("claude", CLAUDE_MODELS),
+        ("openai", OPENAI_MODELS),
+    ];
+
+    let mut providers = Vec::new();
+    for (name, models) in provider_configs {
+        let cp_info = cp_providers.iter().find(|p| p.provider == *name);
+        providers.push(ModelsJsonProvider {
+            provider: name.to_string(),
+            models: models.iter().map(|m| m.to_string()).collect(),
+            valid: cp_info.map(|p| p.valid).unwrap_or(false),
+            updated_at: cp_info.map(|p| p.updated_at.clone()).unwrap_or_default(),
+        });
+    }
+
+    ModelsJsonOutput { providers }
+}
+
 /// Run the models command - show authenticated providers and available models.
-pub async fn run(client: &NemoClient, eng_config: &EngineerConfig) -> Result<()> {
+pub async fn run(client: &NemoClient, eng_config: &EngineerConfig, json: bool) -> Result<()> {
     let engineer = &eng_config.engineer;
     if engineer.is_empty() {
         anyhow::bail!("Engineer name not configured. Run: nemo config --set engineer=<your-name>");
     }
-
-    println!("Authenticated Providers");
-    println!("========================\n");
-
-    // Check local credentials and control plane registration
-    let providers = ["claude", "openai", "ssh"];
-    let mut any_registered = false;
 
     // Fetch control plane credentials
     let cp_providers: Vec<ProviderInfo> = match client
@@ -65,10 +92,24 @@ pub async fn run(client: &NemoClient, eng_config: &EngineerConfig) -> Result<()>
     {
         Ok(resp) => resp.providers,
         Err(e) => {
-            eprintln!("Warning: Could not fetch credentials from control plane: {e}");
+            if !json {
+                eprintln!("Warning: Could not fetch credentials from control plane: {e}");
+            }
             vec![]
         }
     };
+
+    if json {
+        let output = build_models_json(&cp_providers);
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+
+    println!("Authenticated Providers");
+    println!("========================\n");
+
+    let providers = ["claude", "openai", "ssh"];
+    let mut any_registered = false;
 
     for provider in &providers {
         let (local_exists, local_path) = has_local_credentials(provider);
