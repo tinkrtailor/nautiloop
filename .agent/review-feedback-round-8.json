@@ -1,0 +1,69 @@
+{
+  "round": 8,
+  "source": "review",
+  "issues": [
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/templates.rs",
+      "line": 734,
+      "description": "Feed 'Load more' button is missing a `data-filter` attribute. The JS `bindFeedLoadMore` function reads `btn.dataset.filter` to preserve the current filter when paginating, but the server-rendered button only sets `data-cursor`. When a user is viewing 'Converged only' and clicks Load More, the next page fetches ALL terminal events (unfiltered), breaking FR-12b's filter + pagination interaction.",
+      "suggestion": "Add `data-filter=(current_filter.unwrap_or(\"\"))` to the load-more button element in `render_feed`. The `current_filter` parameter is already available in scope."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/aggregate.rs",
+      "line": 678,
+      "description": "Feed filter uses magic string matching that conflates state filters ('converged', 'failed') with engineer name filters in a single `filter` query parameter. If an engineer is named 'converged' or 'failed', their name filter will be interpreted as a state filter. The match arms `Some(\"converged\")` and `Some(\"failed\")` shadow any engineer with those names.",
+      "suggestion": "Use separate query parameters (e.g., `state_filter` and `engineer_filter`) or prefix engineer names (e.g., `engineer:alice`). Alternatively, since engineer names are validated to be alphanumeric with hyphens/underscores/dots, add a note that 'converged' and 'failed' are reserved filter values and cannot be used as engineer names."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/aggregate.rs",
+      "line": 926,
+      "description": "Stats time series buckets converged/failed counts by `created_at` date, not `updated_at`. A loop created Monday that converges Wednesday shows as a Monday convergence. The 'Daily Activity' chart becomes misleading for long-running loops — the convergence count on a given day doesn't reflect what actually completed that day.",
+      "suggestion": "Bucket the `started` counter by `created_at` and the `converged`/`failed` counters by `updated_at`. This way 'started' reflects when work began and 'converged'/'failed' reflects when outcomes were reached, which is the natural reading of the time series."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/handlers.rs",
+      "description": "No test coverage for the `/dashboard/stream/:id` SSE endpoint. This endpoint has complex logic (last-200-line initial batch, SSE tailing, dedup, terminal detection) that is entirely untested. A regression here would break the live log pane (FR-4a) which is a core dashboard feature.",
+      "suggestion": "Add at least one test for active-loop SSE streaming (verify initial lines are sent) and one test for terminal-loop JSON response (verify it returns a JSON array of the last 200 lines)."
+    },
+    {
+      "severity": "medium",
+      "category": "performance",
+      "file": "control-plane/src/state/postgres.rs",
+      "line": 462,
+      "description": "`get_all_loops` has no row limit and no pagination. For long-lived deployments with thousands of historical loops, this query loads the entire loops table into memory. `build_fleet_summary` calls this on every 60s cache miss, and `build_feed_response`, `build_specs_response`, and `build_stats_response` each call it on every request. Multiple concurrent dashboard users could trigger parallel full-table scans.",
+      "suggestion": "Add a WHERE clause to limit by `created_at` window for endpoints that don't need the full history (fleet_summary only needs 14 days for current + previous window, feed only needs terminal loops, stats only needs the selected window). Alternatively, add a configurable max row count with a warning log when exceeded."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/aggregate.rs",
+      "line": 980,
+      "description": "Manual `Deserialize` implementation for `StatsResponse` is dead code. `StatsResponse` already derives `Clone`, and the `StatsCache::get` method uses `.clone()` directly. The 100-line hand-written Deserialize impl with inner structs adds unnecessary maintenance burden.",
+      "suggestion": "Either derive `Deserialize` on `StatsResponse` (and its nested types) if deserialization is needed elsewhere, or remove the manual impl entirely since `StatsCache` uses `Clone`."
+    },
+    {
+      "severity": "low",
+      "category": "style",
+      "file": "control-plane/src/state/postgres.rs",
+      "line": 462,
+      "description": "`get_all_loops` uses `format!()` for SQL query construction and `sqlx::query()` (runtime) instead of `sqlx::query!()` (compile-time checked). The project guidelines specify compile-time query checking where possible.",
+      "suggestion": "Use two separate `sqlx::query!()` calls behind a conditional branch instead of string formatting, to preserve compile-time SQL checking."
+    },
+    {
+      "severity": "low",
+      "category": "style",
+      "file": "control-plane/src/api/dashboard/mod.rs",
+      "line": 36,
+      "description": "Type annotation `let authed: Router<AppState>` is misleading. After `.with_state(dash_state)` where `dash_state: DashboardState`, the actual type is closer to `Router<()>` (state consumed). The annotation compiles due to axum's merge coercion but misrepresents the router's actual state requirement.",
+      "suggestion": "Remove the explicit type annotation or change to `let authed = Router::new()...` to let the compiler infer the correct type."
+    }
+  ]
+}
