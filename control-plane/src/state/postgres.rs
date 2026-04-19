@@ -506,6 +506,7 @@ impl StateStore for PgStateStore {
                 merge_sha = $15, merged_at = $16,
                 hardened_spec_path = $17, spec_pr_url = $18,
                 failed_from_state = $19::loop_state,
+                max_rounds = $20,
                 updated_at = NOW()
             WHERE id = $1
             "#,
@@ -529,6 +530,7 @@ impl StateStore for PgStateStore {
         .bind(&record.hardened_spec_path)
         .bind(&record.spec_pr_url)
         .bind(record.failed_from_state.map(loop_state_str))
+        .bind(record.max_rounds)
         .execute(&self.pool)
         .await?;
         Ok(())
