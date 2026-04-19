@@ -64,11 +64,13 @@ An LLM can parse that. But a friendlier error would name the recovery path: "Loo
 
 **FR-1a.** New subcommand `nemo help ai` (also `nemo help llm`, alias) prints a single comprehensive Markdown document covering:
 
+> **Note on state names**: The authoritative state enum is `LoopState` in `control-plane/src/types/mod.rs`. At time of writing it contains: Pending, Hardening, AwaitingApproval, Implementing, Testing, Reviewing, Converged, Failed, Cancelled, Paused, AwaitingReauth, Hardened, Shipped. The `help_ai.md` template must reflect whatever states exist in that enum at implementation time.
+
 - **What nautiloop is**: one paragraph. Convergent loop orchestrator, cross-model adversarial review, self-hosted.
 - **State machine diagram** (ASCII): the full loop lifecycle with every transition.
 - **Terminal states**: CONVERGED, HARDENED, FAILED, CANCELLED, SHIPPED — what each means.
 - **Typical workflow 1 (implement)**: `nemo start spec.md` → `nemo approve <id>` → `nemo logs <id>` → wait → PR.
-- **Typical workflow 2 (harden-first)**: `nemo start spec.md --harden` → review hardened spec PR → `nemo approve <id>` → watch → PR.
+- **Typical workflow 2 (harden-first)**: `nemo start spec.md` → review hardened spec PR → `nemo approve <id>` → watch → PR. (Harden is the default; use `--no-harden` to skip it. The `--harden` flag is deprecated and emits a warning.)
 - **Typical workflow 3 (ship)**: `nemo ship spec.md` → (no approval, no human) → auto-merged PR.
 - **Recovery playbooks**: AWAITING_REAUTH → `nemo auth --claude && nemo resume <id>`. PAUSED → `nemo resume`. FAILED (max rounds) → `nemo extend --add 10 <id>` OR investigate. Stale kubectl context? Don't switch, use `--context=<name>` per command.
 - **Config hierarchy**: engineer (`~/.nemo/config.toml`) > repo (`nemo.toml` on main) > cluster (control plane ConfigMap). Explain which lives where.
@@ -78,7 +80,58 @@ An LLM can parse that. But a friendlier error would name the recovery path: "Loo
 
 **FR-1b.** Output is Markdown, ~200-400 lines, readable end-to-end. Generated from a template file embedded in the binary via `include_str!`. Maintained in `cli/src/commands/help_ai.md` — not duplicated per-platform.
 
-**FR-1c.** `nemo help ai --format=json` emits the same information as structured JSON (sections keyed, workflow steps as arrays). For agents that prefer to parse rather than read prose.
+**FR-1c.** `nemo help ai --format=json` emits the same information as structured JSON. For agents that prefer to parse rather than read prose.
+
+The JSON schema for `nemo help ai --format=json`:
+
+```json
+{
+  "overview": "string — what nautiloop is",
+  "state_machine": {
+    "states": [
+      { "name": "PENDING", "terminal": false, "description": "string" }
+    ],
+    "transitions": [
+      { "from": "PENDING", "to": "AWAITING_APPROVAL", "trigger": "string" }
+    ]
+  },
+  "workflows": [
+    {
+      "name": "implement",
+      "description": "string",
+      "steps": [
+        { "command": "nemo start spec.md", "description": "string" }
+      ]
+    }
+  ],
+  "recovery_playbooks": [
+    {
+      "state": "AWAITING_REAUTH",
+      "description": "string",
+      "commands": ["nemo auth --claude", "nemo resume <id>"]
+    }
+  ],
+  "config_hierarchy": {
+    "levels": [
+      { "name": "engineer", "path": "~/.nemo/config.toml", "description": "string" }
+    ]
+  },
+  "command_catalog": {
+    "loop_lifecycle": [
+      { "command": "start", "short": "string" }
+    ],
+    "observability": [],
+    "identity": [],
+    "config": []
+  },
+  "spec_structure": "string — minimum skeleton description",
+  "known_failure_modes": [
+    { "name": "string", "detection": "string", "recovery": "string" }
+  ]
+}
+```
+
+All top-level keys are required. The ASCII state machine diagram from the Markdown version is represented as structured `states` and `transitions` arrays rather than a rendered diagram.
 
 ### FR-2: Per-command `long_about` with examples
 
@@ -109,25 +162,30 @@ Example:
 See also: nemo status (find loop IDs), nemo logs (watch after approve).
 ```
 
-**FR-2b.** `nemo <cmd> --help` shows the short description (clap default). `nemo help <cmd>` shows the long_about with examples.
+**FR-2b.** Both `nemo <cmd> --help` and `nemo help <cmd>` show the full `long_about` with examples. This is clap's natural behavior when `long_about` is set.
+
+> **Implementation note**: Clap displays `long_about` for both `--help` and `help <cmd>` by default. No custom help template is needed for this requirement. The short description (from `about`) is shown only in the parent command's subcommand listing (e.g., `nemo --help`).
 
 **FR-2c.** Applied to ALL subcommands: harden, start, ship, status, helm, logs, ps, cancel, approve, inspect, resume, extend, init, auth, models, config, cache (once shipped).
 
 ### FR-3: `--json` output mode on every stateful command
 
 **FR-3a.** Commands whose output an agent might parse get a `--json` flag:
-- `nemo status --json` — list of loops as JSON array
-- `nemo inspect <branch> --json` — already emits JSON (confirm); no change
+- `nemo status --json` — **already implemented**; preserve existing output schema (loops array with `loop_id`, `state`, etc.)
+- `nemo inspect <branch> --json` — already emits JSON by default; add `--json` as a no-op flag for consistency so agents can pass `--json` uniformly without error
 - `nemo approve <id> --json` — structured response object
 - `nemo cancel <id> --json` — structured response
 - `nemo resume <id> --json` — structured response
 - `nemo extend <id> --json` — structured response
 - `nemo models --json` — providers + available models as JSON
 - `nemo auth --json` — push results as JSON
+- `nemo cache show --json` — **already implemented**; preserve existing output schema
+
+> **Note**: `status` and `cache show` already support `--json` with established output schemas. Do not change their existing field names or structure. New `--json` implementations on other commands should follow the same conventions (snake_case keys, `serde_json::to_string_pretty`).
 
 **FR-3b.** JSON output schema documented in `nemo help ai` (FR-1). Stable field names, no presentation-level keys.
 
-**FR-3c.** When stdout is not a TTY and `--json` is not passed, commands emit the plain-text table (unchanged behavior for humans). Adding `--json` always emits JSON regardless of TTY.
+**FR-3c.** `--json` always emits JSON regardless of TTY status. Without `--json`, output is always plain text regardless of TTY status (no auto-detection). There is no implicit format switching based on whether stdout is a terminal.
 
 ### FR-4: Error messages include recovery hints
 
@@ -143,6 +201,14 @@ See also: nemo status (find loop IDs), nemo logs (watch after approve).
 
 **FR-4b.** Recovery hints are CLI-side; server doesn't change. Each hint lives in `cli/src/commands/error_hints.rs` as `(pattern, hint)` pairs. Unknown errors pass through unchanged.
 
+Matching rules:
+- Patterns are **case-insensitive substring** matches against the error message body.
+- Patterns are checked **in definition order**; **first match wins** (no accumulation).
+- Where possible, combine substring matching with HTTP status code (e.g., 409 + "approve" → state conflict hint) to reduce fragility.
+- If the server changes its error message format in a future version, hints gracefully degrade: unmatched errors pass through with no hint rather than showing a wrong hint.
+
+> **Fragility note**: String-based pattern matching is inherently coupled to server error message wording. This is acceptable for v1 since the server and CLI are co-versioned. If the server adds structured error codes in the future, hints should migrate to code-based matching.
+
 **FR-4c.** `--no-hints` flag suppresses the hints for scripting contexts where stable error output matters.
 
 ### FR-5: `nemo help --all`
@@ -151,7 +217,40 @@ See also: nemo status (find loop IDs), nemo logs (watch after approve).
 
 **FR-5b.** Output format: Markdown, headings per command. Same prose as individual `nemo help <cmd>` but concatenated.
 
-**FR-5c.** `nemo help --all --format=json` returns a single JSON object: `{ "commands": { "approve": { "short": "...", "long": "...", "options": [...] }, ... } }`.
+**FR-5c.** `nemo help --all --format=json` returns a single JSON object with the following schema:
+
+```json
+{
+  "commands": {
+    "approve": {
+      "short": "Approve a loop awaiting approval",
+      "long": "Full long_about text including examples...",
+      "options": [
+        {
+          "name": "--server",
+          "short": "-s",
+          "type": "string",
+          "required": false,
+          "description": "Control plane server URL"
+        }
+      ],
+      "positional_args": [
+        {
+          "name": "LOOP_ID",
+          "required": true,
+          "description": "Loop ID"
+        }
+      ]
+    }
+  }
+}
+```
+
+- `commands` is a map from command name to command descriptor.
+- `short`: the one-line `about` string.
+- `long`: the full `long_about` text (including examples, see-also).
+- `options`: array of flag/option descriptors. `short` is null if no short flag. `type` is one of `"string"`, `"bool"`, `"integer"`.
+- `positional_args`: array of positional argument descriptors. Omitted (or empty array) if the command takes no positional args.
 
 ### FR-6: Version + capability report
 
@@ -179,6 +278,20 @@ See also: nemo status (find loop IDs), nemo logs (watch after approve).
 
 **FR-6c.** Lets an agent check `nemo capabilities` once at startup and know what it can and cannot rely on in this CLI version. Avoids version-sniffing via `nemo --version` + external lookup.
 
+> **Implementation note**: Feature flags in `cli/src/capabilities.rs` are hardcoded boolean constants, updated manually when features ship. They are NOT Cargo feature gates — they represent server-side/product-level capability presence, not compile-time conditional compilation. The `commands` array is derived from the clap `Command` definition at build time (iterate subcommands).
+
+### Implementation Note: Custom Help Subcommand
+
+The built-in clap `help` subcommand must be replaced with a custom `Help` subcommand (using `#[command(name = "help")]` and `#[command(disable_help_subcommand = true)]` on the parent) that handles:
+
+- `help ai` / `help llm` — FR-1 mega-primer
+- `help --all` — FR-5 full dump
+- `help --format=json` — JSON output for FR-1c and FR-5c
+- `help <cmd>` — falls back to rendering the matching subcommand's `long_about` (or `about` if no `long_about` is set)
+- `help` (no args) — renders the same output as `nemo --help` (subcommand listing)
+
+The `--help` flag on individual subcommands continues to use clap's built-in `--help` handler, which naturally displays `long_about` when set.
+
 ## Non-Functional Requirements
 
 ### NFR-1: No behavior change for existing commands
@@ -190,7 +303,7 @@ All existing invocations produce identical stdout/stderr. The new flags (`--json
 - **Unit** (`cli/src/commands/help_ai.rs`): `nemo help ai` renders with no errors; contains section headings for state machine, workflows, recovery.
 - **Unit** (`cli/src/commands/*.rs`): each command's `long_about` contains "Example:" substring.
 - **Integration**: `nemo help --all --format=json` parses as valid JSON with expected keys.
-- **Manual**: run each of the FR-4 error-path scenarios, verify the hint line appears.
+- **Unit** (`cli/src/commands/error_hints.rs`): for each `(pattern, hint)` pair, assert that a synthetic error message containing the pattern produces the expected hint. Also assert that an unrecognized error message produces no hint (passthrough).
 
 ## Acceptance Criteria
 
