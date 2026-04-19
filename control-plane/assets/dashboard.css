@@ -126,8 +126,10 @@ a:hover { color: var(--primary-hover); }
   white-space: nowrap;
   overflow-x: auto;
 }
-.fleet-summary a { color: var(--text-secondary); }
+.fleet-summary a { color: var(--text-secondary); text-decoration: none; }
 .fleet-summary a:hover { color: var(--primary); }
+.fleet-summary .fleet-sep { color: var(--text-tertiary); }
+.fleet-summary .trend { font-size: 0.65rem; opacity: 0.8; }
 .fleet-summary .trend-up { color: var(--success); }
 .fleet-summary .trend-down { color: var(--error); }
 

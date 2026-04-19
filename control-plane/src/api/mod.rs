@@ -18,6 +18,9 @@ use crate::config::NautiloopConfig;
 use crate::git::GitOperations;
 use crate::state::StateStore;
 
+/// Cached stats entry: (window_key, stats_data, cached_at).
+pub type StatsCacheEntry = Option<(String, dashboard::render::StatsData, chrono::DateTime<chrono::Utc>)>;
+
 /// Shared application state for all API handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -31,6 +34,8 @@ pub struct AppState {
     /// Separate from the trait-based StateStore so we can write directly
     /// without adding snapshot methods to the test-focused trait.
     pub pool: Option<sqlx::PgPool>,
+    /// Per-instance stats cache for the dashboard (FR-14b).
+    pub stats_cache: Arc<tokio::sync::RwLock<StatsCacheEntry>>,
 }
 
 /// Build the axum router with all endpoints and auth middleware.
@@ -113,6 +118,7 @@ mod tests {
             config: Arc::new(NautiloopConfig::default()),
             kube_client: None,
             pool: None,
+            stats_cache: Arc::new(tokio::sync::RwLock::new(None)),
         };
         build_router(state)
     }
@@ -300,6 +306,7 @@ mod tests {
             config: Arc::new(NautiloopConfig::default()),
             kube_client: None,
             pool: None,
+            stats_cache: Arc::new(tokio::sync::RwLock::new(None)),
         };
         let app = build_router(state);
 

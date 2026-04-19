@@ -595,6 +595,7 @@ mod tests {
             config: Arc::new(NautiloopConfig::default()),
             kube_client: None,
             pool: None,
+            stats_cache: Arc::new(tokio::sync::RwLock::new(None)),
         };
         let router = crate::api::build_router_no_auth(state);
         (router, store)

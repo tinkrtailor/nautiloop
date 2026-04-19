@@ -97,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
                 config: config_arc,
                 kube_client: Some(kube_client),
                 pool: Some(pool.clone()),
+                stats_cache: Arc::new(tokio::sync::RwLock::new(None)),
             };
             let router = api::build_router(app_state);
 

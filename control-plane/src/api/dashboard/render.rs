@@ -1,12 +1,10 @@
 use chrono::{DateTime, Utc};
-use maud::{DOCTYPE, Markup, PreEscaped, html};
+use maud::{DOCTYPE, Markup, html};
 
 use crate::types::{JudgeDecisionRecord, LoopRecord, LoopState};
 
-static CSS: &str = include_str!("../../../assets/dashboard.css");
-static JS: &str = include_str!("../../../assets/dashboard.js");
-
 /// Render the base layout shell.
+/// CSS and JS are loaded via external links (cached by browser) rather than inlined.
 fn layout(title: &str, nav_active: &str, show_team: bool, content: Markup) -> Markup {
     html! {
         (DOCTYPE)
@@ -15,13 +13,13 @@ fn layout(title: &str, nav_active: &str, show_team: bool, content: Markup) -> Ma
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) }
-                style { (PreEscaped(CSS)) }
+                link rel="stylesheet" href="/dashboard/static/dashboard.css";
             }
             body {
                 (render_header(nav_active, show_team))
                 main { (content) }
                 div #status-bar class="status-bar" {}
-                script { (PreEscaped(JS)) }
+                script src="/dashboard/static/dashboard.js" defer {}
             }
         }
     }
@@ -130,7 +128,7 @@ pub fn render_login(error: Option<&str>) -> Markup {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { "nautiloop — login" }
-                style { (PreEscaped(CSS)) }
+                link rel="stylesheet" href="/dashboard/static/dashboard.css";
             }
             body {
                 div class="login-page" {
@@ -167,6 +165,10 @@ pub struct FleetSummary {
     pub converge_rate: Option<f64>,
     pub avg_rounds: Option<f64>,
     pub top_spender: Option<(String, f64)>,
+    /// Delta vs prior 7-day window (FR-9b)
+    pub converge_rate_trend: Option<f64>,
+    pub avg_rounds_trend: Option<f64>,
+    pub cost_trend: Option<f64>,
 }
 
 pub fn render_grid(
@@ -179,20 +181,62 @@ pub fn render_grid(
     counts: &StateCounts,
 ) -> Markup {
     layout("nautiloop", "grid", show_team, html! {
-        // Fleet summary (FR-9)
+        // Fleet summary (FR-9) with per-field links (FR-9c) and trends (FR-9b)
         div #fleet-summary class="fleet-summary" {
-            a href="/dashboard/stats" {
-                "This week \u{00B7} "
-                (fleet.total_loops) " loops \u{00B7} "
-                "$" (format!("{:.2}", fleet.total_cost)) " \u{00B7} "
-                @if let Some(rate) = fleet.converge_rate {
-                    (format!("{:.0}%", rate * 100.0)) " converged \u{00B7} "
+            span class="fleet-field" { "This week" }
+            span class="fleet-sep" { " \u{00B7} " }
+            a href="/dashboard/stats?focus=loops" class="fleet-field" {
+                (fleet.total_loops) " loops"
+            }
+            span class="fleet-sep" { " \u{00B7} " }
+            a href="/dashboard/stats?focus=cost" class="fleet-field" {
+                "$" (format!("{:.2}", fleet.total_cost))
+                @if let Some(delta) = fleet.cost_trend {
+                    span class="trend" {
+                        @if delta > 0.0 {
+                            " \u{2191}$" (format!("{:.2}", delta.abs()))
+                        } @else {
+                            " \u{2193}$" (format!("{:.2}", delta.abs()))
+                        }
+                    }
                 }
-                @if let Some(avg) = fleet.avg_rounds {
-                    "avg " (format!("{:.1}", avg)) " rounds"
+            }
+            @if let Some(rate) = fleet.converge_rate {
+                span class="fleet-sep" { " \u{00B7} " }
+                a href="/dashboard/stats?focus=converge" class="fleet-field" {
+                    (format!("{:.0}%", rate * 100.0))
+                    @if let Some(delta) = fleet.converge_rate_trend {
+                        span class="trend" {
+                            @if delta > 0.0 {
+                                " \u{2191}" (format!("{:.0}%", (delta * 100.0).abs()))
+                            } @else {
+                                " \u{2193}" (format!("{:.0}%", (delta * 100.0).abs()))
+                            }
+                        }
+                    }
+                    " converged"
                 }
-                @if let Some((ref name, cost)) = fleet.top_spender {
-                    " \u{00B7} top: " (name) " ($" (format!("{:.2}", cost)) ")"
+            }
+            @if let Some(avg) = fleet.avg_rounds {
+                span class="fleet-sep" { " \u{00B7} " }
+                a href="/dashboard/stats?focus=rounds" class="fleet-field" {
+                    "avg " (format!("{:.1}", avg))
+                    @if let Some(delta) = fleet.avg_rounds_trend {
+                        span class="trend" {
+                            @if delta < 0.0 {
+                                " \u{2191}" (format!("{:.1}", delta.abs()))
+                            } @else {
+                                " \u{2193}" (format!("{:.1}", delta.abs()))
+                            }
+                        }
+                    }
+                    " rounds"
+                }
+            }
+            @if let Some((ref name, cost)) = fleet.top_spender {
+                span class="fleet-sep" { " \u{00B7} " }
+                a href="/dashboard/stats?focus=engineer" class="fleet-field" {
+                    "top: " (name) " ($" (format!("{:.2}", cost)) ")"
                 }
             }
         }
@@ -600,6 +644,8 @@ pub fn render_feed(
     items: &[FeedItem],
     next_cursor: Option<&str>,
     filter: &str,
+    engineers: &[String],
+    active_engineer: Option<&str>,
 ) -> Markup {
     layout("Feed — nautiloop", "feed", false, html! {
         div style="padding: var(--sp-md);" {
@@ -607,11 +653,23 @@ pub fn render_feed(
                 "Notification Feed"
             }
 
-            // Filter chips (FR-12b)
+            // State filter chips (FR-12b)
             div class="chip-bar" {
-                a href="/dashboard/feed" class=(if filter == "all" { "chip active" } else { "chip" }) { "All events" }
+                a href="/dashboard/feed" class=(if filter == "all" && active_engineer.is_none() { "chip active" } else { "chip" }) { "All events" }
                 a href="/dashboard/feed?filter=converged" class=(if filter == "converged" { "chip active" } else { "chip" }) { "Converged only" }
                 a href="/dashboard/feed?filter=failed" class=(if filter == "failed" { "chip active" } else { "chip" }) { "Failed only" }
+            }
+
+            // Per-engineer filter chips (FR-12b)
+            @if !engineers.is_empty() {
+                div class="chip-bar" {
+                    @for eng in engineers {
+                        a href=(format!("/dashboard/feed?filter={}&engineer={}", filter, eng))
+                          class=(if active_engineer == Some(eng.as_str()) { "chip active" } else { "chip" }) {
+                            (eng)
+                        }
+                    }
+                }
             }
 
             div #feed-list class="feed-list" {

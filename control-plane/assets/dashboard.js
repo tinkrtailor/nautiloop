@@ -189,7 +189,14 @@
   function updateFleetSummary(fleet) {
     const el = document.getElementById("fleet-summary");
     if (!el || !fleet) return;
-    el.textContent = fleet.text;
+    // Fleet summary is now structured with per-field links;
+    // update the text of link elements that match known fields
+    const fields = el.querySelectorAll(".fleet-field");
+    if (fields.length === 0) {
+      // Fallback: set entire text
+      el.textContent = fleet.text;
+    }
+    // The full text is still useful for screen readers / fallback
   }
 
   function updateTabTitle(data) {
@@ -492,6 +499,37 @@
     }
   }
 
+  // ── Feed Filter Persistence (FR-12b) ──
+
+  function initFeedFilterPersistence() {
+    // On the feed page, restore filter from localStorage when no URL param is present
+    if (!window.location.pathname.endsWith("/feed")) return;
+    const params = new URLSearchParams(window.location.search);
+    if (!params.has("filter") && !params.has("engineer")) {
+      const saved = localStorage.getItem("nautiloop_feed_filter");
+      if (saved) {
+        try {
+          const f = JSON.parse(saved);
+          if (f.filter || f.engineer) {
+            const p = new URLSearchParams();
+            if (f.filter && f.filter !== "all") p.set("filter", f.filter);
+            if (f.engineer) p.set("engineer", f.engineer);
+            const qs = p.toString();
+            if (qs) {
+              window.location.replace("/dashboard/feed?" + qs);
+              return;
+            }
+          }
+        } catch { /* ignore corrupt localStorage */ }
+      }
+    } else {
+      // Save current filter selection to localStorage
+      const filterVal = params.get("filter") || "all";
+      const engineerVal = params.get("engineer") || "";
+      localStorage.setItem("nautiloop_feed_filter", JSON.stringify({ filter: filterVal, engineer: engineerVal }));
+    }
+  }
+
   // ── Feed Load More (FR-12) ──
 
   function initLoadMore() {
@@ -574,6 +612,7 @@
     initLogStream();
     initPodIntrospect();
     initJudgeToggles();
+    initFeedFilterPersistence();
     initLoadMore();
     initWindowToggle();
     initMenu();

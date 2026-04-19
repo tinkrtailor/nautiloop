@@ -2,10 +2,8 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{Duration, Utc};
 use std::collections::HashMap;
-use std::sync::OnceLock;
-use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use super::render;
@@ -13,16 +11,7 @@ use crate::api::AppState;
 use crate::error::NautiloopError;
 use crate::types::LoopState;
 
-/// Server-side stats cache (FR-14b): caches computed stats for 60s.
-struct StatsCache {
-    data: Option<(String, render::StatsData, DateTime<Utc>)>,
-}
-
-static STATS_CACHE: OnceLock<RwLock<StatsCache>> = OnceLock::new();
-
-fn stats_cache() -> &'static RwLock<StatsCache> {
-    STATS_CACHE.get_or_init(|| RwLock::new(StatsCache { data: None }))
-}
+// Stats cache moved to AppState to avoid global state and cross-test contamination.
 
 /// GET /dashboard/login — render login form.
 pub async fn login_page(Query(params): Query<HashMap<String, String>>) -> impl IntoResponse {
@@ -38,6 +27,11 @@ pub async fn login_submit(
 
     if api_key.is_empty() || !super::auth::validate_api_key(api_key) {
         return Redirect::to("/dashboard/login?error=Invalid+API+key").into_response();
+    }
+
+    // Validate API key contains only safe ASCII characters (prevent cookie/header injection)
+    if !api_key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.') {
+        return Redirect::to("/dashboard/login?error=Invalid+API+key+format").into_response();
     }
 
     // Set HttpOnly, Secure, SameSite=Strict cookie with 7-day expiry
@@ -101,12 +95,29 @@ pub async fn grid_page(
         .collect();
     engineer_set.sort();
 
-    // Compute per-loop metrics from rounds
+    // Compute counts from the full set BEFORE filtering (no second DB query)
+    let counts = render::StateCounts {
+        active: loops.iter().filter(|l| !l.state.is_terminal()).count(),
+        converged: loops
+            .iter()
+            .filter(|l| {
+                matches!(
+                    l.state,
+                    LoopState::Converged | LoopState::Hardened | LoopState::Shipped
+                )
+            })
+            .count(),
+        failed: loops.iter().filter(|l| l.state == LoopState::Failed).count(),
+    };
+
+    // Fetch rounds once per loop, cache costs for fleet summary
     let mut cards = Vec::with_capacity(loops.len());
+    let mut loop_costs: HashMap<Uuid, f64> = HashMap::new();
     for record in &loops {
         let rounds = state.store.get_rounds(record.id).await?;
         let (total_tokens, total_cost, last_verdict) = compute_round_metrics(&rounds);
-        let current_stage = resolve_current_stage(&state, record).await?;
+        let current_stage = resolve_current_stage_with_rounds(record, &rounds);
+        loop_costs.insert(record.id, total_cost);
 
         cards.push(render::CardData {
             record: record.clone(),
@@ -132,31 +143,8 @@ pub async fn grid_page(
         })
         .collect();
 
-    // Compute counts for filter chips (from unfiltered set)
-    let all_loops = state
-        .store
-        .get_loops_for_engineer(query.engineer.as_deref(), show_team, true)
-        .await?;
-
-    let counts = render::StateCounts {
-        active: all_loops.iter().filter(|l| !l.state.is_terminal()).count(),
-        converged: all_loops
-            .iter()
-            .filter(|l| {
-                matches!(
-                    l.state,
-                    LoopState::Converged | LoopState::Hardened | LoopState::Shipped
-                )
-            })
-            .count(),
-        failed: all_loops
-            .iter()
-            .filter(|l| l.state == LoopState::Failed)
-            .count(),
-    };
-
-    // Fleet summary (FR-9) — 7-day rolling window
-    let fleet = compute_fleet_summary(&all_loops).await;
+    // Fleet summary (FR-9) — 7-day rolling window with real costs
+    let fleet = compute_fleet_summary(&loops, &loop_costs);
 
     let engineer_filter = if show_team {
         "team".to_string()
@@ -385,14 +373,17 @@ pub async fn dashboard_state(
         .get_loops_for_engineer(query.engineer.as_deref(), show_team, true)
         .await?;
 
+    let state_filter = query.state_filter.as_deref().unwrap_or("active");
+
+    // Fetch rounds once per loop, cache for fleet summary
     let mut summaries = Vec::with_capacity(loops.len());
+    let mut loop_costs: HashMap<Uuid, f64> = HashMap::new();
     for record in &loops {
         let rounds = state.store.get_rounds(record.id).await?;
         let (total_tokens, total_cost, last_verdict) = compute_round_metrics(&rounds);
-        let current_stage = resolve_current_stage(&state, record).await?;
+        let current_stage = resolve_current_stage_with_rounds(record, &rounds);
+        loop_costs.insert(record.id, total_cost);
 
-        // Apply state filter if present
-        let state_filter = query.state_filter.as_deref().unwrap_or("active");
         let include = match state_filter {
             "active" => !record.state.is_terminal(),
             "converged" => matches!(
@@ -423,7 +414,7 @@ pub async fn dashboard_state(
         });
     }
 
-    let fleet = compute_fleet_summary(&loops).await;
+    let fleet = compute_fleet_summary(&loops, &loop_costs);
     let fleet_json = FleetSummaryJson {
         text: format_fleet_text(&fleet),
         total_loops: fleet.total_loops,
@@ -460,6 +451,8 @@ pub struct FeedQuery {
     pub filter: Option<String>,
     #[serde(default)]
     pub cursor: Option<String>,
+    #[serde(default)]
+    pub engineer: Option<String>,
 }
 
 pub async fn feed_page(
@@ -467,7 +460,22 @@ pub async fn feed_page(
     Query(query): Query<FeedQuery>,
 ) -> Result<Html<String>, NautiloopError> {
     let filter = query.filter.as_deref().unwrap_or("all");
-    let items = fetch_feed_items(&state, filter, query.cursor.as_deref(), 50).await?;
+    let engineer_filter = query.engineer.as_deref();
+    let items = fetch_feed_items(&state, filter, engineer_filter, query.cursor.as_deref(), 50).await?;
+
+    // Collect unique engineers for filter chips
+    let all_terminal = state
+        .store
+        .get_loops_for_engineer(None, true, true)
+        .await?;
+    let mut engineers: Vec<String> = all_terminal
+        .iter()
+        .filter(|l| l.state.is_terminal())
+        .map(|l| l.engineer.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    engineers.sort();
 
     let next_cursor = if items.len() >= 50 {
         items.last().map(|i| i.updated_at.to_rfc3339())
@@ -476,7 +484,7 @@ pub async fn feed_page(
     };
 
     Ok(Html(
-        render::render_feed(&items, next_cursor.as_deref(), filter).into_string(),
+        render::render_feed(&items, next_cursor.as_deref(), filter, &engineers, engineer_filter).into_string(),
     ))
 }
 
@@ -486,7 +494,8 @@ pub async fn feed_json(
     Query(query): Query<FeedQuery>,
 ) -> Result<Json<FeedJsonResponse>, NautiloopError> {
     let filter = query.filter.as_deref().unwrap_or("all");
-    let items = fetch_feed_items(&state, filter, query.cursor.as_deref(), 50).await?;
+    let engineer_filter = query.engineer.as_deref();
+    let items = fetch_feed_items(&state, filter, engineer_filter, query.cursor.as_deref(), 50).await?;
 
     let next_cursor = if items.len() >= 50 {
         items.last().map(|i| i.updated_at.to_rfc3339())
@@ -533,6 +542,7 @@ pub struct FeedJsonItem {
 async fn fetch_feed_items(
     state: &AppState,
     filter: &str,
+    engineer: Option<&str>,
     cursor: Option<&str>,
     limit: usize,
 ) -> Result<Vec<render::FeedItem>, NautiloopError> {
@@ -550,6 +560,12 @@ async fn fetch_feed_items(
         .into_iter()
         .filter(|l| {
             if !l.state.is_terminal() {
+                return false;
+            }
+            // Per-engineer filter (FR-12b)
+            if let Some(eng) = engineer
+                && l.engineer != eng
+            {
                 return false;
             }
             match filter {
@@ -697,15 +713,15 @@ pub async fn stats_json(
 }
 
 /// Compute stats with 60-second server-side cache (FR-14b).
+/// Cache is per-AppState instance (avoids global static and cross-test contamination).
 async fn compute_stats_cached(
     state: &AppState,
     window: &str,
 ) -> Result<render::StatsData, NautiloopError> {
-    let cache = stats_cache();
     // Check cache under read lock
     {
-        let guard = cache.read().await;
-        if let Some((ref cached_window, ref data, ref cached_at)) = guard.data
+        let guard = state.stats_cache.read().await;
+        if let Some((ref cached_window, ref data, ref cached_at)) = *guard
             && cached_window == window
             && Utc::now() - *cached_at < Duration::seconds(60)
         {
@@ -715,8 +731,8 @@ async fn compute_stats_cached(
     // Cache miss — compute and store under write lock
     let stats = compute_stats(state, window).await?;
     {
-        let mut guard = cache.write().await;
-        guard.data = Some((window.to_string(), stats.clone(), Utc::now()));
+        let mut guard = state.stats_cache.write().await;
+        *guard = Some((window.to_string(), stats.clone(), Utc::now()));
     }
     Ok(stats)
 }
@@ -834,29 +850,26 @@ fn extract_round_output(
     (total_tokens, cost, clean, issues, confidence)
 }
 
-/// Resolve the current stage for a loop record.
-async fn resolve_current_stage(
-    state: &AppState,
+/// Resolve the current stage for a loop record using pre-fetched rounds.
+/// This avoids additional DB queries for Hardening state resolution.
+fn resolve_current_stage_with_rounds(
     record: &crate::types::LoopRecord,
-) -> Result<Option<String>, NautiloopError> {
+    rounds: &[crate::types::RoundRecord],
+) -> Option<String> {
     if record.state.is_active_stage() {
-        let stage = match record.state {
-            LoopState::Implementing => "implement",
-            LoopState::Testing => "test",
-            LoopState::Reviewing => "review",
-            LoopState::Hardening => {
-                let rounds = state.store.get_rounds(record.id).await?;
-                return Ok(Some(
-                    rounds
-                        .iter()
-                        .rfind(|r| r.round == record.round)
-                        .map(|r| r.stage.clone())
-                        .unwrap_or_else(|| "audit".to_string()),
-                ));
-            }
-            _ => return Ok(None),
+        return match record.state {
+            LoopState::Implementing => Some("implement".to_string()),
+            LoopState::Testing => Some("test".to_string()),
+            LoopState::Reviewing => Some("review".to_string()),
+            LoopState::Hardening => Some(
+                rounds
+                    .iter()
+                    .rfind(|r| r.round == record.round)
+                    .map(|r| r.stage.clone())
+                    .unwrap_or_else(|| "audit".to_string()),
+            ),
+            _ => None,
         };
-        return Ok(Some(stage.to_string()));
     }
 
     // For paused/failed, derive from the source state
@@ -868,34 +881,40 @@ async fn resolve_current_stage(
     };
 
     match source {
-        Some(LoopState::Implementing) => Ok(Some("implement".to_string())),
-        Some(LoopState::Testing) => Ok(Some("test".to_string())),
-        Some(LoopState::Reviewing) => Ok(Some("review".to_string())),
-        Some(LoopState::Hardening) => {
-            let rounds = state.store.get_rounds(record.id).await?;
-            Ok(Some(
-                rounds
-                    .iter()
-                    .rfind(|r| r.round == record.round)
-                    .map(|r| r.stage.clone())
-                    .unwrap_or_else(|| "audit".to_string()),
-            ))
-        }
-        _ => Ok(None),
+        Some(LoopState::Implementing) => Some("implement".to_string()),
+        Some(LoopState::Testing) => Some("test".to_string()),
+        Some(LoopState::Reviewing) => Some("review".to_string()),
+        Some(LoopState::Hardening) => Some(
+            rounds
+                .iter()
+                .rfind(|r| r.round == record.round)
+                .map(|r| r.stage.clone())
+                .unwrap_or_else(|| "audit".to_string()),
+        ),
+        _ => None,
     }
 }
 
-/// Compute fleet summary from a set of loops.
-async fn compute_fleet_summary(
+/// Compute fleet summary from loops and pre-fetched per-loop costs.
+/// `loop_costs` maps loop_id -> total_cost computed from round data.
+fn compute_fleet_summary(
     loops: &[crate::types::LoopRecord],
+    loop_costs: &HashMap<Uuid, f64>,
 ) -> render::FleetSummary {
     let week_ago = Utc::now() - Duration::days(7);
+    let prior_week_start = week_ago - Duration::days(7);
     let this_week: Vec<_> = loops
         .iter()
         .filter(|l| l.created_at >= week_ago)
         .collect();
+    let prior_week: Vec<_> = loops
+        .iter()
+        .filter(|l| l.created_at >= prior_week_start && l.created_at < week_ago)
+        .collect();
 
     let total_loops = this_week.len();
+
+    // Current window metrics
     let terminal: Vec<_> = this_week
         .iter()
         .filter(|l| l.state.is_terminal())
@@ -922,36 +941,119 @@ async fn compute_fleet_summary(
         None
     };
 
-    // Top spender (approximation — we don't have round data here, use count as proxy)
-    let mut engineer_loops: HashMap<&str, usize> = HashMap::new();
+    // Total cost from actual round data
+    let total_cost: f64 = this_week
+        .iter()
+        .map(|l| loop_costs.get(&l.id).copied().unwrap_or(0.0))
+        .sum();
+
+    // Top spender by actual cost
+    let mut engineer_cost: HashMap<&str, f64> = HashMap::new();
     for l in &this_week {
-        *engineer_loops.entry(&l.engineer).or_insert(0) += 1;
+        let cost = loop_costs.get(&l.id).copied().unwrap_or(0.0);
+        *engineer_cost.entry(&l.engineer).or_insert(0.0) += cost;
     }
-    let top_spender = engineer_loops
+    let top_spender = engineer_cost
         .into_iter()
-        .max_by_key(|(_, count)| *count)
-        .map(|(name, count)| (name.to_string(), count as f64 * 0.25)); // rough estimate
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(name, cost)| (name.to_string(), cost));
+
+    // Prior-period trends (FR-9b)
+    let prior_terminal: Vec<_> = prior_week
+        .iter()
+        .filter(|l| l.state.is_terminal())
+        .collect();
+    let prior_converged = prior_terminal
+        .iter()
+        .filter(|l| {
+            matches!(
+                l.state,
+                LoopState::Converged | LoopState::Hardened | LoopState::Shipped
+            )
+        })
+        .count();
+    let prior_converge_rate = if !prior_terminal.is_empty() {
+        Some(prior_converged as f64 / prior_terminal.len() as f64)
+    } else {
+        None
+    };
+    let prior_avg_rounds = if !prior_terminal.is_empty() {
+        Some(prior_terminal.iter().map(|l| l.round as f64).sum::<f64>() / prior_terminal.len() as f64)
+    } else {
+        None
+    };
+    let prior_total_cost: f64 = prior_week
+        .iter()
+        .map(|l| loop_costs.get(&l.id).copied().unwrap_or(0.0))
+        .sum();
+
+    // Compute trend deltas (Some only when prior data exists)
+    let has_prior = !prior_week.is_empty();
+    let converge_rate_trend = if has_prior {
+        match (converge_rate, prior_converge_rate) {
+            (Some(cur), Some(prev)) => Some(cur - prev),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let avg_rounds_trend = if has_prior {
+        match (avg_rounds, prior_avg_rounds) {
+            (Some(cur), Some(prev)) => Some(cur - prev),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let cost_trend = if has_prior && prior_total_cost > 0.0 {
+        Some(total_cost - prior_total_cost)
+    } else {
+        None
+    };
 
     render::FleetSummary {
         total_loops,
-        total_cost: 0.0, // computed properly in the dashboard_state endpoint with round data
+        total_cost,
         converge_rate,
         avg_rounds,
         top_spender,
+        converge_rate_trend,
+        avg_rounds_trend,
+        cost_trend,
     }
 }
 
 fn format_fleet_text(fleet: &render::FleetSummary) -> String {
     let mut parts = vec![
-        format!("This week"),
+        "This week".to_string(),
         format!("{} loops", fleet.total_loops),
-        format!("${:.2}", fleet.total_cost),
     ];
+
+    let cost_str = format!("${:.2}", fleet.total_cost);
+    if let Some(delta) = fleet.cost_trend {
+        let arrow = if delta > 0.0 { "\u{2191}" } else { "\u{2193}" };
+        parts.push(format!("{} {}${:.2}", cost_str, arrow, delta.abs()));
+    } else {
+        parts.push(cost_str);
+    }
+
     if let Some(rate) = fleet.converge_rate {
-        parts.push(format!("{:.0}% converged", rate * 100.0));
+        let base = format!("{:.0}%", rate * 100.0);
+        if let Some(delta) = fleet.converge_rate_trend {
+            let arrow = if delta > 0.0 { "\u{2191}" } else { "\u{2193}" };
+            parts.push(format!("{} {}{:.0}% converged", base, arrow, (delta * 100.0).abs()));
+        } else {
+            parts.push(format!("{} converged", base));
+        }
     }
     if let Some(avg) = fleet.avg_rounds {
-        parts.push(format!("avg {:.1} rounds", avg));
+        let base = format!("avg {:.1}", avg);
+        if let Some(delta) = fleet.avg_rounds_trend {
+            let arrow = if delta < 0.0 { "\u{2191}" } else { "\u{2193}" }; // fewer rounds = better
+            parts.push(format!("{} {}{:.1} rounds", base, arrow, delta.abs()));
+        } else {
+            parts.push(format!("{} rounds", base));
+        }
     }
     if let Some((ref name, cost)) = fleet.top_spender {
         parts.push(format!("top: {} (${:.2})", name, cost));
@@ -1007,25 +1109,47 @@ async fn compute_stats(
         0.0
     };
 
-    // Per-engineer stats
-    let mut engineer_map: HashMap<&str, (usize, f64, usize, usize)> = HashMap::new();
+    // Fetch rounds once per loop — build per-loop cost map, then aggregate
+    let mut loop_cost_map: HashMap<Uuid, f64> = HashMap::new();
     let mut total_cost = 0.0;
-
     for l in &window_loops {
         let rounds = state.store.get_rounds(l.id).await?;
         let (_, cost, _) = compute_round_metrics(&rounds);
+        loop_cost_map.insert(l.id, cost);
         total_cost += cost;
+    }
 
-        let entry = engineer_map.entry(&l.engineer).or_insert((0, 0.0, 0, 0));
-        entry.0 += 1;
-        entry.1 += cost;
+    // Per-engineer stats (single pass)
+    let mut engineer_map: HashMap<&str, (usize, f64, usize, usize)> = HashMap::new();
+    // Per-spec stats (same single pass)
+    let mut spec_map: HashMap<&str, (usize, f64, usize, usize)> = HashMap::new();
+
+    for l in &window_loops {
+        let cost = loop_cost_map.get(&l.id).copied().unwrap_or(0.0);
+        let is_converged = matches!(
+            l.state,
+            LoopState::Converged | LoopState::Hardened | LoopState::Shipped
+        );
+
+        // Engineer aggregate
+        let eng_entry = engineer_map.entry(&l.engineer).or_insert((0, 0.0, 0, 0));
+        eng_entry.0 += 1;
+        eng_entry.1 += cost;
         if l.state.is_terminal() {
-            entry.3 += 1;
-            if matches!(
-                l.state,
-                LoopState::Converged | LoopState::Hardened | LoopState::Shipped
-            ) {
-                entry.2 += 1;
+            eng_entry.3 += 1;
+            if is_converged {
+                eng_entry.2 += 1;
+            }
+        }
+
+        // Spec aggregate
+        let spec_entry = spec_map.entry(&l.spec_path).or_insert((0, 0.0, 0, 0));
+        spec_entry.0 += 1;
+        spec_entry.1 += cost;
+        if l.state.is_terminal() {
+            spec_entry.3 += 1;
+            if is_converged {
+                spec_entry.2 += 1;
             }
         }
     }
@@ -1044,26 +1168,6 @@ async fn compute_stats(
         })
         .collect();
     per_engineer.sort_by(|a, b| b.cost.partial_cmp(&a.cost).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Per-spec stats (top 10)
-    let mut spec_map: HashMap<&str, (usize, f64, usize, usize)> = HashMap::new();
-    for l in &window_loops {
-        let rounds = state.store.get_rounds(l.id).await?;
-        let (_, cost, _) = compute_round_metrics(&rounds);
-
-        let entry = spec_map.entry(&l.spec_path).or_insert((0, 0.0, 0, 0));
-        entry.0 += 1;
-        entry.1 += cost;
-        if l.state.is_terminal() {
-            entry.3 += 1;
-            if matches!(
-                l.state,
-                LoopState::Converged | LoopState::Hardened | LoopState::Shipped
-            ) {
-                entry.2 += 1;
-            }
-        }
-    }
 
     let mut per_spec: Vec<render::SpecStats> = spec_map
         .into_iter()
@@ -1157,6 +1261,7 @@ mod tests {
             config: Arc::new(NautiloopConfig::default()),
             kube_client: None,
             pool: None,
+            stats_cache: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
@@ -1231,7 +1336,7 @@ mod tests {
         assert!(html.contains("Sign in"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_login_submit_invalid_key() {
         unsafe { std::env::set_var("NAUTILOOP_API_KEY", "test-secret-key") };
 
@@ -1257,7 +1362,7 @@ mod tests {
         assert!(location.contains("error"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_login_submit_valid_key() {
         unsafe { std::env::set_var("NAUTILOOP_API_KEY", "valid-test-key") };
 
@@ -1286,7 +1391,7 @@ mod tests {
         assert!(cookie.contains("SameSite=Strict"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_unauthenticated_redirect() {
         unsafe { std::env::set_var("NAUTILOOP_API_KEY", "secret-key") };
 
@@ -1309,7 +1414,7 @@ mod tests {
         assert_eq!(location, "/dashboard/login");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_grid_page_with_cookie_auth() {
         unsafe { std::env::set_var("NAUTILOOP_API_KEY", "grid-test-key") };
 
@@ -1342,7 +1447,7 @@ mod tests {
         assert!(html.contains("IMPLEMENTING"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_detail_page() {
         unsafe { std::env::set_var("NAUTILOOP_API_KEY", "detail-test-key") };
 
@@ -1393,7 +1498,7 @@ mod tests {
         assert!(html.contains("implement"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_dashboard_state_json() {
         unsafe { std::env::set_var("NAUTILOOP_API_KEY", "state-test-key") };
 
@@ -1465,7 +1570,7 @@ mod tests {
         assert!(ct.contains("javascript"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_logout_clears_cookie() {
         unsafe { std::env::set_var("NAUTILOOP_API_KEY", "logout-test-key") };
 
@@ -1489,7 +1594,7 @@ mod tests {
         assert!(cookie.contains("Max-Age=0"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_feed_page() {
         unsafe { std::env::set_var("NAUTILOOP_API_KEY", "feed-test-key") };
 
@@ -1522,11 +1627,9 @@ mod tests {
         assert!(html.contains("test-feature.md"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_stats_page() {
         unsafe { std::env::set_var("NAUTILOOP_API_KEY", "stats-test-key") };
-        // Clear stats cache to avoid cross-test contamination
-        { let mut guard = stats_cache().write().await; guard.data = None; }
 
         let state = test_state();
         let record = test_loop_record("alice", LoopState::Converged);
@@ -1598,7 +1701,7 @@ mod tests {
         assert_eq!(last_verdict, Some("clean".to_string()));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_bearer_auth_for_dashboard_state() {
         unsafe { std::env::set_var("NAUTILOOP_API_KEY", "bearer-test-key") };
 
@@ -1620,7 +1723,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_unauthenticated_json_returns_401() {
         unsafe { std::env::set_var("NAUTILOOP_API_KEY", "json-test-key") };
 
@@ -1640,7 +1743,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_feed_json_endpoint() {
         unsafe { std::env::set_var("NAUTILOOP_API_KEY", "feed-json-key") };
 
@@ -1672,11 +1775,9 @@ mod tests {
         assert_eq!(data.items[0].engineer, "alice");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_stats_json_endpoint() {
         unsafe { std::env::set_var("NAUTILOOP_API_KEY", "stats-json-key") };
-        // Clear stats cache to avoid cross-test contamination
-        { let mut guard = stats_cache().write().await; guard.data = None; }
 
         let state = test_state();
         let record = test_loop_record("bob", LoopState::Converged);
@@ -1705,7 +1806,7 @@ mod tests {
         assert_eq!(data.total_loops, 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_specs_page() {
         unsafe { std::env::set_var("NAUTILOOP_API_KEY", "specs-test-key") };
 
@@ -1737,7 +1838,7 @@ mod tests {
         assert!(html.contains("1 runs"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_state_filter_active() {
         unsafe { std::env::set_var("NAUTILOOP_API_KEY", "filter-test-key") };
 
