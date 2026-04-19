@@ -14,10 +14,19 @@ struct CanonicalCodexOauthBundle {
     account_id: Option<String>,
 }
 
+/// JSON output for a single provider auth result.
+#[derive(serde::Serialize)]
+struct AuthProviderResult {
+    provider: String,
+    status: String,
+    messages: Vec<String>,
+}
+
 /// Push local model credentials to the cluster.
 ///
 /// Reads local credential files, validates they exist, and registers them
 /// with the control plane so AWAITING_REAUTH loops can recover via `nemo resume`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     client: &NemoClient,
     engineer: &str,
@@ -26,6 +35,7 @@ pub async fn run(
     claude: bool,
     openai: bool,
     ssh: bool,
+    json: bool,
 ) -> Result<()> {
     if engineer.is_empty() {
         anyhow::bail!("Engineer name not configured. Run: nemo config --set engineer=<your-name>");
@@ -48,8 +58,10 @@ pub async fn run(
 
     let mut any_registered = false;
     let mut any_error = false;
+    let mut json_results: Vec<AuthProviderResult> = Vec::new();
 
     for provider in &providers {
+        let mut messages: Vec<String> = Vec::new();
         let cred_path = match *provider {
             "claude" => {
                 // Claude Code credential paths (checked in priority order)
@@ -92,15 +104,23 @@ pub async fn run(
         };
 
         if !std::path::Path::new(&cred_path).exists() {
-            eprintln!("No {provider} credentials found at {cred_path}");
-            match *provider {
-                "claude" => eprintln!("  Run: claude login"),
-                "openai" => {
-                    eprintln!("  Create {cred_path} with your OpenAI API key as content")
+            if !json {
+                eprintln!("No {provider} credentials found at {cred_path}");
+                match *provider {
+                    "claude" => eprintln!("  Run: claude login"),
+                    "openai" => {
+                        eprintln!("  Create {cred_path} with your OpenAI API key as content")
+                    }
+                    "ssh" => eprintln!("  Run: ssh-keygen -t ed25519"),
+                    _ => {}
                 }
-                "ssh" => eprintln!("  Run: ssh-keygen -t ed25519"),
-                _ => {}
             }
+            messages.push("No local token found.".to_string());
+            json_results.push(AuthProviderResult {
+                provider: provider.to_string(),
+                status: "skipped".to_string(),
+                messages,
+            });
             // If the provider was explicitly requested (not default "all"), treat as error
             if claude || openai || ssh {
                 any_error = true;
@@ -109,11 +129,7 @@ pub async fn run(
         }
 
         // Read the credential file. For Claude on macOS, prefer a fresh
-        // keychain entry over a stale disk file — Claude Code 2.x updates the
-        // macOS keychain as its OAuth refreshes, but writes the disk file
-        // less eagerly. Without this fallback, `nemo auth --claude` pushes
-        // an expired disk token while a fresh keychain token is sitting right
-        // there, and every loop immediately hits AWAITING_REAUTH.
+        // keychain entry over a stale disk file.
         let content = {
             let file_content = std::fs::read_to_string(&cred_path);
             if *provider == "claude" {
@@ -125,17 +141,30 @@ pub async fn run(
                 if file_stale {
                     match crate::claude_creds::extract_from_keychain() {
                         Some(kc) if !crate::claude_creds::is_bundle_stale(&kc, now) => {
-                            eprintln!(
-                                "Note: disk credentials at {cred_path} are stale; using fresh keychain entry."
+                            let msg = format!(
+                                "disk credentials stale at {cred_path}; using fresh keychain entry."
                             );
+                            if !json {
+                                eprintln!("Note: {msg}");
+                            }
+                            messages.push(msg);
                             kc
                         }
                         _ => match file_content {
                             Ok(c) => c,
                             Err(e) => {
-                                eprintln!(
-                                    "Warning: could not read claude credentials at {cred_path} and keychain has no fresh entry: {e}"
+                                let msg = format!(
+                                    "could not read claude credentials at {cred_path} and keychain has no fresh entry: {e}"
                                 );
+                                if !json {
+                                    eprintln!("Warning: {msg}");
+                                }
+                                messages.push(msg);
+                                json_results.push(AuthProviderResult {
+                                    provider: provider.to_string(),
+                                    status: "error".to_string(),
+                                    messages,
+                                });
                                 any_error = true;
                                 continue;
                             }
@@ -148,7 +177,18 @@ pub async fn run(
                 match file_content {
                     Ok(c) => c,
                     Err(e) => {
-                        eprintln!("Warning: could not read {provider} credentials at {cred_path}: {e}");
+                        let msg = format!(
+                            "could not read {provider} credentials at {cred_path}: {e}"
+                        );
+                        if !json {
+                            eprintln!("Warning: {msg}");
+                        }
+                        messages.push(msg);
+                        json_results.push(AuthProviderResult {
+                            provider: provider.to_string(),
+                            status: "error".to_string(),
+                            messages,
+                        });
                         any_error = true;
                         continue;
                     }
@@ -157,19 +197,38 @@ pub async fn run(
         };
 
         if content.trim().is_empty() {
-            eprintln!("Error: {provider} credentials at {cred_path} are empty");
+            let msg = format!("{provider} credentials at {cred_path} are empty");
+            if !json {
+                eprintln!("Error: {msg}");
+            }
+            messages.push(msg);
+            json_results.push(AuthProviderResult {
+                provider: provider.to_string(),
+                status: "error".to_string(),
+                messages,
+            });
             any_error = true;
             continue;
         }
 
         // For claude/openai, validate content is either valid JSON or a raw API key string.
-        // Reject obviously malformed content (e.g. truncated JSON, binary data).
         if *provider != "ssh" {
             let trimmed = content.trim();
             if trimmed.starts_with('{')
                 && serde_json::from_str::<serde_json::Value>(trimmed).is_err()
             {
-                eprintln!("Error: {provider} credentials at {cred_path} contain malformed JSON");
+                let msg = format!(
+                    "{provider} credentials at {cred_path} contain malformed JSON"
+                );
+                if !json {
+                    eprintln!("Error: {msg}");
+                }
+                messages.push(msg);
+                json_results.push(AuthProviderResult {
+                    provider: provider.to_string(),
+                    status: "error".to_string(),
+                    messages,
+                });
                 any_error = true;
                 continue;
             }
@@ -193,16 +252,43 @@ pub async fn run(
             .await
         {
             Ok(()) => {
-                println!("Registered {provider} credentials with control plane");
+                if !json {
+                    println!("Registered {provider} credentials with control plane");
+                }
+                messages.push("Token pushed to cluster.".to_string());
+                json_results.push(AuthProviderResult {
+                    provider: provider.to_string(),
+                    status: "ok".to_string(),
+                    messages,
+                });
                 any_registered = true;
             }
             Err(e) => {
-                eprintln!("Failed to register {provider} credentials: {e}");
-                eprintln!("  Credentials found locally at {cred_path} but could not be pushed.");
-                eprintln!("  Ensure the control plane is reachable and your API key is valid.");
+                let msg = format!("Failed to register {provider} credentials: {e}");
+                if !json {
+                    eprintln!("{msg}");
+                    eprintln!("  Credentials found locally at {cred_path} but could not be pushed.");
+                    eprintln!("  Ensure the control plane is reachable and your API key is valid.");
+                }
+                messages.push(msg);
+                json_results.push(AuthProviderResult {
+                    provider: provider.to_string(),
+                    status: "error".to_string(),
+                    messages,
+                });
                 any_error = true;
             }
         }
+    }
+
+    if json {
+        let output = serde_json::json!({ "results": json_results });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        // Still return error if all failed so exit code is non-zero
+        if any_error && !any_registered {
+            anyhow::bail!("All credential uploads failed");
+        }
+        return Ok(());
     }
 
     if any_registered {

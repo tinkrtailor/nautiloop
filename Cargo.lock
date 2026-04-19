@@ -2656,6 +2656,7 @@ dependencies = [
  "clap",
  "crossterm",
  "futures",
+ "nautiloop-control-plane",
  "notify-rust",
  "open",
  "ratatui",

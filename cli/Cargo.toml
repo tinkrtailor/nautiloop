@@ -34,3 +34,4 @@ desktop-notifications = ["notify-rust"]
 
 [dev-dependencies]
 tempfile = "3"
+nautiloop-control-plane = { path = "../control-plane" }

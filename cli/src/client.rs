@@ -2,6 +2,18 @@ use anyhow::Result;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 
+/// Structured API error with HTTP status and response body.
+///
+/// Returned by `NemoClient` methods on non-2xx responses. The `Display`
+/// output is identical to the previous `anyhow!("API error ...")` format
+/// so external behavior is preserved.
+#[derive(Debug, thiserror::Error)]
+#[error("API error ({status}): {body}")]
+pub struct ApiError {
+    pub status: u16,
+    pub body: String,
+}
+
 /// HTTP client wrapper for communicating with the Nemo API server.
 #[derive(Clone)]
 pub struct NemoClient {
@@ -44,7 +56,7 @@ impl NemoClient {
 
         if !status.is_success() {
             let body = resp.text().await?;
-            anyhow::bail!("API error ({status}): {body}");
+            return Err(ApiError { status: status.as_u16(), body }.into());
         }
 
         Ok(resp.json().await?)
@@ -63,7 +75,7 @@ impl NemoClient {
 
         if !status.is_success() {
             let body = resp.text().await?;
-            anyhow::bail!("API error ({status}): {body}");
+            return Err(ApiError { status: status.as_u16(), body }.into());
         }
 
         Ok(resp.json().await?)
@@ -82,7 +94,7 @@ impl NemoClient {
 
         if !status.is_success() {
             let body = resp.text().await?;
-            anyhow::bail!("API error ({status}): {body}");
+            return Err(ApiError { status: status.as_u16(), body }.into());
         }
 
         Ok(resp.json().await?)
@@ -140,7 +152,7 @@ impl NemoClient {
 
         if !status.is_success() {
             let body = resp.text().await?;
-            anyhow::bail!("API error ({status}): {body}");
+            return Err(ApiError { status: status.as_u16(), body }.into());
         }
 
         Ok(resp)
