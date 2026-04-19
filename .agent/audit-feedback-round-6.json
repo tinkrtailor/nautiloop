@@ -1,0 +1,62 @@
+{
+  "round": 6,
+  "source": "audit",
+  "issues": [
+    {
+      "severity": "high",
+      "category": "completeness",
+      "file": "specs/llm-friendly-cli.md",
+      "description": "FR-1a transition table is labeled 'authoritative' but is missing several real transitions from the driver code: (1) HARDENING → HARDENED (harden_only mode, when the harden command completes without proceeding to implement), (2) HARDENING → FAILED (judge fails, max rounds exceeded, or audit issues during hardening), (3) REVIEWING → AWAITING_APPROVAL (judge escalates during review). The spec lists HARDENED as a terminal state but never shows a transition into it. The spec also says 'all transitions above must be represented' in the ASCII diagram, so omissions here propagate to incorrect LLM understanding.",
+      "suggestion": "Add the missing transitions to the table: HARDENING → HARDENED (harden_only job completes), HARDENING → FAILED (harden job fails / max rounds), REVIEWING → AWAITING_APPROVAL (judge escalates). If any are intentionally omitted for simplicity, add a note saying the table is simplified and point to the driver source for the full picture — but given the stated goal of being 'authoritative', including them is better."
+    },
+    {
+      "severity": "medium",
+      "category": "completeness",
+      "file": "specs/llm-friendly-cli.md",
+      "description": "FR-1a transition table omits the PENDING → IMPLEMENTING path for auto_approve (ship mode). In ship mode, the reconciler skips AWAITING_APPROVAL entirely. An LLM reading the mega-primer would incorrectly believe all loops must pass through AWAITING_APPROVAL, which contradicts Workflow 3 (ship) where no approval is needed.",
+      "suggestion": "Add a transition row: PENDING → IMPLEMENTING with trigger 'Reconciler picks up loop (ship mode / auto-approve)'. Alternatively, add PENDING → AWAITING_APPROVAL → IMPLEMENTING with a note that auto-approve collapses these, but the explicit transition is cleaner."
+    },
+    {
+      "severity": "medium",
+      "category": "consistency",
+      "file": "specs/llm-friendly-cli.md",
+      "description": "FR-3b models --json schema proposes a nested `credential_status: { valid, updated_at }` object, but the server's ProviderInfo struct has flat `valid: bool` and `updated_at: Option<DateTime>` fields. The CLI would need to reshape the server response into a different structure. While not impossible, this creates a translation layer the spec's own design notes (on ExtendResponse) explicitly say to avoid: 'The CLI passes these through without renaming to avoid a translation layer.'",
+      "suggestion": "Either flatten the schema to match ProviderInfo (`\"valid\": true, \"updated_at\": \"...\"` as top-level fields per provider object), or acknowledge the intentional reshape and note why credential_status grouping is worth the translation cost."
+    },
+    {
+      "severity": "medium",
+      "category": "completeness",
+      "file": "specs/llm-friendly-cli.md",
+      "description": "FR-1a 'Typical workflow 2 (harden-first)' describes the flow for `nemo start` with default hardening, but there is no workflow showing the standalone `nemo harden` command (which sets harden_only=true and terminates at HARDENED). The harden command is listed in FR-2c as needing long_about, but its lifecycle (PENDING → HARDENING → HARDENED) is never described as a workflow. An LLM would not understand when to use `nemo harden` vs `nemo start`.",
+      "suggestion": "Add a brief 'Typical workflow 4 (harden-only)': `nemo harden spec.md` → review hardened spec PR → loop terminates at HARDENED. Explain that this is for spec refinement without implementation."
+    },
+    {
+      "severity": "medium",
+      "category": "clarity",
+      "file": "specs/llm-friendly-cli.md",
+      "description": "FR-5c option type mapping says ArgAction `SetTrue`/`SetFalse` → `bool`, everything else → `string`. But `Count` actions (e.g., `-v` verbosity) produce integers, not strings. Mapping them to `string` is technically misleading. The spec acknowledges no `integer` type but doesn't explain the Count case specifically.",
+      "suggestion": "Add a note: '`Count` actions (e.g., verbosity flags) are also mapped to `string` since they are rare and consumers should parse by context. No current nemo commands use `Count`.' — this makes the limitation explicit and confirms it doesn't affect the current command set."
+    },
+    {
+      "severity": "low",
+      "category": "completeness",
+      "file": "specs/llm-friendly-cli.md",
+      "description": "FR-6b `nemo capabilities` lists specific feature flags (qa_stage, orchestrator_judge, etc.) but does not specify how these map to actual codebase state. For example, is `orchestrator_judge` true because the judge code exists in driver.rs, or because a feature flag is enabled? The spec says 'hardcoded boolean constants, updated manually when features ship' but doesn't define the decision criteria for each flag.",
+      "suggestion": "Add a one-line definition for each feature flag (e.g., 'orchestrator_judge: true when the judge-based review escalation path is active in the loop engine'). This prevents the implementer from having to guess what each flag represents."
+    },
+    {
+      "severity": "low",
+      "category": "clarity",
+      "file": "specs/llm-friendly-cli.md",
+      "description": "The spec references 'PR #159 merge' as the baseline multiple times but doesn't clarify what #159 contains or whether the spec assumes #159's changes are already merged. If an implementer starts before #159 lands, they may encounter conflicts.",
+      "suggestion": "Add a one-line note: 'Implementation should begin after #159 is merged to main. If starting earlier, rebase onto main after #159 lands.'"
+    },
+    {
+      "severity": "low",
+      "category": "consistency",
+      "file": "specs/llm-friendly-cli.md",
+      "description": "The command count in the Baseline section says 'flat list of 17 commands' and 'bringing the count to 18 plus the custom help subcommand.' The current Commands enum has 17 variants (Harden, Start, Ship, Status, Helm, Logs, Ps, Cancel, Approve, Inspect, Resume, Extend, Init, Auth, Models, Cache, Config). Adding Capabilities makes 18. But the custom Help subcommand replaces clap's built-in help, so the user-visible count depends on whether Help is counted. The FR-6b commands array lists 19 entries (including both 'help' and 'capabilities'). Minor inconsistency in counting.",
+      "suggestion": "Clarify: '17 existing commands + capabilities (new) + custom help subcommand = 19 user-visible commands' to match the FR-6b commands array."
+    }
+  ]
+}
