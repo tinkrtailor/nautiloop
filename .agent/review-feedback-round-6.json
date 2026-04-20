@@ -1,0 +1,46 @@
+{
+  "round": 6,
+  "source": "review",
+  "issues": [
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/assets/dashboard.js",
+      "line": 45,
+      "description": "FR-2a requires 'Tab moves focus in/out of the group' per the ARIA radio group keyboard pattern. The implementation uses <button role=\"radio\"> elements which are all natively focusable, meaning Tab stops on each of the three buttons individually instead of treating the radiogroup as a single tab stop. The standard ARIA radio group pattern requires tabindex=\"0\" on the selected radio and tabindex=\"-1\" on the others, so Tab enters/exits the group in one stop and arrow keys move between items. The keyboard arrow handler correctly moves focus and selects, but Tab behavior violates the spec requirement.",
+      "suggestion": "In initTheme(), during initialization and inside sel(), set tabindex=\"0\" on the active option and tabindex=\"-1\" on the others. E.g., in sel(): `p.setAttribute('tabindex', c ? '0' : '-1');` and similarly in the initialization loop."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/assets/dashboard.css",
+      "line": 11,
+      "description": "The CSS comment claims #A29F9B has contrast '≥5.2:1 vs --bg' (#0F0F0E). Computing the actual WCAG relative luminance ratio: #A29F9B has L≈0.348, #0F0F0E has L≈0.005, yielding a contrast ratio of approximately 7.3:1 — not 5.2:1. The spec FR-1a also claims '~5.2:1'. While the actual ratio is higher (better), the documented ratio is materially wrong. The spec requires 'the implementor MUST verify the final value and document the measured ratio' (FR-1b), and the documented ratio is incorrect.",
+      "suggestion": "Verify with a standard contrast checker (e.g., WebAIM) and update the comment to reflect the actual measured ratio (~7.3:1)."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/assets/dashboard.css",
+      "line": 268,
+      "description": "The comment claims '#C4392D ≈4.6:1 vs #F0EFED (light --surface)' for the --error badge color in light mode. Computing: #C4392D has L≈0.149, #F0EFED has L≈0.865, giving contrast ≈4.6:1. This barely passes 4.5:1 (within rounding tolerance). However, FR-3c says to 'Document measured ratios' — the ratio should be verified with a proper tool and documented precisely, since being this close to the threshold means rounding differences in implementations could cause it to fail.",
+      "suggestion": "Verify #C4392D vs #F0EFED with a standards-compliant contrast calculator. If it falls below 4.5:1 at full precision, use a slightly adjusted color (e.g., #D04438 or similar) for the light-mode badge-failed override. Document the exact measured ratio."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "control-plane/assets/dashboard.css",
+      "line": 55,
+      "description": "Light-mode --text-secondary and --text-tertiary are both set to #5C5A57, eliminating visual hierarchy between secondary and tertiary text in light mode. This is acknowledged as a 'known limitation' in the comment and is spec-compliant per FR-1f, but worth noting since card metadata (tertiary) and progress text (secondary) become visually identical.",
+      "suggestion": "No code change needed for v0.6.1 — this is spec-compliant. A follow-up could find an intermediate value between #5C5A57 and #6E6C69 that passes 4.5:1 against #FAFAF8."
+    },
+    {
+      "severity": "low",
+      "category": "style",
+      "file": "control-plane/src/api/dashboard/render.rs",
+      "line": 42,
+      "description": "Server-rendered HTML hardcodes aria-checked=\"true\" on System and \"false\" on Dark/Light. If the user previously selected Dark (in localStorage), a screen reader accessing the DOM before initTheme() runs would see stale ARIA state. The menu starts hidden and initTheme() runs on DOMContentLoaded, so this is not user-visible in practice.",
+      "suggestion": "Acceptable for v0.6.1. The JS initialization corrects ARIA state before the menu can be opened."
+    }
+  ]
+}
