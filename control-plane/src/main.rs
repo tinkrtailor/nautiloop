@@ -155,7 +155,7 @@ async fn main() -> anyhow::Result<()> {
                 JudgeResolution::Enabled { model } => {
                     tracing::info!(
                         model = %model,
-                        "Orchestrator judge: enabled, model={model}",
+                        "Orchestrator judge: enabled",
                     );
                 }
                 JudgeResolution::CredentialsMissing => {

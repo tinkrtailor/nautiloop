@@ -186,13 +186,7 @@ impl SidecarJudgeClient {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    error = %e,
-                    "Failed to build reqwest client with timeout; falling back to default (no per-request timeout)"
-                );
-                reqwest::Client::default()
-            });
+            .expect("Failed to build reqwest client with 30s timeout");
         Self {
             client,
             base_url: sidecar_base_url.to_string(),
@@ -518,7 +512,9 @@ impl OrchestratorJudge {
 
         // ship-judge FR-4d: read cumulative attempt count (includes this attempt)
         // for structured logging on both success and failure paths.
-        let judge_decision_total = {
+        // Named "invocation_total" (not "decision_total") because it counts attempts
+        // including failures/timeouts, not just successful decisions.
+        let judge_invocation_total = {
             let counts = self.call_counts.lock().await;
             counts.get(&context.loop_id).copied().unwrap_or(0)
         };
@@ -532,7 +528,7 @@ impl OrchestratorJudge {
                     round = context.round,
                     error = %e,
                     duration_ms,
-                    judge_decision_total,
+                    judge_invocation_total,
                     "Judge model invocation failed, falling back to heuristic"
                 );
                 return None;
@@ -543,7 +539,7 @@ impl OrchestratorJudge {
                     loop_id = %context.loop_id,
                     round = context.round,
                     duration_ms,
-                    judge_decision_total,
+                    judge_invocation_total,
                     "Judge model timed out after 30s, falling back to heuristic"
                 );
                 return None;
@@ -559,7 +555,7 @@ impl OrchestratorJudge {
                     loop_id = %context.loop_id,
                     round = context.round,
                     response = %response_text,
-                    judge_decision_total,
+                    judge_invocation_total,
                     "Failed to parse judge response, falling back to heuristic"
                 );
                 return None;
@@ -593,7 +589,8 @@ impl OrchestratorJudge {
             );
         }
 
-        // ship-judge FR-4a: Log at INFO level with all required fields
+        // ship-judge FR-4a/FR-4d: Log at INFO level with all required fields.
+        // judge_invocation_total counts all attempts for this loop (including this one).
         tracing::info!(
             target: "judge",
             loop_id = %context.loop_id,
@@ -603,7 +600,7 @@ impl OrchestratorJudge {
             decision = %output.decision,
             confidence = ?output.confidence,
             duration_ms,
-            judge_decision_total,
+            judge_invocation_total,
             "Judge decision"
         );
 
@@ -1545,5 +1542,72 @@ mod tests {
 
         let result = client.invoke("test-model", "judge this").await;
         assert!(result.is_ok());
+    }
+
+    // --- Full integration: DirectAnthropicClient → OrchestratorJudge → store write (NFR-4) ---
+
+    #[tokio::test]
+    async fn test_full_integration_direct_client_judge_store() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock Anthropic response with valid judge JSON
+        let anthropic_response = serde_json::json!({
+            "id": "msg_integration",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "{\"decision\": \"exit_clean\", \"confidence\": 0.92, \"reasoning\": \"All issues resolved in latest round.\", \"hint\": null}"
+                }
+            ],
+            "model": "claude-haiku-4-5-20251001",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 200, "output_tokens": 60}
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("x-api-key", "sk-ant-integration-key"))
+            .and(header("anthropic-version", "2023-06-01"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&anthropic_response))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // Wire: DirectAnthropicClient → OrchestratorJudge → MemoryStateStore
+        let client = DirectAnthropicClient::with_base_url(
+            "sk-ant-integration-key".to_string(),
+            mock_server.uri(),
+        );
+        let store = Arc::new(MemoryStateStore::new());
+        let judge = OrchestratorJudge::new(
+            test_config(),
+            Arc::new(client),
+            store.clone(),
+        );
+
+        let ctx = test_context();
+        let output = judge
+            .invoke(&ctx, &JudgeTrigger::NotClean)
+            .await
+            .expect("Judge should return a decision");
+
+        // Verify decision output
+        assert_eq!(output.decision, JudgeDecision::ExitClean);
+        assert_eq!(output.confidence, Some(0.92));
+        assert_eq!(output.reasoning, Some("All issues resolved in latest round.".to_string()));
+
+        // Verify decision was persisted to the store
+        let decisions = store.get_judge_decisions(ctx.loop_id).await.unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].decision, "exit_clean");
+        assert_eq!(decisions[0].trigger, "not_clean");
+        assert_eq!(decisions[0].phase, "review");
+        assert_eq!(decisions[0].confidence, Some(0.92));
+        assert_eq!(decisions[0].reasoning, Some("All issues resolved in latest round.".to_string()));
     }
 }
