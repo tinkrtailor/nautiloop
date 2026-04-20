@@ -1,0 +1,85 @@
+{
+  "round": 9,
+  "source": "review",
+  "issues": [
+    {
+      "severity": "high",
+      "category": "correctness",
+      "file": "control-plane/assets/dashboard.js",
+      "line": 32,
+      "description": "Tab title update (FR-7a) and bell notification are broken in the default 'active' filter view. The `ut()` function counts converged loops from `d.loops`, and the `ug()` function triggers the bell based on new entries in `d.loops` with converged states. But when `state_filter=active` (the default), the `dashboard_state` handler sets `include_terminal=false` (handlers.rs:742), so converged loops are never included in the response's `loops` array. The tab title will never show '(N) nautiloop' and the bell will never fire in the default view — both FR-7a features are completely non-functional.",
+      "suggestion": "Either (a) always include recently-converged loops in the response alongside active ones (e.g., add a `recently_converged` array to `DashboardStateResponse`), or (b) have the JS detect convergence by comparing the `counts.converged` value from the fleet cache across polls, or (c) have the dashboard_state endpoint always fetch terminal loops that updated in the last 30 seconds regardless of state_filter."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/render.rs",
+      "line": 37,
+      "description": "Kill switch visibility (FR-10d) is controlled by the server-rendered `show_team` flag in the header. When a user loads `/dashboard` in 'Mine' mode (no kill switch), then taps the 'Team' chip, the JS uses `history.replaceState` + JSON poll (`gp()`) to update the card grid without a full page reload. The header HTML (including kill switch button) is never re-rendered. Result: kill switch remains hidden after switching to Team mode via chips, and conversely remains visible if the user loads in Team mode then switches to Mine. The button visibility doesn't track the actual view mode after initial render.",
+      "suggestion": "Either (a) make chip filter changes trigger a full page navigation (location.href) instead of replaceState for the engineer/team filter group, or (b) add JS to show/hide the #cancel-all-btn based on the current team/mine state."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/handlers.rs",
+      "line": 37,
+      "description": "The login CSRF cookie has Max-Age=3600 (1 hour), which is an improvement over the original 600s. However, the primary use case is mobile (FR-12d, problem statement). Mobile users commonly switch apps for extended periods (meetings, commutes), then return to the login page hours later. The CSRF cookie will have expired, causing a confusing 'Invalid request, please try again' error that looks like a system failure rather than a stale form. The user must manually reload the page to get a fresh CSRF token.",
+      "suggestion": "Increase Max-Age to 86400 (24 hours) to match the use case, or add a small JS snippet on the login page that refreshes the CSRF token when the page regains focus (visibilitychange event)."
+    },
+    {
+      "severity": "medium",
+      "category": "performance",
+      "file": "control-plane/src/state/postgres.rs",
+      "line": 456,
+      "description": "The team/all query path in get_loops_for_engineer has LIMIT 10000. The fleet summary (FR-9a), stats (FR-14), and compute_fleet_cached all depend on this method returning comprehensive data within a 7-day (or 30-day for stats) window. For long-running deployments with more than 10,000 loops, aggregates (fleet summary cost, converge rate, avg rounds, top spender, per-engineer stats) will silently show incomplete/incorrect data. The LIMIT truncates the oldest rows, which are precisely the ones needed for prior-period trend comparison (FR-9b).",
+      "suggestion": "For aggregation queries (fleet summary, stats), either remove the LIMIT and rely on the time-window filter to bound results, or add a dedicated bounded-by-time method. The 10000 cap is appropriate for the card grid but not for statistical aggregation across time windows."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/handlers.rs",
+      "line": 918,
+      "description": "fetch_feed_items_with_engineers uses a fetch-filter-fetch loop with `max_fetches = 5` and `batch_size = limit + 50 = 100`. In the worst case (filtering for 'converged' but most terminal loops are 'failed'), only 5 × 100 = 500 rows are examined. If matching items are sparse, fewer than `limit=50` results are returned and `items.len() < 50` causes the 'Load more' button to not render — even though more matching items exist in the DB. The user sees an incomplete list with no indication that more data exists.",
+      "suggestion": "Increase max_fetches to a higher value (e.g., 20) or increase batch_size, or pass the state sub-filter down to the `get_terminal_loops` DB query to avoid the fetch-filter pattern entirely."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/assets/dashboard.js",
+      "line": 38,
+      "description": "The SSE EventSource for log streaming connects to `/dashboard/stream/:id` which goes through the dashboard auth middleware. EventSource sends cookies automatically. However, EventSource does not support custom headers and cannot send CORS credentials in the same way as fetch. More critically, if the auth cookie expires while the SSE connection is open, the connection will remain active (SSE connections are long-lived). But if the connection drops and EventSource auto-reconnects, the reconnection will fail auth (expired cookie) and `sse.onerror` will fire, closing the stream permanently. The user sees logs stop with no explanation.",
+      "suggestion": "Add a visual indicator in the log pane when the SSE connection closes (e.g., 'Stream disconnected — refresh to reconnect'). This makes the failure visible rather than silent."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "docs/dashboard-setup.md",
+      "description": "The dashboard-setup.md document does not mention the new `dashboard_secure_cookie` config option in the nemo.toml [cluster] section. This option was added specifically to fix the repeatedly flagged issue where the Secure cookie flag is inferred from bind_addr, which breaks cookie delivery when running behind Tailscale without TLS termination. Without documentation, operators in this exact scenario will be stuck with no visible path to fix it.",
+      "suggestion": "Add a section to dashboard-setup.md documenting the `[cluster] dashboard_secure_cookie` option: `dashboard_secure_cookie = false  # Set to false when running behind Tailscale without TLS termination`."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "control-plane/assets/dashboard.js",
+      "line": 26,
+      "description": "FR-3d says 'auto-refreshes every 5s via a small vanilla-JS poll that fetches /status and re-renders card fields in place'. New loops that appear in polled data show a 'tap to refresh' banner instead of being rendered directly. While the banner is good UX, it deviates from the spec intent of in-place updates.",
+      "suggestion": "Acceptable as-is — the banner avoids complex HTML duplication in JS. Consider rendering new cards from JSON in a future iteration."
+    },
+    {
+      "severity": "low",
+      "category": "style",
+      "file": "control-plane/assets/dashboard.js",
+      "line": 1,
+      "description": "The JS file is hand-minified with single-letter variable names (pt, sse, lfc, csf, etc.), making it difficult to maintain and debug. A readable source with a build-time minification step would be more sustainable. The variable map comment at the top helps but doesn't fully compensate.",
+      "suggestion": "Maintain a readable source file (e.g., dashboard.src.js) and add a build.rs minification step, or accept the current approach with the variable map comment."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/render.rs",
+      "line": 505,
+      "description": "FR-12b specifies filter selection should persist in localStorage across visits. The implementation does use localStorage but restores via `location.replace()` which triggers a full page reload rather than applying the filter client-side. Minor UX friction on mobile.",
+      "suggestion": "Apply the filter client-side instead of redirecting, or accept the current behavior as adequate."
+    }
+  ]
+}
