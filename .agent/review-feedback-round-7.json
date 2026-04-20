@@ -1,0 +1,86 @@
+{
+  "round": 7,
+  "source": "review",
+  "issues": [
+    {
+      "severity": "critical",
+      "category": "correctness",
+      "file": "control-plane/assets/dashboard.js",
+      "line": 27,
+      "description": "Action buttons (Approve, Cancel, Resume, Extend) call main API endpoints (/approve/:id, /cancel/:id, /resume/:id, /extend/:id) via the JS `api()` function. These endpoints are protected by the main API auth middleware (api/auth.rs) which ONLY accepts `Authorization: Bearer` headers — it does NOT check cookies. The JS `api()` function sets `credentials: 'same-origin'` (sends cookies) but does NOT set a Bearer header. Since the `nautiloop_api_key` cookie is HttpOnly, JS cannot read it to construct a Bearer header. Result: every action button click returns 401 Unauthorized. FR-4b is completely broken. The kill switch (FR-10) is also broken for the same reason — it fans out to `/cancel/:id`.",
+      "suggestion": "Add dashboard-namespaced proxy routes (e.g., POST /dashboard/api/approve/:id, DELETE /dashboard/api/cancel/:id, etc.) that go through the dashboard auth middleware (which accepts cookies) and internally call the action logic. Update the JS `da()` function to use these dashboard-namespaced routes instead of the main API routes."
+    },
+    {
+      "severity": "high",
+      "category": "correctness",
+      "file": "control-plane/assets/dashboard.js",
+      "line": 38,
+      "description": "In the load-more handler (initLM), the badge state value `i.state` is interpolated into innerHTML without escaping: `'<span class=\"badge '+sc(i.state)+'\">'+i.state+'</span>'`. While `sc()` converts to CSS class format, the raw `i.state` text content is not escaped via `esc()`. Same applies to the construction of new feed items. If a loop state value somehow contained HTML metacharacters, this would be an XSS vector. Other fields (engineer, spec_path) correctly use `esc()`, but `i.state` does not.",
+      "suggestion": "Use `esc(i.state)` for the state text content in all innerHTML constructions in initLM."
+    },
+    {
+      "severity": "medium",
+      "category": "performance",
+      "file": "control-plane/src/state/postgres.rs",
+      "line": 456,
+      "description": "The team/all query path in get_loops_for_engineer now has NO LIMIT (`SELECT * FROM loops WHERE true... ORDER BY created_at DESC`). The dashboard_state endpoint (polled every 5s by every open dashboard tab) and grid_page call this. For long-running deployments with thousands of historical loops, this fetches every row into memory on every poll cycle. NFR-2 requires <200ms for 50 active loops, but unbounded historical data makes this unpredictable.",
+      "suggestion": "Add a reasonable LIMIT (e.g., 10000) to the unbounded query path. The dashboard grid only displays active loops anyway; historical data is needed for fleet summary which has a 60s cache. Consider adding a separate bounded method for the frequently-polled dashboard_state endpoint."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/handlers.rs",
+      "line": 77,
+      "description": "When `state.api_key` is None (env var not set), the login handler compares against an empty string via `validate_api_key_against(api_key, \"\")` which always returns false (empty check). But the dashboard auth middleware has a separate fallback to `NAUTILOOP_API_KEY` env var (auth.rs line 45). This creates an inconsistency: a user could authenticate via cookie (middleware reads env var) but be unable to log in (login_submit reads AppState.api_key which is None). The login form becomes permanently broken if AppState.api_key is not set even though the env var exists.",
+      "suggestion": "Add the same env var fallback to login_submit: `let expected = state.api_key.as_deref().or_else(|| std::env::var(\"NAUTILOOP_API_KEY\").ok().as_deref()).unwrap_or(\"\");` — or better, ensure the api_key is always populated from the env var at startup (which main.rs already does, but document this requirement)."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/handlers.rs",
+      "line": 666,
+      "description": "fetch_feed_items_with_engineers fetches `limit + 50` terminal loops from the DB, then filters by state sub-filter (converged/failed) in memory, then takes `limit`. If many of the fetched rows don't match the filter (e.g., filtering for 'converged' but most are 'failed'), fewer than `limit` results are returned. The pagination cursor is based on having `items.len() >= 50`, so users see no 'Load more' button even though more matching items exist in the DB.",
+      "suggestion": "Either pass the state sub-filter down to the DB query (add converged/failed state lists to get_terminal_loops), or use a fetch-filter-fetch loop that continues fetching until `limit` matching items are collected or the DB is exhausted."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/auth.rs",
+      "line": 76,
+      "description": "The auth middleware generates a new CSRF token on every authenticated request and appends it as a SET_COOKIE header (line 76 uses `append`, not `insert`). Over multiple requests in a session, the browser accumulates multiple `nautiloop_csrf` cookies with the same name but different values. When the browser sends these back, `extract_cookie_value` only finds the first match, which may be a stale token. This can cause CSRF validation failures for logout and other POST actions.",
+      "suggestion": "Use `response.headers_mut().insert(header::SET_COOKIE, ...)` instead of `append` for the CSRF cookie, or better yet, only set the CSRF cookie once (not on every request). Alternatively, the cookie parser could take the last match instead of the first."
+    },
+    {
+      "severity": "medium",
+      "category": "performance",
+      "file": "control-plane/assets/dashboard.js",
+      "line": 1,
+      "description": "FR-7b requires '<10 KB minified' for dashboard.js. The file is hand-minified with single-letter variable names but is served as-is via include_str! with no build-time minification step. The raw file is approximately 5-6KB which is within budget, but the CSS file (dashboard.css) is ~12KB unminified and is also served directly. Combined HTML+CSS+JS page weight likely exceeds NFR-2's '<100 KB uncompressed, <30 KB gzipped' when including server-rendered HTML. CSS and JS are loaded via external links (cached after first load), so subsequent pages are lighter, but the first load may be borderline.",
+      "suggestion": "Verify actual page weights with gzip. Consider minifying the CSS at build time or reducing redundant CSS rules. The external link approach is correct for caching."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/handlers.rs",
+      "line": 30,
+      "description": "The CSRF cookie for the login page has `Max-Age=600` (10 minutes) and is scoped to `Path=/dashboard/login`. If a user opens the login page, waits more than 10 minutes, then submits, the CSRF cookie has expired and submission silently fails with 'Invalid request, please try again'. On mobile (the primary use case), users frequently switch apps and come back later.",
+      "suggestion": "Increase Max-Age to at least 3600 (1 hour), or regenerate the CSRF token client-side when the page regains focus."
+    },
+    {
+      "severity": "low",
+      "category": "style",
+      "file": "control-plane/assets/dashboard.js",
+      "line": 1,
+      "description": "The JS file is hand-minified with single-letter variable names (pt, sse, lfc, csf, pci, etc.), making it extremely difficult to maintain and debug. A readable source with a build-time minification step would be more sustainable.",
+      "suggestion": "Write readable JS source and add a build.rs minification step, or at minimum add a comment block mapping variable names to their meanings."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/render.rs",
+      "line": 505,
+      "description": "FR-12b specifies filter selection should persist in localStorage across visits. The implementation does use localStorage (JS initFeed function) with location.replace() for restoration, which triggers a full page reload rather than client-side filter application. This is a minor UX friction on mobile.",
+      "suggestion": "Apply the filter client-side instead of redirecting, or accept the current behavior as adequate."
+    }
+  ]
+}
