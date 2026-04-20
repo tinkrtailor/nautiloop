@@ -1,0 +1,94 @@
+{
+  "round": 6,
+  "source": "review",
+  "issues": [
+    {
+      "severity": "critical",
+      "category": "correctness",
+      "file": "control-plane/assets/dashboard.js",
+      "line": 30,
+      "description": "Action buttons (Approve, Cancel, Resume, Extend) call main API endpoints (/approve/:id, /cancel/:id, /resume/:id, /extend/:id) via the JS `api()` function. These endpoints are behind the main API auth middleware (api/auth.rs) which ONLY accepts `Authorization: Bearer` headers — it does NOT check cookies. The JS `api()` function sets `credentials: 'same-origin'` (sends cookies) but does NOT include a Bearer header. Since the `nautiloop_api_key` cookie is HttpOnly, JS cannot read it. Result: every action button click returns 401 Unauthorized. FR-4b is completely broken.",
+      "suggestion": "Either (a) modify the main API auth middleware to also accept the `nautiloop_api_key` cookie as an auth mechanism (consistent with the dashboard middleware), or (b) add dashboard-namespaced proxy routes (e.g., POST /dashboard/approve/:id) that go through the dashboard auth middleware and internally call the action logic."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/handlers.rs",
+      "line": 169,
+      "description": "FR-3e 'Mine' filter relies on the `nautiloop_engineer` cookie set during login. However, both the `nautiloop_api_key` and `nautiloop_engineer` cookies are HttpOnly, and the engineer name is extracted by the auth middleware from the cookie. This part works correctly. But the `nautiloop_engineer` cookie is also set with HttpOnly, meaning the JS chip filter logic cannot know which engineer is 'mine' to pass the right query params. When the user clicks 'Mine' chip, JS removes the `team` and `engineer` query params, causing the server to use the cookie-derived engineer name. This works, but there's no visual indication to the user of WHICH engineer they are — the login form asks for a name but the grid never shows 'Viewing as: alice'.",
+      "suggestion": "Consider rendering the viewer's engineer name somewhere in the header (e.g., next to the Logout button) so users know whose loops they're viewing in 'Mine' mode."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/handlers.rs",
+      "line": 77,
+      "description": "When `state.api_key` is None (env var not set, AppState.api_key defaults to None), the login handler compares the submitted key against an empty string via `validate_api_key_against(api_key, \"\")`. The `validate_api_key_against` function returns false for empty expected keys, so login always fails. But there's no error message — it redirects to 'Invalid API key' which is misleading. More critically, the dashboard auth middleware has a separate fallback to `NAUTILOOP_API_KEY` env var, creating an inconsistency: the middleware might authenticate via env var while login_submit checks AppState.api_key.",
+      "suggestion": "Ensure login_submit also falls back to the NAUTILOOP_API_KEY env var when state.api_key is None, matching the middleware behavior. Or return a 500-level error when no API key is configured."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/handlers.rs",
+      "line": 30,
+      "description": "The CSRF cookie for the login page is scoped to `Path=/dashboard/login` but the CSRF cookie set by the auth middleware (for authenticated requests) is scoped to `Path=/dashboard`. The logout handler (POST /dashboard/logout) validates CSRF from the cookie named `nautiloop_csrf`. When a user is authenticated, the auth middleware sets a new CSRF token on every request (with Path=/dashboard). This means the CSRF token rendered in the logout form may not match the cookie if the middleware has rotated it since the page was rendered. The middleware generates a NEW CSRF token on every request and sets it as a cookie, but the form was rendered with the token from the request's extension — which was set by the middleware BEFORE running the handler. This should work because the middleware sets both the extension and the response cookie to the same value. However, the auth middleware appends to SET_COOKIE (not inserts), so multiple CSRF cookies could accumulate.",
+      "suggestion": "Use `insert` instead of `append` for the CSRF cookie in the auth middleware to avoid cookie accumulation, or scope the CSRF cookie more carefully."
+    },
+    {
+      "severity": "medium",
+      "category": "performance",
+      "file": "control-plane/src/state/postgres.rs",
+      "line": 456,
+      "description": "The team/all query path in get_loops_for_engineer now has NO LIMIT at all (`SELECT * FROM loops WHERE true... ORDER BY created_at DESC`). For long-running deployments with thousands of historical loops, this fetches every row into memory. The fleet summary, stats page, and grid page all call this. While the 60s cache helps for stats, the grid page and dashboard_state (polled every 5s by every open tab) have no caching and will fetch unbounded rows on every request.",
+      "suggestion": "Add a reasonable LIMIT (e.g., 10000) even for the unbounded path, or implement server-side pagination for the grid. At minimum, the dashboard_state endpoint (polled every 5s) should not fetch all historical loops."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/handlers.rs",
+      "line": 666,
+      "description": "fetch_feed_items_with_engineers calls state.store.get_distinct_engineers() which queries terminal loops. However, the feed page's engineer chips should include engineers who have terminal loops, which this correctly does. But get_terminal_loops is called with `limit + 50` (line following) which fetches 100 rows, then filters by state sub-filter in memory. If many of the 100 rows don't match the filter (e.g., filtering for 'converged' but most are 'failed'), fewer than 50 results may be returned, giving the impression there are no more results when there could be.",
+      "suggestion": "Increase the over-fetch ratio or use a loop that fetches more rows until the desired limit is reached."
+    },
+    {
+      "severity": "medium",
+      "category": "security",
+      "file": "control-plane/assets/dashboard.js",
+      "line": 38,
+      "description": "In the load-more handler (initLM), the badge state value (`i.state`) is interpolated into innerHTML without escaping: `'<span class=\"badge '+sc(i.state)+'\">'+i.state+'</span>'`. While `sc()` converts to lowercase and replaces underscores (safe), the raw `i.state` is inserted as text content without escaping. If a loop state somehow contained HTML, this would be XSS. The same pattern applies to the engineer and spec_path fields — `esc()` is used for those (good), but `i.state` is not escaped.",
+      "suggestion": "Use `esc(i.state)` for the state text content in the innerHTML construction."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/handlers.rs",
+      "line": 248,
+      "description": "Fleet summary computation in grid_page/dashboard_state correctly fetches all loops when not in team mode. However, `compute_fleet_summary` filters to `this_week` (last 7 days). The prior-period cost calculation (`prior_total_cost`) uses `loop_costs` which was computed from rounds of the current query's loops. For the 'mine' view, `loop_costs` only has costs for the viewer's loops, not all loops. When a second query fetches all_loops_for_fleet, `fleet_costs` is seeded from the viewer's loop_costs, and only fetches extra rounds for loops NOT already in fleet_costs. But prior_week loops belonging to OTHER engineers in the cost map would correctly get their costs computed from the extra_rounds query. This seems correct on closer inspection.",
+      "suggestion": "No change needed — the cost computation correctly handles the fleet vs. filtered view distinction."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/render.rs",
+      "line": 505,
+      "description": "FR-12b specifies per-engineer filter chips on the feed page should persist selection in localStorage across visits. The implementation does use localStorage (JS initFeed function), but the persistence is keyed as 'nf' with a JSON object. When a user visits /dashboard/feed with no query params, it checks localStorage and redirects. However, this redirect happens via `location.replace()` which triggers a full page reload, not a smooth experience.",
+      "suggestion": "Minor UX concern — consider applying the filter client-side instead of redirecting."
+    },
+    {
+      "severity": "low",
+      "category": "style",
+      "file": "control-plane/assets/dashboard.js",
+      "line": 1,
+      "description": "The JS file is hand-minified with single-letter variable names, making it very difficult to maintain and debug. FR-7b says '<10 KB minified' — the file is ~10KB of already-minified code. A readable source with a build-time minification step would be more maintainable.",
+      "suggestion": "Write readable JS source and add a build.rs minification step, or accept the current approach with inline comments explaining the minified variable names."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/handlers.rs",
+      "line": 32,
+      "description": "The login page generates a CSRF token with `Path=/dashboard/login; Max-Age=600` (10 minutes). If a user leaves the login page open for more than 10 minutes, the CSRF cookie expires and the form submission will fail with 'Invalid request, please try again'. Not a security issue but a UX annoyance.",
+      "suggestion": "Increase the Max-Age to match the session duration or regenerate on page revisit via JS."
+    }
+  ]
+}
