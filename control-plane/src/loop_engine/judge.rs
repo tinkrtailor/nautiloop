@@ -263,15 +263,25 @@ impl JudgeModelClient for SidecarJudgeClient {
 pub struct DirectAnthropicClient {
     client: reqwest::Client,
     api_key: String,
+    base_url: String,
 }
 
 impl DirectAnthropicClient {
     pub fn new(api_key: String) -> Self {
+        Self::with_base_url(api_key, "https://api.anthropic.com".to_string())
+    }
+
+    /// Construct with a custom base URL (used in tests with wiremock).
+    pub fn with_base_url(api_key: String, base_url: String) -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("Failed to build reqwest client with 30s timeout — TLS backend misconfigured");
-        Self { client, api_key }
+        Self {
+            client,
+            api_key,
+            base_url,
+        }
     }
 }
 
@@ -289,9 +299,10 @@ impl JudgeModelClient for DirectAnthropicClient {
             ]
         });
 
+        let url = format!("{}/v1/messages", self.base_url);
         let resp = self
             .client
-            .post("https://api.anthropic.com/v1/messages")
+            .post(&url)
             .header("content-type", "application/json")
             .header("anthropic-version", "2023-06-01")
             .header("x-api-key", &self.api_key)
@@ -505,23 +516,34 @@ impl OrchestratorJudge {
 
         let duration_ms = start.elapsed().as_millis() as i32;
 
+        // ship-judge FR-4d: read cumulative attempt count (includes this attempt)
+        // for structured logging on both success and failure paths.
+        let judge_decision_total = {
+            let counts = self.call_counts.lock().await;
+            counts.get(&context.loop_id).copied().unwrap_or(0)
+        };
+
         let response_text = match model_result {
             Ok(Ok(text)) => text,
             Ok(Err(e)) => {
                 tracing::warn!(
+                    target: "judge",
                     loop_id = %context.loop_id,
                     round = context.round,
                     error = %e,
                     duration_ms,
+                    judge_decision_total,
                     "Judge model invocation failed, falling back to heuristic"
                 );
                 return None;
             }
             Err(_) => {
                 tracing::warn!(
+                    target: "judge",
                     loop_id = %context.loop_id,
                     round = context.round,
                     duration_ms,
+                    judge_decision_total,
                     "Judge model timed out after 30s, falling back to heuristic"
                 );
                 return None;
@@ -533,9 +555,11 @@ impl OrchestratorJudge {
             Some(o) => o,
             None => {
                 tracing::warn!(
+                    target: "judge",
                     loop_id = %context.loop_id,
                     round = context.round,
                     response = %response_text,
+                    judge_decision_total,
                     "Failed to parse judge response, falling back to heuristic"
                 );
                 return None;
@@ -569,13 +593,7 @@ impl OrchestratorJudge {
             );
         }
 
-        // FR-4a: Cumulative attempt count for this loop (for operator grep)
-        let judge_attempt_total = {
-            let counts = self.call_counts.lock().await;
-            counts.get(&context.loop_id).copied().unwrap_or(0)
-        };
-
-        // FR-6a / FR-4a: Log at INFO level with all required fields
+        // ship-judge FR-4a: Log at INFO level with all required fields
         tracing::info!(
             target: "judge",
             loop_id = %context.loop_id,
@@ -585,7 +603,7 @@ impl OrchestratorJudge {
             decision = %output.decision,
             confidence = ?output.confidence,
             duration_ms,
-            judge_attempt_total,
+            judge_decision_total,
             "Judge decision"
         );
 
@@ -1419,5 +1437,113 @@ mod tests {
         assert_eq!(decisions[0].phase, "review");
         assert!(decisions[0].confidence.is_some());
         assert!(decisions[0].duration_ms > 0 || decisions[0].duration_ms == 0);
+    }
+
+    // --- DirectAnthropicClient HTTP integration test (NFR-4) ---
+
+    #[tokio::test]
+    async fn test_direct_anthropic_client_http_request_format() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Set up mock to return an Anthropic Messages API response
+        let anthropic_response = serde_json::json!({
+            "id": "msg_test123",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "{\"decision\": \"continue\", \"confidence\": 0.8, \"reasoning\": \"ok\", \"hint\": null}"
+                }
+            ],
+            "model": "claude-haiku-4-5-20251001",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 100, "output_tokens": 50}
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("x-api-key", "sk-ant-test-key"))
+            .and(header("anthropic-version", "2023-06-01"))
+            .and(header("content-type", "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&anthropic_response))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client =
+            DirectAnthropicClient::with_base_url("sk-ant-test-key".to_string(), mock_server.uri());
+
+        let result = client.invoke("claude-haiku-4-5", "test prompt").await;
+        assert!(result.is_ok());
+        let text = result.unwrap();
+        assert!(text.contains("continue"));
+        assert!(text.contains("confidence"));
+    }
+
+    #[tokio::test]
+    async fn test_direct_anthropic_client_non_success_status() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_string("invalid x-api-key"),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client =
+            DirectAnthropicClient::with_base_url("bad-key".to_string(), mock_server.uri());
+
+        let result = client.invoke("claude-haiku-4-5", "test prompt").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("401"));
+    }
+
+    #[tokio::test]
+    async fn test_direct_anthropic_client_request_body_format() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let expected_body = serde_json::json!({
+            "model": "test-model",
+            "max_tokens": 512,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "judge this"
+                }
+            ]
+        });
+
+        let anthropic_response = serde_json::json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_json(&expected_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&anthropic_response))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client =
+            DirectAnthropicClient::with_base_url("sk-ant-key".to_string(), mock_server.uri());
+
+        let result = client.invoke("test-model", "judge this").await;
+        assert!(result.is_ok());
     }
 }
