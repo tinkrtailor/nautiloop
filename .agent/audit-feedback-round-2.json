@@ -1,0 +1,34 @@
+{
+  "round": 2,
+  "source": "audit",
+  "issues": [
+    {
+      "severity": "medium",
+      "category": "consistency",
+      "file": "specs/ship-judge.md",
+      "description": "NFR-4 test requirement says 'Unit: DirectAnthropicClient constructs with env-var API key; with mounted OAuth bundle; errors cleanly when neither present.' However, FR-1b explicitly scopes out OAuth ('OAuth token refresh is out of scope for v1') and only defines two credential sources: NAUTILOOP_JUDGE_API_KEY env var and credentials.json with an api_key field. There is no 'OAuth bundle' credential type in the functional requirements. This stale language from an earlier draft will confuse implementers about what the second test case should actually verify.",
+      "suggestion": "Replace 'with mounted OAuth bundle' in NFR-4 with 'with credentials file at configured path' to match FR-1b's actual credential sources."
+    },
+    {
+      "severity": "medium",
+      "category": "completeness",
+      "file": "specs/ship-judge.md",
+      "description": "FR-1d specifies timeout (30s), Content-Type, and anthropic-version header but omits max_tokens for the Anthropic Messages API request body. The existing SidecarJudgeClient hard-codes max_tokens=512. DirectAnthropicClient must also set max_tokens but the spec doesn't specify the value. An implementer who doesn't read SidecarJudgeClient's source could omit it entirely or pick a different value, affecting cost and response quality.",
+      "suggestion": "Add 'max_tokens=512' to FR-1d's list of request parameters that DirectAnthropicClient must match, or explicitly state that max_tokens should match SidecarJudgeClient's value."
+    },
+    {
+      "severity": "low",
+      "category": "clarity",
+      "file": "specs/ship-judge.md",
+      "description": "FR-1d says 'must follow the same request format as SidecarJudgeClient' but DirectAnthropicClient necessarily differs: it adds x-api-key auth header (SidecarJudgeClient sends none) and targets api.anthropic.com instead of a localhost sidecar. The phrase 'same request format' is slightly misleading.",
+      "suggestion": "Reword to 'same request body format and timeout as SidecarJudgeClient' to make clear the equivalence is about the body and timeout, not the full HTTP request."
+    },
+    {
+      "severity": "low",
+      "category": "clarity",
+      "file": "specs/ship-judge.md",
+      "description": "FR-4a requires INFO logging with specific fields (loop_id, round, phase, trigger, decision, confidence, duration_ms). The existing judge.rs already logs at INFO level (lines 433-441). The spec doesn't clarify whether this is 'verify existing logging has these fields' or 'add/modify logging to include these fields', which could lead to unnecessary code churn.",
+      "suggestion": "Prefix FR-4a with 'Verify that' to make clear this is confirming existing behavior, or explicitly say 'add if missing' if new fields are needed."
+    }
+  ]
+}
