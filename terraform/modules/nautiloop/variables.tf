@@ -118,6 +118,21 @@ variable "cert_manager_version" {
   }
 }
 
+variable "dashboard_secure_cookie" {
+  description = <<-EOT
+    Controls the `Secure` flag on dashboard session cookies.
+    - null (default): auto-detect. When domain is unset (IP-only Tailscale
+      deployments), defaults to false so browsers accept cookies over plain HTTP.
+      When domain is set (TLS-fronted), defaults to true.
+    - false: never set Secure. Required for plain-HTTP deployments. Browsers
+      silently drop Secure cookies over HTTP; without this override, users
+      bounce off /dashboard/login forever.
+    - true: always set Secure. Use when you terminate TLS in front of the server.
+  EOT
+  type        = bool
+  default     = null
+}
+
 variable "postgres_password" {
   description = "Postgres password. Auto-generated if empty."
   type        = string
