@@ -623,6 +623,28 @@ impl StateStore for PgStateStore {
         Ok(rows.iter().map(row_to_round_record).collect())
     }
 
+    async fn get_rounds_for_loops(
+        &self,
+        loop_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<RoundRecord>>> {
+        if loop_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = sqlx::query(
+            "SELECT * FROM rounds WHERE loop_id = ANY($1) ORDER BY round ASC, started_at ASC",
+        )
+        .bind(loop_ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut map: std::collections::HashMap<Uuid, Vec<RoundRecord>> = std::collections::HashMap::new();
+        for row in &rows {
+            let record = row_to_round_record(row);
+            map.entry(record.loop_id).or_default().push(record);
+        }
+        Ok(map)
+    }
+
     async fn append_log(&self, event: &LogEvent) -> Result<()> {
         sqlx::query(
             "INSERT INTO log_events (id, loop_id, round, stage, timestamp, line) VALUES ($1, $2, $3, $4, $5, $6)",

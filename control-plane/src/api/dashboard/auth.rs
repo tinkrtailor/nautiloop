@@ -2,10 +2,20 @@ use axum::extract::Request;
 use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
+
+/// Extension type carrying the API key for dashboard auth.
+/// Injected as a tower Extension layer so the middleware can access it
+/// without requiring `State` extraction (which needs `from_fn_with_state`).
+#[derive(Clone)]
+pub struct DashboardApiKey(pub String);
 
 /// Dashboard auth middleware: checks for `nautiloop_api_key` cookie OR Bearer header.
 /// Unauthenticated requests to `/dashboard/*` (except `/dashboard/login` and
 /// `/dashboard/static/*`) are redirected to `/dashboard/login`.
+///
+/// Reads the expected API key from `AppState.api_key` via request extensions.
 pub async fn dashboard_auth_middleware(
     request: Request,
     next: Next,
@@ -17,12 +27,19 @@ pub async fn dashboard_auth_middleware(
         return Ok(next.run(request).await);
     }
 
-    let expected_key = std::env::var("NAUTILOOP_API_KEY").map_err(|_| {
-        tracing::error!("NAUTILOOP_API_KEY not set");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    // Extract expected key from DashboardApiKey extension (set by the router layer)
+    // or fall back to NAUTILOOP_API_KEY env var for backwards compatibility.
+    let expected_key = request
+        .extensions()
+        .get::<DashboardApiKey>()
+        .map(|k| k.0.clone())
+        .or_else(|| std::env::var("NAUTILOOP_API_KEY").ok())
+        .ok_or_else(|| {
+            tracing::error!("NAUTILOOP_API_KEY not configured");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
-    // Check Bearer header first (for JS fetch calls)
+    // Check Bearer header first (for API calls)
     let bearer_valid = request
         .headers()
         .get("authorization")
@@ -81,11 +98,9 @@ pub fn extract_cookie_value<'a>(
         })
 }
 
-/// Validate an API key against the expected key from the environment.
-pub fn validate_api_key(key: &str) -> bool {
-    let Ok(expected) = std::env::var("NAUTILOOP_API_KEY") else {
-        return false;
-    };
+/// Validate an API key against the expected key. Accepts the expected key directly
+/// rather than reading from the environment.
+pub fn validate_api_key_against(key: &str, expected: &str) -> bool {
     if key.is_empty() || expected.is_empty() {
         return false;
     }
@@ -93,12 +108,27 @@ pub fn validate_api_key(key: &str) -> bool {
 }
 
 /// Constant-time byte comparison to prevent timing side-channel attacks.
+/// Both values are hashed to a fixed-length digest before comparison,
+/// preventing length leakage via early return on length mismatch.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
+    // Hash both values to a fixed 8-byte output so the comparison
+    // is always over equal-length data — no early return on length difference.
+    let hash_a = {
+        let mut h = DefaultHasher::new();
+        a.hash(&mut h);
+        h.finish()
+    };
+    let hash_b = {
+        let mut h = DefaultHasher::new();
+        b.hash(&mut h);
+        h.finish()
+    };
+
+    let a_bytes = hash_a.to_le_bytes();
+    let b_bytes = hash_b.to_le_bytes();
+
     let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
+    for (x, y) in a_bytes.iter().zip(b_bytes.iter()) {
         diff |= x ^ y;
     }
     diff == 0
@@ -135,5 +165,15 @@ mod tests {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));
+        // Different lengths still compared safely (no early return on length)
+        assert!(!constant_time_eq(b"short", b"longer-string"));
+    }
+
+    #[test]
+    fn test_validate_api_key_against() {
+        assert!(validate_api_key_against("test-key", "test-key"));
+        assert!(!validate_api_key_against("wrong", "test-key"));
+        assert!(!validate_api_key_against("", "test-key"));
+        assert!(!validate_api_key_against("test-key", ""));
     }
 }

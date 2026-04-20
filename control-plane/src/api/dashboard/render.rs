@@ -192,7 +192,8 @@ pub fn render_grid(
             a href="/dashboard/stats?focus=cost" class="fleet-field" {
                 "$" (format!("{:.2}", fleet.total_cost))
                 @if let Some(delta) = fleet.cost_trend {
-                    span class="trend" {
+                    // Cost down = favorable (trend-up green), cost up = unfavorable (trend-down red)
+                    span class=(if delta <= 0.0 { "trend trend-up" } else { "trend trend-down" }) {
                         @if delta > 0.0 {
                             " \u{2191}$" (format!("{:.2}", delta.abs()))
                         } @else {
@@ -206,7 +207,8 @@ pub fn render_grid(
                 a href="/dashboard/stats?focus=converge" class="fleet-field" {
                     (format!("{:.0}%", rate * 100.0))
                     @if let Some(delta) = fleet.converge_rate_trend {
-                        span class="trend" {
+                        // Converge rate up = favorable (trend-up green)
+                        span class=(if delta >= 0.0 { "trend trend-up" } else { "trend trend-down" }) {
                             @if delta > 0.0 {
                                 " \u{2191}" (format!("{:.0}%", (delta * 100.0).abs()))
                             } @else {
@@ -222,7 +224,8 @@ pub fn render_grid(
                 a href="/dashboard/stats?focus=rounds" class="fleet-field" {
                     "avg " (format!("{:.1}", avg))
                     @if let Some(delta) = fleet.avg_rounds_trend {
-                        span class="trend" {
+                        // Fewer rounds = favorable (trend-up green), more = unfavorable
+                        span class=(if delta <= 0.0 { "trend trend-up" } else { "trend trend-down" }) {
                             @if delta < 0.0 {
                                 " \u{2191}" (format!("{:.1}", delta.abs()))
                             } @else {
@@ -825,28 +828,28 @@ pub fn render_stats(data: &StatsData) -> Markup {
                 }
             }
 
-            // Headline cards
+            // Headline cards (FR-9c: id anchors for focus param)
             div class="stat-cards" {
-                div class="stat-card" {
+                div #stat-loops class="stat-card" {
                     div class="stat-card-label" { "Total Loops" }
                     div class="stat-card-value" { (data.total_loops) }
                 }
-                div class="stat-card" {
+                div #stat-cost class="stat-card" {
                     div class="stat-card-label" { "Total Cost" }
                     div class="stat-card-value" { "$" (format!("{:.2}", data.total_cost)) }
                 }
-                div class="stat-card" {
+                div #stat-converge class="stat-card" {
                     div class="stat-card-label" { "Converge Rate" }
                     div class="stat-card-value" { (format!("{:.0}%", data.converge_rate * 100.0)) }
                 }
-                div class="stat-card" {
+                div #stat-rounds class="stat-card" {
                     div class="stat-card-label" { "Avg Rounds" }
                     div class="stat-card-value" { (format!("{:.1}", data.avg_rounds)) }
                 }
             }
 
             // Per-engineer table
-            h3 class="text-sm mb-md mt-md" style="color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em;" {
+            h3 #stat-engineer class="text-sm mb-md mt-md" style="color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em;" {
                 "Per Engineer"
             }
             div class="rounds-table-wrap" {

@@ -36,13 +36,16 @@ pub struct AppState {
     pub pool: Option<sqlx::PgPool>,
     /// Per-instance stats cache for the dashboard (FR-14b).
     pub stats_cache: Arc<tokio::sync::RwLock<StatsCacheEntry>>,
+    /// API key for dashboard auth. Read from NAUTILOOP_API_KEY env var at startup
+    /// and injected here so tests can set it without `unsafe { set_var() }`.
+    pub api_key: Option<String>,
 }
 
 /// Build the axum router with all endpoints and auth middleware.
 /// The /health endpoint is outside the auth layer so K8s probes work without an API key.
 pub fn build_router(state: AppState) -> Router {
     let authed = build_routes(state.clone()).layer(middleware::from_fn(auth::auth_middleware));
-    let dashboard = dashboard::build_dashboard_router();
+    let dashboard = dashboard::build_dashboard_router_with_key(state.api_key.clone());
 
     Router::new()
         .route("/health", get(health))
@@ -119,6 +122,7 @@ mod tests {
             kube_client: None,
             pool: None,
             stats_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            api_key: None,
         };
         build_router(state)
     }
@@ -190,6 +194,12 @@ mod tests {
             unimplemented!()
         }
         async fn get_rounds(&self, _: Uuid) -> crate::error::Result<Vec<RoundRecord>> {
+            unimplemented!()
+        }
+        async fn get_rounds_for_loops(
+            &self,
+            _: &[Uuid],
+        ) -> crate::error::Result<std::collections::HashMap<Uuid, Vec<RoundRecord>>> {
             unimplemented!()
         }
         async fn append_log(&self, _: &LogEvent) -> crate::error::Result<()> {
@@ -307,6 +317,7 @@ mod tests {
             kube_client: None,
             pool: None,
             stats_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            api_key: None,
         };
         let app = build_router(state);
 

@@ -21,11 +21,13 @@ pub async fn login_page(Query(params): Query<HashMap<String, String>>) -> impl I
 
 /// POST /dashboard/login — validate API key, set cookie, redirect.
 pub async fn login_submit(
+    State(state): State<AppState>,
     axum::extract::Form(form): axum::extract::Form<HashMap<String, String>>,
 ) -> Response {
     let api_key = form.get("api_key").map(|s| s.as_str()).unwrap_or("");
 
-    if api_key.is_empty() || !super::auth::validate_api_key(api_key) {
+    let expected = state.api_key.as_deref().unwrap_or("");
+    if api_key.is_empty() || !super::auth::validate_api_key_against(api_key, expected) {
         return Redirect::to("/dashboard/login?error=Invalid+API+key").into_response();
     }
 
@@ -34,10 +36,16 @@ pub async fn login_submit(
         return Redirect::to("/dashboard/login?error=Invalid+API+key+format").into_response();
     }
 
-    // Set HttpOnly, Secure, SameSite=Strict cookie with 7-day expiry
+    // Set HttpOnly, SameSite=Strict cookie with 7-day expiry.
+    // Only set `Secure` flag when not on loopback — otherwise the browser won't
+    // send the cookie back on plain HTTP (dev environments, non-TLS setups).
+    let is_loopback = state.config.cluster.bind_addr == "127.0.0.1"
+        || state.config.cluster.bind_addr == "localhost"
+        || state.config.cluster.bind_addr == "::1";
+    let secure_flag = if is_loopback { "" } else { "; Secure" };
     let cookie = format!(
-        "nautiloop_api_key={}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=604800",
-        api_key
+        "nautiloop_api_key={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800{}",
+        api_key, secure_flag
     );
 
     let mut response = Redirect::to("/dashboard").into_response();
@@ -49,9 +57,15 @@ pub async fn login_submit(
 }
 
 /// POST /dashboard/logout — clear cookie and redirect to login.
-pub async fn logout() -> Response {
-    let cookie =
-        "nautiloop_api_key=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0";
+pub async fn logout(State(state): State<AppState>) -> Response {
+    let is_loopback = state.config.cluster.bind_addr == "127.0.0.1"
+        || state.config.cluster.bind_addr == "localhost"
+        || state.config.cluster.bind_addr == "::1";
+    let secure_flag = if is_loopback { "" } else { "; Secure" };
+    let cookie = format!(
+        "nautiloop_api_key=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
+        secure_flag
+    );
     let mut response = Redirect::to("/dashboard/login").into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
@@ -110,13 +124,16 @@ pub async fn grid_page(
         failed: loops.iter().filter(|l| l.state == LoopState::Failed).count(),
     };
 
-    // Fetch rounds once per loop, cache costs for fleet summary
+    // Fetch rounds for all loops in a single query (avoids N+1)
+    let loop_ids: Vec<Uuid> = loops.iter().map(|l| l.id).collect();
+    let all_rounds = state.store.get_rounds_for_loops(&loop_ids).await?;
+
     let mut cards = Vec::with_capacity(loops.len());
     let mut loop_costs: HashMap<Uuid, f64> = HashMap::new();
     for record in &loops {
-        let rounds = state.store.get_rounds(record.id).await?;
-        let (total_tokens, total_cost, last_verdict) = compute_round_metrics(&rounds);
-        let current_stage = resolve_current_stage_with_rounds(record, &rounds);
+        let rounds = all_rounds.get(&record.id).map(|v| v.as_slice()).unwrap_or(&[]);
+        let (total_tokens, total_cost, last_verdict) = compute_round_metrics(rounds);
+        let current_stage = resolve_current_stage_with_rounds(record, rounds);
         loop_costs.insert(record.id, total_cost);
 
         cards.push(render::CardData {
@@ -143,8 +160,30 @@ pub async fn grid_page(
         })
         .collect();
 
-    // Fleet summary (FR-9) — 7-day rolling window with real costs
-    let fleet = compute_fleet_summary(&loops, &loop_costs);
+    // Fleet summary (FR-9) — always uses ALL loops regardless of current view filter.
+    // FR-9a: "Aggregates all non-terminal + terminal loops in the rolling 7-day window."
+    let all_loops_for_fleet = state
+        .store
+        .get_loops_for_engineer(None, true, true)
+        .await?;
+    // Compute costs for fleet loops (reuse already-computed costs where possible)
+    let mut fleet_costs: HashMap<Uuid, f64> = loop_costs.clone();
+    let fleet_loop_ids_needed: Vec<Uuid> = all_loops_for_fleet
+        .iter()
+        .filter(|l| !fleet_costs.contains_key(&l.id))
+        .map(|l| l.id)
+        .collect();
+    if !fleet_loop_ids_needed.is_empty() {
+        let extra_rounds = state.store.get_rounds_for_loops(&fleet_loop_ids_needed).await?;
+        for l in &all_loops_for_fleet {
+            fleet_costs.entry(l.id).or_insert_with(|| {
+                let rounds = extra_rounds.get(&l.id).map(|v| v.as_slice()).unwrap_or(&[]);
+                let (_, cost, _) = compute_round_metrics(rounds);
+                cost
+            });
+        }
+    }
+    let fleet = compute_fleet_summary(&all_loops_for_fleet, &fleet_costs);
 
     let engineer_filter = if show_team {
         "team".to_string()
@@ -375,13 +414,16 @@ pub async fn dashboard_state(
 
     let state_filter = query.state_filter.as_deref().unwrap_or("active");
 
-    // Fetch rounds once per loop, cache for fleet summary
+    // Fetch rounds for all loops in a single query (avoids N+1)
+    let loop_ids: Vec<Uuid> = loops.iter().map(|l| l.id).collect();
+    let all_rounds = state.store.get_rounds_for_loops(&loop_ids).await?;
+
     let mut summaries = Vec::with_capacity(loops.len());
     let mut loop_costs: HashMap<Uuid, f64> = HashMap::new();
     for record in &loops {
-        let rounds = state.store.get_rounds(record.id).await?;
-        let (total_tokens, total_cost, last_verdict) = compute_round_metrics(&rounds);
-        let current_stage = resolve_current_stage_with_rounds(record, &rounds);
+        let rounds = all_rounds.get(&record.id).map(|v| v.as_slice()).unwrap_or(&[]);
+        let (total_tokens, total_cost, last_verdict) = compute_round_metrics(rounds);
+        let current_stage = resolve_current_stage_with_rounds(record, rounds);
         loop_costs.insert(record.id, total_cost);
 
         let include = match state_filter {
@@ -414,7 +456,28 @@ pub async fn dashboard_state(
         });
     }
 
-    let fleet = compute_fleet_summary(&loops, &loop_costs);
+    // Fleet summary uses ALL loops regardless of current view filter (FR-9a)
+    let all_loops_for_fleet = state
+        .store
+        .get_loops_for_engineer(None, true, true)
+        .await?;
+    let mut fleet_costs: HashMap<Uuid, f64> = loop_costs.clone();
+    let fleet_ids_needed: Vec<Uuid> = all_loops_for_fleet
+        .iter()
+        .filter(|l| !fleet_costs.contains_key(&l.id))
+        .map(|l| l.id)
+        .collect();
+    if !fleet_ids_needed.is_empty() {
+        let extra = state.store.get_rounds_for_loops(&fleet_ids_needed).await?;
+        for l in &all_loops_for_fleet {
+            fleet_costs.entry(l.id).or_insert_with(|| {
+                let rounds = extra.get(&l.id).map(|v| v.as_slice()).unwrap_or(&[]);
+                let (_, cost, _) = compute_round_metrics(rounds);
+                cost
+            });
+        }
+    }
+    let fleet = compute_fleet_summary(&all_loops_for_fleet, &fleet_costs);
     let fleet_json = FleetSummaryJson {
         text: format_fleet_text(&fleet),
         total_loops: fleet.total_loops,
@@ -461,21 +524,7 @@ pub async fn feed_page(
 ) -> Result<Html<String>, NautiloopError> {
     let filter = query.filter.as_deref().unwrap_or("all");
     let engineer_filter = query.engineer.as_deref();
-    let items = fetch_feed_items(&state, filter, engineer_filter, query.cursor.as_deref(), 50).await?;
-
-    // Collect unique engineers for filter chips
-    let all_terminal = state
-        .store
-        .get_loops_for_engineer(None, true, true)
-        .await?;
-    let mut engineers: Vec<String> = all_terminal
-        .iter()
-        .filter(|l| l.state.is_terminal())
-        .map(|l| l.engineer.clone())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    engineers.sort();
+    let (items, engineers) = fetch_feed_items_with_engineers(&state, filter, engineer_filter, query.cursor.as_deref(), 50).await?;
 
     let next_cursor = if items.len() >= 50 {
         items.last().map(|i| i.updated_at.to_rfc3339())
@@ -495,7 +544,7 @@ pub async fn feed_json(
 ) -> Result<Json<FeedJsonResponse>, NautiloopError> {
     let filter = query.filter.as_deref().unwrap_or("all");
     let engineer_filter = query.engineer.as_deref();
-    let items = fetch_feed_items(&state, filter, engineer_filter, query.cursor.as_deref(), 50).await?;
+    let (items, _) = fetch_feed_items_with_engineers(&state, filter, engineer_filter, query.cursor.as_deref(), 50).await?;
 
     let next_cursor = if items.len() >= 50 {
         items.last().map(|i| i.updated_at.to_rfc3339())
@@ -539,18 +588,29 @@ pub struct FeedJsonItem {
     pub updated_at: chrono::DateTime<Utc>,
 }
 
-async fn fetch_feed_items(
+/// Fetch feed items and the set of unique engineers (from all terminal loops).
+/// Returns both in one pass over the data, avoiding a second full query.
+async fn fetch_feed_items_with_engineers(
     state: &AppState,
     filter: &str,
     engineer: Option<&str>,
     cursor: Option<&str>,
     limit: usize,
-) -> Result<Vec<render::FeedItem>, NautiloopError> {
-    // Get all terminal loops
+) -> Result<(Vec<render::FeedItem>, Vec<String>), NautiloopError> {
+    // Get all terminal loops (single query)
     let loops = state
         .store
         .get_loops_for_engineer(None, true, true)
         .await?;
+
+    // Extract unique engineers from ALL terminal loops (for filter chips)
+    let engineers: Vec<String> = loops
+        .iter()
+        .filter(|l| l.state.is_terminal())
+        .map(|l| l.engineer.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
 
     let cursor_dt = cursor
         .and_then(|c| chrono::DateTime::parse_from_rfc3339(c).ok())
@@ -583,10 +643,14 @@ async fn fetch_feed_items(
     terminal_loops.sort_by_key(|l| std::cmp::Reverse(l.updated_at));
     terminal_loops.truncate(limit);
 
+    // Fetch rounds for all terminal loops in one query
+    let feed_loop_ids: Vec<Uuid> = terminal_loops.iter().map(|l| l.id).collect();
+    let feed_rounds = state.store.get_rounds_for_loops(&feed_loop_ids).await?;
+
     let mut items = Vec::with_capacity(terminal_loops.len());
     for l in terminal_loops {
-        let rounds = state.store.get_rounds(l.id).await?;
-        let (_, total_cost, _) = compute_round_metrics(&rounds);
+        let rounds = feed_rounds.get(&l.id).map(|v| v.as_slice()).unwrap_or(&[]);
+        let (_, total_cost, _) = compute_round_metrics(rounds);
         items.push(render::FeedItem {
             loop_id: l.id,
             engineer: l.engineer.clone(),
@@ -599,7 +663,7 @@ async fn fetch_feed_items(
         });
     }
 
-    Ok(items)
+    Ok((items, engineers))
 }
 
 /// GET /dashboard/specs/:path — per-spec history (FR-13).
@@ -617,6 +681,10 @@ pub async fn specs_page(
         .filter(|l| l.spec_path == spec_path)
         .collect();
 
+    // Fetch rounds for all matching loops in one query
+    let spec_loop_ids: Vec<Uuid> = matching.iter().map(|l| l.id).collect();
+    let spec_rounds = state.store.get_rounds_for_loops(&spec_loop_ids).await?;
+
     let mut items = Vec::new();
     let mut total_cost = 0.0;
     let mut total_rounds = 0;
@@ -624,8 +692,8 @@ pub async fn specs_page(
     let terminal_count = matching.iter().filter(|l| l.state.is_terminal()).count();
 
     for l in &matching {
-        let rounds = state.store.get_rounds(l.id).await?;
-        let (_, cost, _) = compute_round_metrics(&rounds);
+        let rounds = spec_rounds.get(&l.id).map(|v| v.as_slice()).unwrap_or(&[]);
+        let (_, cost, _) = compute_round_metrics(rounds);
         total_cost += cost;
         total_rounds += l.round;
         if matches!(
@@ -1109,12 +1177,15 @@ async fn compute_stats(
         0.0
     };
 
-    // Fetch rounds once per loop — build per-loop cost map, then aggregate
+    // Fetch rounds for all window loops in a single query
+    let stats_loop_ids: Vec<Uuid> = window_loops.iter().map(|l| l.id).collect();
+    let stats_rounds = state.store.get_rounds_for_loops(&stats_loop_ids).await?;
+
     let mut loop_cost_map: HashMap<Uuid, f64> = HashMap::new();
     let mut total_cost = 0.0;
     for l in &window_loops {
-        let rounds = state.store.get_rounds(l.id).await?;
-        let (_, cost, _) = compute_round_metrics(&rounds);
+        let rounds = stats_rounds.get(&l.id).map(|v| v.as_slice()).unwrap_or(&[]);
+        let (_, cost, _) = compute_round_metrics(rounds);
         loop_cost_map.insert(l.id, cost);
         total_cost += cost;
     }
@@ -1186,6 +1257,8 @@ async fn compute_stats(
     per_spec.truncate(10);
 
     // Daily time series
+    // FR-14a: "daily count of loops started vs terminal outcomes"
+    // Started uses created_at; terminal outcomes use updated_at (when they terminated).
     let days = match window {
         "24h" => 1,
         "30d" => 30,
@@ -1200,24 +1273,31 @@ async fn compute_stats(
             .and_utc();
         let day_end = day_start + Duration::days(1);
 
-        let day_loops: Vec<_> = window_loops
+        // Loops started on this day
+        let started = window_loops
             .iter()
             .filter(|l| l.created_at >= day_start && l.created_at < day_end)
-            .collect();
+            .count();
 
-        let started = day_loops.len();
-        let converged = day_loops
+        // Terminal outcomes that landed on this day (by updated_at)
+        let converged = window_loops
             .iter()
             .filter(|l| {
-                matches!(
-                    l.state,
-                    LoopState::Converged | LoopState::Hardened | LoopState::Shipped
-                )
+                l.updated_at >= day_start
+                    && l.updated_at < day_end
+                    && matches!(
+                        l.state,
+                        LoopState::Converged | LoopState::Hardened | LoopState::Shipped
+                    )
             })
             .count();
-        let failed = day_loops
+        let failed = window_loops
             .iter()
-            .filter(|l| l.state == LoopState::Failed)
+            .filter(|l| {
+                l.updated_at >= day_start
+                    && l.updated_at < day_end
+                    && l.state == LoopState::Failed
+            })
             .count();
 
         daily_series.push(render::DayStats {
@@ -1255,6 +1335,10 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_state() -> AppState {
+        test_state_with_key("test-api-key")
+    }
+
+    fn test_state_with_key(key: &str) -> AppState {
         AppState {
             store: Arc::new(MemoryStateStore::new()),
             git: Arc::new(MockGitOperations::new()),
@@ -1262,6 +1346,7 @@ mod tests {
             kube_client: None,
             pool: None,
             stats_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            api_key: Some(key.to_string()),
         }
     }
 
@@ -1312,7 +1397,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_login_page_renders_html() {
-        let app = crate::api::dashboard::build_dashboard_router()
+        let app = crate::api::dashboard::build_dashboard_router_with_key(Some("test-api-key".to_string()))
             .with_state(test_state());
 
         let response = app
@@ -1336,11 +1421,9 @@ mod tests {
         assert!(html.contains("Sign in"));
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     async fn test_login_submit_invalid_key() {
-        unsafe { std::env::set_var("NAUTILOOP_API_KEY", "test-secret-key") };
-
-        let app = crate::api::dashboard::build_dashboard_router()
+        let app = crate::api::dashboard::build_dashboard_router_with_key(Some("test-api-key".to_string()))
             .with_state(test_state());
 
         let response = app
@@ -1362,11 +1445,9 @@ mod tests {
         assert!(location.contains("error"));
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     async fn test_login_submit_valid_key() {
-        unsafe { std::env::set_var("NAUTILOOP_API_KEY", "valid-test-key") };
-
-        let app = crate::api::dashboard::build_dashboard_router()
+        let app = crate::api::dashboard::build_dashboard_router_with_key(Some("test-api-key".to_string()))
             .with_state(test_state());
 
         let response = app
@@ -1375,7 +1456,7 @@ mod tests {
                     .method("POST")
                     .uri("/dashboard/login")
                     .header("content-type", "application/x-www-form-urlencoded")
-                    .body(Body::from("api_key=valid-test-key"))
+                    .body(Body::from("api_key=test-api-key"))
                     .unwrap(),
             )
             .await
@@ -1386,16 +1467,14 @@ mod tests {
         assert_eq!(location, "/dashboard");
         // Should set cookie
         let cookie = response.headers().get("set-cookie").unwrap().to_str().unwrap();
-        assert!(cookie.contains("nautiloop_api_key=valid-test-key"));
+        assert!(cookie.contains("nautiloop_api_key=test-api-key"));
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("SameSite=Strict"));
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     async fn test_unauthenticated_redirect() {
-        unsafe { std::env::set_var("NAUTILOOP_API_KEY", "secret-key") };
-
-        let app = crate::api::dashboard::build_dashboard_router()
+        let app = crate::api::dashboard::build_dashboard_router_with_key(Some("test-api-key".to_string()))
             .with_state(test_state());
 
         let response = app
@@ -1414,16 +1493,14 @@ mod tests {
         assert_eq!(location, "/dashboard/login");
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     async fn test_grid_page_with_cookie_auth() {
-        unsafe { std::env::set_var("NAUTILOOP_API_KEY", "grid-test-key") };
-
         let state = test_state();
         // Insert a loop
         let record = test_loop_record("alice", LoopState::Implementing);
         state.store.create_loop(&record).await.unwrap();
 
-        let app = crate::api::dashboard::build_dashboard_router()
+        let app = crate::api::dashboard::build_dashboard_router_with_key(Some("test-api-key".to_string()))
             .with_state(state);
 
         let response = app
@@ -1431,7 +1508,7 @@ mod tests {
                 Request::builder()
                     .uri("/dashboard?state_filter=all")
                     .header("accept", "text/html")
-                    .header("cookie", "nautiloop_api_key=grid-test-key")
+                    .header("cookie", "nautiloop_api_key=test-api-key")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1447,10 +1524,8 @@ mod tests {
         assert!(html.contains("IMPLEMENTING"));
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     async fn test_detail_page() {
-        unsafe { std::env::set_var("NAUTILOOP_API_KEY", "detail-test-key") };
-
         let state = test_state();
         let record = test_loop_record("bob", LoopState::Converged);
         let loop_id = record.id;
@@ -1473,7 +1548,7 @@ mod tests {
         };
         state.store.create_round(&round).await.unwrap();
 
-        let app = crate::api::dashboard::build_dashboard_router()
+        let app = crate::api::dashboard::build_dashboard_router_with_key(Some("test-api-key".to_string()))
             .with_state(state);
 
         let response = app
@@ -1481,7 +1556,7 @@ mod tests {
                 Request::builder()
                     .uri(&format!("/dashboard/loops/{}", loop_id))
                     .header("accept", "text/html")
-                    .header("cookie", "nautiloop_api_key=detail-test-key")
+                    .header("cookie", "nautiloop_api_key=test-api-key")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1498,22 +1573,20 @@ mod tests {
         assert!(html.contains("implement"));
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     async fn test_dashboard_state_json() {
-        unsafe { std::env::set_var("NAUTILOOP_API_KEY", "state-test-key") };
-
         let state = test_state();
         let record = test_loop_record("alice", LoopState::Implementing);
         state.store.create_loop(&record).await.unwrap();
 
-        let app = crate::api::dashboard::build_dashboard_router()
+        let app = crate::api::dashboard::build_dashboard_router_with_key(Some("test-api-key".to_string()))
             .with_state(state);
 
         let response = app
             .oneshot(
                 Request::builder()
                     .uri("/dashboard/state?state_filter=all")
-                    .header("authorization", "Bearer state-test-key")
+                    .header("authorization", "Bearer test-api-key")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1532,7 +1605,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_static_css() {
-        let app = crate::api::dashboard::build_dashboard_router()
+        let app = crate::api::dashboard::build_dashboard_router_with_key(Some("test-api-key".to_string()))
             .with_state(test_state());
 
         let response = app
@@ -1552,7 +1625,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_static_js() {
-        let app = crate::api::dashboard::build_dashboard_router()
+        let app = crate::api::dashboard::build_dashboard_router_with_key(Some("test-api-key".to_string()))
             .with_state(test_state());
 
         let response = app
@@ -1570,11 +1643,9 @@ mod tests {
         assert!(ct.contains("javascript"));
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     async fn test_logout_clears_cookie() {
-        unsafe { std::env::set_var("NAUTILOOP_API_KEY", "logout-test-key") };
-
-        let app = crate::api::dashboard::build_dashboard_router()
+        let app = crate::api::dashboard::build_dashboard_router_with_key(Some("test-api-key".to_string()))
             .with_state(test_state());
 
         let response = app
@@ -1582,7 +1653,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/dashboard/logout")
-                    .header("cookie", "nautiloop_api_key=logout-test-key")
+                    .header("cookie", "nautiloop_api_key=test-api-key")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1594,16 +1665,14 @@ mod tests {
         assert!(cookie.contains("Max-Age=0"));
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     async fn test_feed_page() {
-        unsafe { std::env::set_var("NAUTILOOP_API_KEY", "feed-test-key") };
-
         let state = test_state();
         let mut record = test_loop_record("alice", LoopState::Converged);
         record.spec_pr_url = Some("https://github.com/test/repo/pull/1".to_string());
         state.store.create_loop(&record).await.unwrap();
 
-        let app = crate::api::dashboard::build_dashboard_router()
+        let app = crate::api::dashboard::build_dashboard_router_with_key(Some("test-api-key".to_string()))
             .with_state(state);
 
         let response = app
@@ -1611,7 +1680,7 @@ mod tests {
                 Request::builder()
                     .uri("/dashboard/feed")
                     .header("accept", "text/html")
-                    .header("cookie", "nautiloop_api_key=feed-test-key")
+                    .header("cookie", "nautiloop_api_key=test-api-key")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1627,15 +1696,13 @@ mod tests {
         assert!(html.contains("test-feature.md"));
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     async fn test_stats_page() {
-        unsafe { std::env::set_var("NAUTILOOP_API_KEY", "stats-test-key") };
-
         let state = test_state();
         let record = test_loop_record("alice", LoopState::Converged);
         state.store.create_loop(&record).await.unwrap();
 
-        let app = crate::api::dashboard::build_dashboard_router()
+        let app = crate::api::dashboard::build_dashboard_router_with_key(Some("test-api-key".to_string()))
             .with_state(state);
 
         let response = app
@@ -1643,7 +1710,7 @@ mod tests {
                 Request::builder()
                     .uri("/dashboard/stats?window=7d")
                     .header("accept", "text/html")
-                    .header("cookie", "nautiloop_api_key=stats-test-key")
+                    .header("cookie", "nautiloop_api_key=test-api-key")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1701,11 +1768,9 @@ mod tests {
         assert_eq!(last_verdict, Some("clean".to_string()));
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     async fn test_bearer_auth_for_dashboard_state() {
-        unsafe { std::env::set_var("NAUTILOOP_API_KEY", "bearer-test-key") };
-
-        let app = crate::api::dashboard::build_dashboard_router()
+        let app = crate::api::dashboard::build_dashboard_router_with_key(Some("test-api-key".to_string()))
             .with_state(test_state());
 
         // Should succeed with bearer token
@@ -1713,7 +1778,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/dashboard/state")
-                    .header("authorization", "Bearer bearer-test-key")
+                    .header("authorization", "Bearer test-api-key")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1723,11 +1788,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     async fn test_unauthenticated_json_returns_401() {
-        unsafe { std::env::set_var("NAUTILOOP_API_KEY", "json-test-key") };
-
-        let app = crate::api::dashboard::build_dashboard_router()
+        let app = crate::api::dashboard::build_dashboard_router_with_key(Some("test-api-key".to_string()))
             .with_state(test_state());
 
         let response = app
@@ -1743,23 +1806,21 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     async fn test_feed_json_endpoint() {
-        unsafe { std::env::set_var("NAUTILOOP_API_KEY", "feed-json-key") };
-
         let state = test_state();
         let mut record = test_loop_record("alice", LoopState::Converged);
         record.spec_pr_url = Some("https://github.com/test/repo/pull/2".to_string());
         state.store.create_loop(&record).await.unwrap();
 
-        let app = crate::api::dashboard::build_dashboard_router()
+        let app = crate::api::dashboard::build_dashboard_router_with_key(Some("test-api-key".to_string()))
             .with_state(state);
 
         let response = app
             .oneshot(
                 Request::builder()
                     .uri("/dashboard/feed/json")
-                    .header("authorization", "Bearer feed-json-key")
+                    .header("authorization", "Bearer test-api-key")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1775,22 +1836,20 @@ mod tests {
         assert_eq!(data.items[0].engineer, "alice");
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     async fn test_stats_json_endpoint() {
-        unsafe { std::env::set_var("NAUTILOOP_API_KEY", "stats-json-key") };
-
         let state = test_state();
         let record = test_loop_record("bob", LoopState::Converged);
         state.store.create_loop(&record).await.unwrap();
 
-        let app = crate::api::dashboard::build_dashboard_router()
+        let app = crate::api::dashboard::build_dashboard_router_with_key(Some("test-api-key".to_string()))
             .with_state(state);
 
         let response = app
             .oneshot(
                 Request::builder()
                     .uri("/dashboard/stats/json?window=7d")
-                    .header("authorization", "Bearer stats-json-key")
+                    .header("authorization", "Bearer test-api-key")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1806,15 +1865,13 @@ mod tests {
         assert_eq!(data.total_loops, 1);
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     async fn test_specs_page() {
-        unsafe { std::env::set_var("NAUTILOOP_API_KEY", "specs-test-key") };
-
         let state = test_state();
         let record = test_loop_record("alice", LoopState::Converged);
         state.store.create_loop(&record).await.unwrap();
 
-        let app = crate::api::dashboard::build_dashboard_router()
+        let app = crate::api::dashboard::build_dashboard_router_with_key(Some("test-api-key".to_string()))
             .with_state(state);
 
         let response = app
@@ -1822,7 +1879,7 @@ mod tests {
                 Request::builder()
                     .uri("/dashboard/specs/specs/test-feature.md")
                     .header("accept", "text/html")
-                    .header("cookie", "nautiloop_api_key=specs-test-key")
+                    .header("cookie", "nautiloop_api_key=test-api-key")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1838,10 +1895,8 @@ mod tests {
         assert!(html.contains("1 runs"));
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     async fn test_state_filter_active() {
-        unsafe { std::env::set_var("NAUTILOOP_API_KEY", "filter-test-key") };
-
         let state = test_state();
         // Create one active and one terminal loop
         let active = test_loop_record("alice", LoopState::Implementing);
@@ -1849,14 +1904,14 @@ mod tests {
         state.store.create_loop(&active).await.unwrap();
         state.store.create_loop(&terminal).await.unwrap();
 
-        let app = crate::api::dashboard::build_dashboard_router()
+        let app = crate::api::dashboard::build_dashboard_router_with_key(Some("test-api-key".to_string()))
             .with_state(state);
 
         let response = app
             .oneshot(
                 Request::builder()
                     .uri("/dashboard/state?state_filter=active&team=true")
-                    .header("authorization", "Bearer filter-test-key")
+                    .header("authorization", "Bearer test-api-key")
                     .body(Body::empty())
                     .unwrap(),
             )

@@ -4,7 +4,6 @@
 (function () {
   "use strict";
 
-  const API_KEY = getCookie("nautiloop_api_key") || "";
   let pollTimer = null;
   let sseSource = null;
   let lastFocusConvergedCount = 0;
@@ -15,17 +14,11 @@
 
   // ── Helpers ──
 
-  function getCookie(name) {
-    const match = document.cookie.match(new RegExp("(?:^|; )" + name + "=([^;]*)"));
-    return match ? decodeURIComponent(match[1]) : "";
-  }
-
-  function authHeaders() {
-    return { Authorization: "Bearer " + API_KEY, "Content-Type": "application/json" };
-  }
-
   async function apiFetch(url, opts = {}) {
-    opts.headers = Object.assign(authHeaders(), opts.headers || {});
+    // Auth is handled by the browser-sent HttpOnly cookie (same-origin).
+    // No Bearer header needed — the cookie is automatically included.
+    opts.headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
+    opts.credentials = "same-origin";
     const res = await fetch(url, opts);
     if (!res.ok) {
       const body = await res.text();
@@ -471,7 +464,7 @@
           " MB</p>";
       }
       if (data.worktree) {
-        html += '<p class="text-sm text-muted">HEAD: ' + (data.worktree.head_sha || "—") + "</p>";
+        html += '<p class="text-sm text-muted">HEAD: ' + escapeHtml(data.worktree.head_sha || "—") + "</p>";
       }
       body.innerHTML = html;
     } catch {
@@ -603,6 +596,21 @@
     });
   }
 
+  // ── Stats Focus Scroll (FR-9c) ──
+
+  function initStatsFocus() {
+    const params = new URLSearchParams(location.search);
+    const focus = params.get("focus");
+    if (!focus) return;
+    const el = document.getElementById("stat-" + focus);
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      el.style.outline = "2px solid var(--primary)";
+      el.style.outlineOffset = "4px";
+      setTimeout(() => { el.style.outline = ""; el.style.outlineOffset = ""; }, 2000);
+    }
+  }
+
   // ── Init ──
 
   function init() {
@@ -616,6 +624,7 @@
     initLoadMore();
     initWindowToggle();
     initMenu();
+    initStatsFocus();
     startGridPoll();
   }
 

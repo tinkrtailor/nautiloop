@@ -10,9 +10,12 @@ use super::AppState;
 
 /// Build the dashboard router. All routes are under `/dashboard/*`.
 /// Auth middleware redirects unauthenticated requests to `/dashboard/login`.
-pub fn build_dashboard_router() -> Router<AppState> {
+///
+/// Accepts the API key to inject into the auth middleware via Extension.
+/// When `api_key` is `None`, the middleware falls back to the `NAUTILOOP_API_KEY` env var.
+pub fn build_dashboard_router_with_key(api_key: Option<String>) -> Router<AppState> {
     // Routes that need auth
-    let authed = Router::new()
+    let mut authed = Router::new()
         .route("/dashboard", get(handlers::grid_page))
         .route("/dashboard/loops/{id}", get(handlers::detail_page))
         .route("/dashboard/stream/{id}", get(handlers::stream_logs))
@@ -25,6 +28,10 @@ pub fn build_dashboard_router() -> Router<AppState> {
         .route("/dashboard/logout", post(handlers::logout))
         .layer(middleware::from_fn(auth::dashboard_auth_middleware));
 
+    if let Some(key) = api_key {
+        authed = authed.layer(axum::Extension(auth::DashboardApiKey(key)));
+    }
+
     // Public routes (no auth required)
     let public = Router::new()
         .route("/dashboard/login", get(handlers::login_page).post(handlers::login_submit))
@@ -32,4 +39,10 @@ pub fn build_dashboard_router() -> Router<AppState> {
         .route("/dashboard/static/dashboard.js", get(handlers::static_js));
 
     Router::new().merge(authed).merge(public)
+}
+
+/// Build the dashboard router (legacy convenience, reads key from env).
+pub fn build_dashboard_router() -> Router<AppState> {
+    let api_key = std::env::var("NAUTILOOP_API_KEY").ok();
+    build_dashboard_router_with_key(api_key)
 }
