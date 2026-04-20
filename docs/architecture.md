@@ -346,6 +346,10 @@ Engineer                API Server          Postgres            Loop Engine     
   |<-----------------------|                   |                    |                        |
 ```
 
+### QA Stage (deferred)
+
+Deferred v2 work: runs acceptance-criteria verification after review-clean, before CONVERGED. Gated by `[qa] enabled = true` in nemo.toml. See `specs/qa-stage.md`.
+
 ---
 
 ## 4. State Machine Diagram
@@ -448,6 +452,16 @@ Engineer                API Server          Postgres            Loop Engine     
                                                      v
                                            {prev stage}/DISPATCHED
 
+  FAILED ----[nemo extend --add N]----> {failed_from_state}/DISPATCHED
+             (only when failed_from_state is set; resumes at the
+              stage where the loop failed, e.g. IMPLEMENTING or REVIEWING)
+
+  NOTE: LoopRecord carries two resume-tracking fields:
+    - reauth_from_state: which stage the loop was in when it entered
+      AWAITING_REAUTH, enabling correct resume to the interrupted stage.
+    - failed_from_state: which stage the loop was in when it entered
+      FAILED, enabling `nemo extend` to resume at the right point.
+
   ============================================================
   SUB-STATE TRANSITIONS (within each stage):
   ============================================================
@@ -465,7 +479,98 @@ Engineer                API Server          Postgres            Loop Engine     
 
 ---
 
-## 5. Control Plane Communication
+## 5. Orchestrator Judge
+
+The orchestrator judge is an LLM call at loop transition points that decides `continue | exit_clean | exit_escalate | exit_fail` when the reviewer's verdict is ambiguous or the loop is churning.
+
+**Where it runs:** in-process from the loop engine, reusing the sidecar model proxy. It is NOT a separate pod — the loop engine makes a direct model API call through the existing proxy infrastructure.
+
+**When it fires:**
+
+- On review-clean-but-with-medium+-severity issues remaining
+- On `round >= max_rounds` with recurring findings across rounds
+- On audit ambiguity (reviewer verdict contradicts its own prior round)
+
+**Data it reads:**
+
+- Full spec text
+- Round history (all prior verdicts and findings)
+- Current verdict and finding list
+- Recurring-finding analysis (findings that appeared in 2+ consecutive rounds)
+
+**Storage:** every judge decision is persisted to the `judge_decisions` table:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `loop_id` | UUID | Foreign key to loops |
+| `round` | int | Round number when judge fired |
+| `phase` | text | `implement` or `harden` |
+| `trigger` | text | Why the judge was invoked (e.g. `recurring_findings`, `ambiguous_verdict`) |
+| `input_json` | jsonb | Snapshot of data sent to the judge |
+| `decision` | text | One of `continue`, `exit_clean`, `exit_escalate`, `exit_fail` |
+| `confidence` | float | Model-reported confidence (0.0–1.0) |
+| `reasoning` | text | Model-generated explanation |
+| `hint` | text | Optional hint passed to the next agent round |
+| `duration_ms` | int | Wall-clock time for the judge call |
+| `created_at` | timestamptz | When the decision was recorded |
+| `loop_final_state` | text | Terminal state of the loop (backfilled when loop ends) |
+| `loop_terminated_at` | timestamptz | When the loop reached a terminal state (backfilled) |
+
+**Future:** judge decisions provide a training signal for a resident fine-tuned judge model in v2.
+
+---
+
+## 6. Dashboard
+
+The dashboard is a web UI served by the existing axum control plane at `/dashboard/*`. No new process, no new binary — the same server that handles API requests renders the dashboard.
+
+**Rendering:** server-rendered HTML via `maud` (the workspace uses `maud = "0.26"`). A single embedded JS file polls `/dashboard/state` every 5 seconds for live updates.
+
+**Auth model:** uses the existing API key. Browser sessions get an HttpOnly cookie after initial API-key auth. Programmatic access uses Bearer token (same API key).
+
+**Features:**
+
+- Card grid: one card per active loop with status, round, elapsed time, and cost
+- Loop detail: rounds table with per-round diff viewer and live log tail
+- Feed: terminal events stream (convergences, failures, cancellations)
+- Per-spec history: all loops run against a given spec, with outcome and duration
+- Stats deep-dive: `/dashboard/stats?window=7d` shows cost breakdown, convergence rate, engineer activity
+- Kill switch: cancel any running loop from the UI
+- Fleet summary header: total active loops, queue depth, cluster utilization
+
+**Security:** the dashboard inherits the deployment's security posture. On the Hetzner terraform module, that means Tailscale-only access by default. In local dev, the dashboard binds to localhost. Never expose the dashboard to the public internet without fronting auth (oauth2-proxy or similar).
+
+**No new database:** all aggregates are computed on-demand from the existing `loops` and `rounds` tables, with a 60-second cache on the stats endpoint.
+
+---
+
+## 7. Pluggable Cache
+
+One PVC `nautiloop-cache` mounted at `/cache` on implement and revise pods. The cache is shared across all loops and rounds — a warm cache from one loop benefits the next.
+
+**Env-var passthrough:** the `[cache.env]` table in `nemo.toml` becomes pod environment variables verbatim. The control plane does not interpret these values or have per-backend code. Any tool that respects environment variables for cache location works out of the box.
+
+**Covered tools:**
+
+- sccache (default for Rust workspaces) — `SCCACHE_DIR=/cache/sccache`, `RUSTC_WRAPPER=sccache`
+- ccache, npm, pnpm, yarn, bun, pip, poetry, uv, turbo, go, gradle
+- Any tool that wants a writable directory and an env var to point at it
+
+**Operational:** `nemo cache show` prints the resolved env-var mapping, disk usage, and recent hit-rate stats.
+
+**Terraform:** `cache_volume_size` variable (default 50 GiB) controls the PVC size.
+
+---
+
+## 8. Observability
+
+`nemo ps` lists running agent pods with status, resource usage, and current stage. It queries the k8s API directly and joins with loop state from Postgres to show a unified view.
+
+`/pod-introspect/:id` returns live pod details including a logs tail, resource metrics, and the current round. This endpoint is used by both the dashboard (for the loop detail view) and the CLI (`nemo ps --detail`). It requires `pods/exec` permission on the `nautiloop-jobs` namespace — the terraform module provisions this by default.
+
+---
+
+## 9. Control Plane Communication
 
 ```
                  +-------------------+          +-------------------+
@@ -564,7 +669,7 @@ Engineer                API Server          Postgres            Loop Engine     
 
 ---
 
-## 6. Config Resolution Flow
+## 10. Config Resolution Flow
 
 ```
   LAYER 1 (lowest priority)            LAYER 2 (team)                LAYER 3 (highest priority)
@@ -658,7 +763,7 @@ Engineer                API Server          Postgres            Loop Engine     
 
 ---
 
-## 7. Git Worktree Lifecycle
+## 11. Git Worktree Lifecycle
 
 ```
   Loop Engine                       Bare Repo (PVC)                     K8s Job Pod
@@ -762,7 +867,7 @@ Engineer                API Server          Postgres            Loop Engine     
 
 ---
 
-## 8. Auth Flow
+## 12. Auth Flow
 
 ```
   Engineer's Machine                   k3s Cluster
@@ -883,7 +988,7 @@ Engineer                API Server          Postgres            Loop Engine     
 
 ---
 
-## 9. Retry and Error Handling Flow
+## 13. Retry and Error Handling Flow
 
 ```
   +=============================================================+

@@ -11,8 +11,8 @@ The README was already partially refreshed in PR #169; this spec covers the thre
 Main at PR #169 merge.
 
 Current state per artifact:
-- **`www/index.html`** — 342 lines. Sections: hero, how it works, "every engineer becomes a dev director", three verbs, deploy, security, "built with nautiloop" data table (81 rounds / 331 findings from original build), open source footer. Tone: founder-mode confident, bold typography, technical but punchy. Missing: dashboard, orchestrator judge, harden-by-default, pluggable cache, nemo helm phase 2.
-- **`docs/architecture.md`** — 1141 lines. Comprehensive system design; covers pre-v0.6 features (loop engine, state machine, job builder, sidecar, git ops, state store). Missing: orchestrator judge, `/dashboard` subsystem, pluggable cache layer, pod introspection endpoint, `nemo extend` state transitions.
+- **`www/index.html`** — 343 lines. Sections: hero, how it works, "every engineer becomes a dev director", three verbs, deploy, security, "built with nautiloop" data table (81 rounds / 331 findings from original build), open source footer. Tone: founder-mode confident, bold typography, technical but punchy. Missing: dashboard, orchestrator judge, harden-by-default, pluggable cache, nemo helm phase 2.
+- **`docs/architecture.md`** — 1142 lines. Comprehensive system design; covers pre-v0.6 features (loop engine, state machine, job builder, sidecar, git ops, state store). Missing: orchestrator judge, `/dashboard` subsystem, pluggable cache layer, pod introspection endpoint, `nemo extend` state transitions.
 - **`docs/deploy.md`** — 201 lines. Terraform module reference, variable docs, deployment walkthrough. Missing: dashboard access over Tailscale, cache volume variable, pod-introspect RBAC, tomato new env vars.
 
 ## Problem Statement
@@ -47,7 +47,7 @@ None of this is in the deploy guide.
 
 **FR-1a.** Keep the current hero: `Push a spec, get a clean PR.` Keep the hero-sub. Keep the terminal animation and CTA. No tone shift.
 
-**FR-1b.** Update the page `<title>` to: `Nautiloop — Push a spec, get a clean PR.` (unchanged — it already says this).
+**FR-1b.** The page `<title>` is `Nautiloop — Push a spec, get a clean PR` (no trailing period). Leave it unchanged.
 
 **FR-1c.** Add a new section **between** "Three verbs" and "Deploy a nautiloop", with heading:
 
@@ -64,26 +64,30 @@ Content: a short paragraph and bullets explaining the dashboard:
 
 If a screenshot or live demo is referenced in the future, leave a placeholder: `<img>` tag commented out with `<!-- TODO: dashboard screenshot -->`. Do not fabricate an image path.
 
-**FR-1d.** Update the "How it works" diagram / text to mention the orchestrator judge as a third model in the loop. Keep the ASCII or whatever shape the current diagram uses; add a line noting "An orchestrator judge (LLM) decides transitions when the reviewer disagrees with itself or churns."
+**FR-1d.** Update the "How it works" section to mention the orchestrator judge. The existing arch-flow is a 5-element CSS grid of `div.arch-node` elements (Your Machine → Nautiloop Server → Agent Pods) with `div.arch-arrow` separators — NOT ASCII art. Do not restructure the grid. There is an existing `<p class="arch-tagline">` between `.arch-flow` and the closing `</div>`. Add a new `<p>` **after** the existing `<p class="arch-tagline">`, before the closing `</div>` of the container, noting: "An orchestrator judge (LLM) decides transitions when the reviewer disagrees with itself or churns." This keeps the visual layout intact while surfacing the judge concept.
 
 **FR-1e.** Replace the "Built with Nautiloop" data table. The old table shows 81 rounds / 331 findings from the original build. Replace with a newer table reflecting v0.6.0 self-convergence:
 
-| Phase | What | PRs produced | Notes |
+| Phase | What | Output | Notes |
 |---|---|---|---|
-| Original build | Core loop + infrastructure | 3 lanes, 81 rounds, 331 findings | Hardened + implemented across three parallel lanes |
+| Original build | Core loop + infrastructure | 3 PRs across 3 lanes, 81 rounds, 331 findings | Hardened + implemented across three parallel lanes |
 | v0.6.0 (self-hosted dogfood) | Judge, dashboard, helm phase 2, pluggable cache, CLI polish, mobile UX | 12+ machine-produced convergent PRs in one session | Nautiloop implementing its own features against its own codebase |
 
-Retain the bold "331 production bugs caught by cross-model review before first deploy" line as historical context; add a sibling line: "v0.6.0: nautiloop shipped 10+ of its own feature PRs in a single day of dogfooding." Keep the voice confident-but-honest; don't inflate numbers.
+Replace the entire `<table class="stats-table">` element — including `<thead>`, `<tbody>`, and all rows — with a new table matching the 4-column schema above (Phase, What, Output, Notes). The existing 5-row per-lane breakdown (Core loop engine, Infrastructure, Agent runtime, Integration, Total) is fully replaced by the 2-row summary table above. The per-lane granularity is no longer needed; the summary row "3 PRs across 3 lanes, 81 rounds, 331 findings" preserves the aggregate numbers.
 
-**FR-1f.** Add to the "Three verbs" table a fourth row or sub-note covering `nemo harden` is no longer the only way to pre-validate — `nemo start` hardens by default now. The existing "Add --harden to start or ship" note is obsolete; flip it to: "Add `--no-harden` to skip the harden phase (default: on)."
+Update the lead paragraph (`<p class="built-lead">`) to work with the new 2-row table. Replace the current text ("Nautiloop was built through the exact process it automates. Three parallel implementation lanes, each hardened by cross-model adversarial review.") with: "Nautiloop was built through the exact process it automates — and v0.6.0 was shipped by nautiloop itself." This bridges both table rows without referencing removed lane detail.
 
-**FR-1g.** Security section: add a bullet for the dashboard's auth model: "Dashboard auth = same API key as the CLI. HttpOnly cookies. Behind Tailscale by default. See `docs/dashboard-setup.md`." Mentioning Tailscale once is enough; don't oversell.
+Retain the existing `<p class="built-callout">` line ("331 production bugs caught by cross-model review before first deploy") as historical context. Add a sibling `<p class="built-callout">` using the same markup pattern (with `<span class="amber">` for the number) for the new line: "v0.6.0: nautiloop shipped 12+ of its own feature PRs in a single day of dogfooding." Use "12+" consistently in both the table and the callout line (12 is the total machine-produced PR count; do not use "10+" elsewhere). Keep the voice confident-but-honest; don't inflate numbers.
 
-**FR-1h.** Documentation links footer: add links to `docs/local-dev-quickstart.md`, `docs/dashboard-setup.md`. Ensure link labels read naturally; do not add any link that points at a non-existent doc.
+**FR-1f.** Update the harden-by-default messaging. The "Three verbs" section is a 3-column CSS grid of `div.verb-card` elements — NOT a table. Do not add a 4th card (that would break the grid and violate NFR-3). Instead, update the existing `<p class="verbs-note">` paragraph (currently reads "Add `--harden` to `start` or `ship` to harden the spec before implementing.") to read: "Add `--no-harden` to skip the harden phase (default: on)." This is the simplest change that conveys harden-by-default without touching the grid layout.
+
+**FR-1g.** Security section: add a new `<li>` to the existing `<ul class="security-list">` for the dashboard's auth model: "Dashboard auth = same API key as the CLI. HttpOnly cookies. Behind Tailscale by default. See `docs/dashboard-setup.md`." Mentioning Tailscale once is enough; don't oversell. The "See `docs/dashboard-setup.md`" text must link using the same absolute GitHub URL pattern as the existing footer (e.g., `https://github.com/tinkrtailor/nautiloop/blob/main/docs/dashboard-setup.md`), NOT a relative path — relative paths would resolve incorrectly from the `www/` serving origin.
+
+**FR-1h.** Documentation links footer: add links to `docs/local-dev-quickstart.md` and `docs/dashboard-setup.md`. Both files exist at HEAD. Links must use the same absolute GitHub URL pattern as existing footer links (e.g., `https://github.com/tinkrtailor/nautiloop/blob/main/docs/dashboard-setup.md`). Follow the existing `<a>` + `<span class="footer-sep">·</span>` structure. Ensure link labels read naturally; do not add any link that points at a non-existent doc.
 
 ### FR-2: `docs/architecture.md` updates
 
-**FR-2a.** Add a new top-level section `## Orchestrator Judge` after the existing state-machine section. Content:
+**FR-2a.** Add a new top-level section after the existing `## 4. State Machine Diagram` section. architecture.md uses numbered headings (`## 1.`, `## 2.`, …, `## 9.`); continue the numbering scheme. The new section becomes `## 5. Orchestrator Judge`, and all subsequent existing sections are renumbered: current `## 5. Control Plane Communication` becomes `## 9.`, etc. (Sections added in FR-2b/c/f take numbers 6, 7, 8 respectively; existing sections 5–9 become 9–13; the unnumbered `## Notation Reference` at the end stays unnumbered.) Content:
 - What it is: an LLM call at loop transition points that decides `continue | exit_clean | exit_escalate | exit_fail` when the reviewer's verdict is ambiguous or churning.
 - Where it runs: in-process from the loop engine (NOT a separate pod), reusing the sidecar model proxy.
 - When it fires: on review-clean-but-with-medium+-issues, on round >= max_rounds with recurring findings, on audit ambiguity.
@@ -91,26 +95,32 @@ Retain the bold "331 production bugs caught by cross-model review before first d
 - Storage: every decision is persisted to `judge_decisions` table (loop_id, round, phase, trigger, input_json, decision, confidence, reasoning, hint, duration_ms, created_at, loop_final_state, loop_terminated_at).
 - Future: training signal for a resident fine-tuned judge in v2.
 
-**FR-2b.** Add a new top-level section `## Dashboard` after the judge section. Content:
+**FR-2b.** Add a new top-level section `## 6. Dashboard` after the judge section. Content:
 - Routes under `/dashboard/*` on the existing axum server (no new process).
-- Server-rendered HTML (askama or maud), single embedded JS file polling `/dashboard/state` every 5s.
+- Server-rendered HTML via `maud` (the workspace uses `maud = "0.26"`), single embedded JS file polling `/dashboard/state` every 5s.
 - Auth model: existing API key, cookie-based for browser sessions, bearer for programmatic.
 - Features covered: card grid, loop detail with rounds table + diff + live logs, feed of terminal events, per-spec history, stats deep-dive (`/dashboard/stats?window=7d`), kill switch, fleet summary header.
 - Security: inherits deployment security (Tailscale on hetzner module). Dashboard on localhost in dev; NEVER expose to public internet without fronting auth.
 - No new database: aggregates computed on-demand from existing `loops` + `rounds` tables with a 60s cache on the stats endpoint.
 
-**FR-2c.** Add a new top-level section `## Pluggable cache` after dashboard. Content:
+**FR-2c.** Add a new top-level section `## 7. Pluggable cache` after dashboard. Content:
 - One PVC `nautiloop-cache` mounted at `/cache` on implement/revise pods.
 - Env-var passthrough: `[cache.env]` in `nemo.toml` becomes pod env. No control-plane code per backend.
 - Covered tools: sccache (default for Rust), ccache, npm, pnpm, yarn, bun, pip, poetry, uv, turbo, go, gradle, anything that wants a writable dir.
 - Operational: `nemo cache show` prints resolved env + disk usage + recent hit stats.
 - Terraform: `cache_volume_size` variable (default 50 GiB).
 
-**FR-2d.** Update the existing "Stages" section to add `QA` as a future stage (link to `specs/qa-stage.md`). Describe as "deferred v2 work: runs acceptance-criteria verification after review-clean, before CONVERGED. Gated by `[qa] enabled = true` in nemo.toml." Do NOT imply it is shipped.
+**FR-2d.** Add a `QA` stage note. There is no dedicated "Stages" section in architecture.md — stages are described inline within `## Full Loop Lifecycle (Harden + Implement)` (the 3rd `##` heading). Add a new subsection `### QA Stage (deferred)` at the end of `## Full Loop Lifecycle (Harden + Implement)`, before the state machine section. Content: "Deferred v2 work: runs acceptance-criteria verification after review-clean, before CONVERGED. Gated by `[qa] enabled = true` in nemo.toml. See `specs/qa-stage.md`." Do NOT imply it is shipped.
 
-**FR-2e.** Update state machine diagram/description to include the `AWAITING_REAUTH` → resume transition (via `nemo auth --claude` + `nemo resume`) and the new extend flow: `FAILED` with `failed_from_state` → `nemo extend --add N` → resumes at last stage.
+**FR-2e.** Update state machine diagram/description to include the following transitions (use the existing diagram syntax — Mermaid or ASCII — matching whichever format is already in the file):
 
-**FR-2f.** Add `nemo ps` and the `/pod-introspect/:id` endpoint to the observability section with a 2-sentence description.
+The existing diagram already has a generic `ANY active state ----[creds expired]----> AWAITING_REAUTH` block (lines ~442-449). Leave that generic notation in place — do NOT replace it with per-state arrows. Instead, add the following **new** transitions that are not yet covered:
+
+- `FAILED -> {failed_from_state}` (on `nemo extend --add N` — only when `failed_from_state` is set; resumes at the stage where the loop failed, e.g. IMPLEMENTING or REVIEWING)
+
+Add a prose note after the existing AWAITING_REAUTH block (or nearby, at the implementer's discretion) explaining the `reauth_from_state` and `failed_from_state` fields on `LoopRecord`: these track which stage the loop was in when it entered AWAITING_REAUTH or FAILED, enabling correct resume to the interrupted stage.
+
+**FR-2f.** Add `nemo ps` and the `/pod-introspect/:id` endpoint. There is no dedicated "Observability" section in architecture.md. Create a new top-level section `## 8. Observability` after `## 7. Pluggable cache` (the section added in FR-2c). Content: a 2-sentence description of `nemo ps` (lists running agent pods with status, resource usage, and current stage) and `/pod-introspect/:id` (returns live pod details including logs tail, resource metrics, and current round — used by the dashboard and CLI).
 
 ### FR-3: `docs/deploy.md` updates
 
@@ -125,11 +135,13 @@ Retain the bold "331 production bugs caught by cross-model review before first d
 **FR-3c.** Add a subsection `### Pod introspection RBAC` explaining that `nemo ps` and the `/pod-introspect/:id` endpoint require `pods/exec` permission on the `nautiloop-jobs` namespace. Note that the terraform module provisions this by default; operators installing manifests by hand need to grant it.
 
 **FR-3d.** Add a subsection `### Cache configuration examples` with a short snippet showing:
-- Default (Rust-only, sccache): `[cache.env]` with sccache vars only.
-- Polyglot example (Rust + TypeScript): sccache + npm + pnpm.
+- Default (Rust-only, sccache): `[cache.env]` with sccache vars — e.g., `SCCACHE_DIR = "/cache/sccache"`, `RUSTC_WRAPPER = "sccache"`.
+- Polyglot example (Rust + TypeScript): sccache + npm + pnpm — e.g., `npm_config_cache = "/cache/npm"`, `PNPM_HOME = "/cache/pnpm"`.
 - Disabled: `[cache] disabled = true`.
 
-**FR-3e.** Update the "What gets installed" list to include the orchestrator judge and dashboard as first-class components of the control plane (they're in-process, not separate deployments).
+Refer to the pluggable-cache spec (`specs/pluggable-cache.md`) for the canonical env var list if it exists; otherwise use the examples above as representative.
+
+**FR-3e.** There is no "What gets installed" section in deploy.md by that name. The deployment walkthrough text (lines 1-5 and ~150-157) describes what the module provisions. Add a new `## What the module installs` section (h2, to maintain heading hierarchy under the h1) after the intro paragraph and before `## Quick start (minimal)`, listing the components: k3s, Postgres, control plane (which includes the API server, loop engine, orchestrator judge, and dashboard — all in-process, not separate deployments), agent-base image, sidecar image. This makes it explicit that the judge and dashboard are first-class components shipped as part of the control plane binary.
 
 ## Non-Functional Requirements
 
@@ -160,8 +172,8 @@ Every link added (in README, landing, docs/*) must point at a file that exists a
 A reviewer can verify by:
 
 1. **Landing**: open `www/index.html` in a browser, see "Watch from anywhere" section between "Three verbs" and "Deploy a nautiloop". See updated "Built with Nautiloop" table with two rows. No placeholder images rendered.
-2. **Architecture**: `docs/architecture.md` has new `## Orchestrator Judge`, `## Dashboard`, `## Pluggable cache` sections. QA stage section notes it's deferred.
-3. **Deploy**: `docs/deploy.md` has `### Accessing the dashboard`, `### Pod introspection RBAC`, `### Cache configuration examples` subsections.
+2. **Architecture**: `docs/architecture.md` has new `## 5. Orchestrator Judge`, `## 6. Dashboard`, `## 7. Pluggable cache`, `## 8. Observability` sections. Existing sections 5–9 are renumbered to 9–13. QA stage subsection under Full Loop Lifecycle notes it's deferred.
+3. **Deploy**: `docs/deploy.md` has `## What the module installs`, `### Accessing the dashboard`, `### Pod introspection RBAC`, `### Cache configuration examples` subsections.
 4. **Links resolve**: `grep -Eo '\]\([^)]+\)' docs/*.md www/index.html | sort -u` lists only existing targets (manual or scripted).
 5. **Tone check**: no instance of "enterprise-grade", "mission-critical", "best-in-class", or similar buzzwords. Voice unchanged.
 6. **No regression**: `cargo test --workspace` passes.
