@@ -1,0 +1,85 @@
+{
+  "round": 11,
+  "source": "review",
+  "issues": [
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/handlers.rs",
+      "line": 1156,
+      "description": "compute_fleet_cached uses get_loops_for_engineer(None, true, true) for filter chip counts, which has LIMIT 10000 in the Postgres implementation. For long-running deployments with >10000 total loops (active + terminal), the converged/failed counts shown in filter chip badges will be silently incorrect — the oldest loops will be excluded by the LIMIT. The comment says 'Counts must reflect ALL current-state loops' but the underlying query caps at 10000.",
+      "suggestion": "Add a dedicated lightweight count query to StateStore: `get_loop_state_counts() -> Result<HashMap<LoopState, usize>>` implemented as `SELECT state, COUNT(*) FROM loops GROUP BY state`. This is O(1) in result size regardless of total loops, and gives exact counts without fetching full row data."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/handlers.rs",
+      "line": 730,
+      "description": "Tab title update (FR-7a) and bell notification rely on d.counts.converged from the fleet cache (10s TTL). When a loop converges, the bell won't fire until the fleet cache refreshes (up to 10 seconds later). More critically, the bell fires based on the converged count increasing across ALL loops (fleet-wide), not scoped to the viewer's loops. If Alice is viewing 'Mine' and Bob's loop converges, Alice's tab will show '(1) nautiloop' and play a bell — even though the convergence is not her loop.",
+      "suggestion": "Scope the bell/tab-title notification to the loops visible in the current view (d.loops), not the fleet-wide counts. Add a 'recently_converged' array to the dashboard_state response containing loops that transitioned to converged since the previous poll, filtered by the current view."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/handlers.rs",
+      "line": 37,
+      "description": "The kill switch header button visibility is set server-side based on show_team at page render time. When a user loads /dashboard in 'Mine' mode (kill switch hidden), then taps the 'Team' chip, the JS updates the card grid via JSON poll + replaceState but does NOT re-render the header. The tks() function in dashboard.js toggles the button visibility client-side — but this only works because #cancel-all-btn is inside #menu-dropdown which itself is hidden until the menu is opened. If a user goes Mine→Team→opens menu, the button correctly shows. But if they go Team→Mine (button was visible on page load)→Team (tks shows it), the button is in the DOM already. Actually — tks() correctly toggles based on current URL params, so this does work. HOWEVER, the initial server-rendered CSS class 'danger hidden' (when show_team=false) vs 'danger' (when show_team=true) creates a flash: on Team→Mine switch, the button briefly remains visible until tks() runs. This is a minor UX issue, not a functional bug.",
+      "suggestion": "Accept current behavior — tks() runs synchronously in initChips before the user opens the menu, so the flash is imperceptible."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/assets/dashboard.js",
+      "line": 28,
+      "description": "The card-level metrics update in uc() uses textContent for the progress line (safe) but for the metrics row uses: `m.textContent=a.join(...)`. The last_verdict value comes from the server JSON ('clean' or 'not clean') and is set via textContent (safe). However, the card-level badge update uses className assignment: `b.className='badge '+sc(l.state)`. The sc() function lowercases and replaces underscores — but if l.state somehow contained a space or quote, it would corrupt the className and potentially cause visual issues. In practice, states are server-controlled enum values so this is not exploitable.",
+      "suggestion": "No change needed — states are controlled enum values from the server."
+    },
+    {
+      "severity": "medium",
+      "category": "performance",
+      "file": "control-plane/src/api/dashboard/handlers.rs",
+      "line": 997,
+      "description": "specs_page fetches ALL active loops via get_active_loops_for_spec (DB-filtered, efficient) and ALL terminal loops matching the spec_path via get_terminal_loops with limit=500. The get_terminal_loops call is efficient (DB-level spec_path filter). However, the aggregate computation at the bottom iterates matching.iter() twice: once for total_cost/converged_count in the for loop, and once for avg_rounds in the aggregate computation. This is O(2n) which is fine for 500 loops.",
+      "suggestion": "Compute avg_rounds sum in the existing for loop to avoid the second iteration, though this is a minor optimization."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/handlers.rs",
+      "description": "NFR-6 requires integration tests covering 'end-to-end login → card grid → detail page → action button → verify API side effect.' The integration test file exists and covers these flows individually, but no single test exercises the full sequential session flow where cookies from login are propagated through to action buttons in a multi-step sequence. Each test constructs its own app instance. While the individual tests are thorough, a true session-continuity test would catch middleware ordering issues that per-handler tests miss.",
+      "suggestion": "Add one test that reuses cookies across login → grid → detail → action in sequence, verifying session continuity."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "control-plane/assets/dashboard.js",
+      "line": 17,
+      "description": "The bell notification (FR-7a) is opt-in via localStorage key 'nautiloop_bell'. There is no UI to toggle this setting — users must manually set localStorage.setItem('nautiloop_bell', 'true') in the browser console. The spec says 'opt-in, off by default' which is satisfied, but discoverability is zero.",
+      "suggestion": "Add a checkbox in the header menu dropdown to toggle the bell setting, or document the localStorage key in docs/dashboard-setup.md."
+    },
+    {
+      "severity": "low",
+      "category": "style",
+      "file": "control-plane/assets/dashboard.js",
+      "line": 1,
+      "description": "The JS file is hand-minified with single-letter variable names. While within the <10KB budget at ~3KB effective size, this makes the code difficult to maintain and debug. No build-time minification step exists.",
+      "suggestion": "Maintain a readable source file and add a build.rs minification step, or accept the current approach given the small file size."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "control-plane/assets/dashboard.js",
+      "line": 25,
+      "description": "When new loops appear in polled data that aren't in the current DOM, a 'tap to refresh' banner is shown instead of rendering new cards inline. FR-3d says 'auto-refreshes every 5s via a small vanilla-JS poll that re-renders card fields in place.' New loops requiring manual interaction deviates from the spec intent, though the banner is arguably better UX.",
+      "suggestion": "Acceptable as-is — the banner avoids complex HTML duplication in JS while keeping the user informed."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/render.rs",
+      "line": 505,
+      "description": "FR-12b specifies feed filter selection should persist in localStorage across visits. The implementation uses localStorage but restores via location.replace() which triggers a full page reload rather than applying the filter client-side. Minor UX friction on mobile.",
+      "suggestion": "Apply the filter client-side by hiding/showing feed items based on the stored filter, or accept the current behavior."
+    }
+  ]
+}
