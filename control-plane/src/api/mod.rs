@@ -64,19 +64,20 @@ pub fn build_router(state: AppState) -> Router {
 }
 
 /// Health check that verifies Postgres connectivity.
-/// Returns 200 with `{"status":"ok"}` if the store is reachable,
-/// 503 with `{"status":"degraded"}` otherwise.
+/// Returns 200 with `{"status":"ok","version":"...","build_info":"..."}` if the store is reachable,
+/// 503 with `{"status":"degraded","version":"...","build_info":"..."}` otherwise.
 /// K8s liveness/readiness probes use this to detect a dead control plane.
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let version = env!("CARGO_PKG_VERSION");
+    let build_info = option_env!("BUILD_SHA").unwrap_or("unknown");
     match state.store.health_check().await {
         Ok(()) => (
             StatusCode::OK,
-            axum::Json(serde_json::json!({"status": "ok", "version": version})),
+            axum::Json(serde_json::json!({"status": "ok", "version": version, "build_info": build_info})),
         ),
         Err(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(serde_json::json!({"status": "degraded", "version": version})),
+            axum::Json(serde_json::json!({"status": "degraded", "version": version, "build_info": build_info})),
         ),
     }
 }
@@ -345,6 +346,8 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "ok");
         assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+        let build_info = json["build_info"].as_str().expect("build_info should be a string");
+        assert!(!build_info.is_empty(), "build_info should not be empty");
     }
 
     #[tokio::test]
@@ -391,5 +394,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "degraded");
         assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+        let build_info = json["build_info"].as_str().expect("build_info should be a string");
+        assert!(!build_info.is_empty(), "build_info should not be empty");
     }
 }
