@@ -512,9 +512,7 @@ impl OrchestratorJudge {
 
         // ship-judge FR-4d: read cumulative attempt count (includes this attempt)
         // for structured logging on both success and failure paths.
-        // Named "invocation_total" (not "decision_total") because it counts attempts
-        // including failures/timeouts, not just successful decisions.
-        let judge_invocation_total = {
+        let judge_decision_total = {
             let counts = self.call_counts.lock().await;
             counts.get(&context.loop_id).copied().unwrap_or(0)
         };
@@ -528,7 +526,7 @@ impl OrchestratorJudge {
                     round = context.round,
                     error = %e,
                     duration_ms,
-                    judge_invocation_total,
+                    judge_decision_total,
                     "Judge model invocation failed, falling back to heuristic"
                 );
                 return None;
@@ -539,7 +537,7 @@ impl OrchestratorJudge {
                     loop_id = %context.loop_id,
                     round = context.round,
                     duration_ms,
-                    judge_invocation_total,
+                    judge_decision_total,
                     "Judge model timed out after 30s, falling back to heuristic"
                 );
                 return None;
@@ -555,7 +553,7 @@ impl OrchestratorJudge {
                     loop_id = %context.loop_id,
                     round = context.round,
                     response = %response_text,
-                    judge_invocation_total,
+                    judge_decision_total,
                     "Failed to parse judge response, falling back to heuristic"
                 );
                 return None;
@@ -590,7 +588,7 @@ impl OrchestratorJudge {
         }
 
         // ship-judge FR-4a/FR-4d: Log at INFO level with all required fields.
-        // judge_invocation_total counts all attempts for this loop (including this one).
+        // judge_decision_total counts all attempts for this loop (including this one).
         tracing::info!(
             target: "judge",
             loop_id = %context.loop_id,
@@ -600,7 +598,7 @@ impl OrchestratorJudge {
             decision = %output.decision,
             confidence = ?output.confidence,
             duration_ms,
-            judge_invocation_total,
+            judge_decision_total,
             "Judge decision"
         );
 
