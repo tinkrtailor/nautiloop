@@ -141,6 +141,8 @@ pub fn render_login(error: Option<&str>, csrf_token: &str) -> Markup {
                         }
                         form method="post" action="/dashboard/login" {
                             input type="hidden" name="csrf_token" value=(csrf_token);
+                            input class="login-input" type="text" name="engineer_name"
+                                  placeholder="Your name (e.g. alice)" autocomplete="username" required;
                             input class="login-input" type="password" name="api_key"
                                   placeholder="API key" autocomplete="current-password" required;
                             button class="login-submit" type="submit" { "Sign in" }
@@ -198,7 +200,12 @@ pub fn render_grid(
                 "$" (format!("{:.2}", fleet.total_cost))
                 @if let Some(delta) = fleet.cost_trend {
                     // Cost down = favorable (trend-up green), cost up = unfavorable (trend-down red)
-                    span class=(if delta <= 0.0 { "trend trend-up" } else { "trend trend-down" }) {
+                    span class=(if delta <= 0.0 { "trend trend-up" } else { "trend trend-down" })
+                         title=(if delta > 0.0 {
+                             format!("Cost increased by ${:.2} vs prior week", delta.abs())
+                         } else {
+                             format!("Cost decreased by ${:.2} vs prior week", delta.abs())
+                         }) {
                         @if delta > 0.0 {
                             " \u{2191}$" (format!("{:.2}", delta.abs()))
                         } @else {
@@ -213,7 +220,12 @@ pub fn render_grid(
                     (format!("{:.0}%", rate * 100.0))
                     @if let Some(delta) = fleet.converge_rate_trend {
                         // Converge rate up = favorable (trend-up green)
-                        span class=(if delta >= 0.0 { "trend trend-up" } else { "trend trend-down" }) {
+                        span class=(if delta >= 0.0 { "trend trend-up" } else { "trend trend-down" })
+                             title=(if delta > 0.0 {
+                                 format!("Converge rate increased by {:.0}% vs prior week", (delta * 100.0).abs())
+                             } else {
+                                 format!("Converge rate decreased by {:.0}% vs prior week", (delta * 100.0).abs())
+                             }) {
                             @if delta > 0.0 {
                                 " \u{2191}" (format!("{:.0}%", (delta * 100.0).abs()))
                             } @else {
@@ -231,7 +243,12 @@ pub fn render_grid(
                     @if let Some(delta) = fleet.avg_rounds_trend {
                         // Consistent arrow semantics: ↑ = increased, ↓ = decreased.
                         // Color indicates favorability: fewer rounds (↓) = green, more (↑) = red.
-                        span class=(if delta <= 0.0 { "trend trend-up" } else { "trend trend-down" }) {
+                        span class=(if delta <= 0.0 { "trend trend-up" } else { "trend trend-down" })
+                             title=(if delta > 0.0 {
+                                 format!("Avg rounds increased by {:.1} vs prior week", delta.abs())
+                             } else {
+                                 format!("Avg rounds decreased by {:.1} vs prior week", delta.abs())
+                             }) {
                             @if delta > 0.0 {
                                 " \u{2191}" (format!("{:.1}", delta.abs()))
                             } @else {

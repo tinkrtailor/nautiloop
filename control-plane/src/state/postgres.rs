@@ -449,8 +449,11 @@ impl StateStore for PgStateStore {
                 sqlx::query(&q).bind(eng).fetch_all(&self.pool).await?
             }
             _ => {
+                // No hard LIMIT for team/all queries — aggregation (fleet summary,
+                // stats, specs) depends on complete data. The card grid applies its
+                // own in-memory filtering + pagination.
                 let q = format!(
-                    "SELECT * FROM loops WHERE true{terminal_filter} ORDER BY created_at DESC LIMIT 10000"
+                    "SELECT * FROM loops WHERE true{terminal_filter} ORDER BY created_at DESC"
                 );
                 sqlx::query(&q).fetch_all(&self.pool).await?
             }
@@ -980,6 +983,22 @@ impl StateStore for PgStateStore {
         .await
         .map_err(crate::error::NautiloopError::Database)?;
         Ok(result.rows_affected())
+    }
+
+    async fn get_distinct_engineers(&self) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT engineer FROM loops \
+             WHERE state IN ('CONVERGED', 'FAILED', 'CANCELLED', 'HARDENED', 'SHIPPED') \
+             ORDER BY engineer",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(crate::error::NautiloopError::Database)?;
+
+        Ok(rows
+            .iter()
+            .map(|r| sqlx::Row::get::<String, _>(r, "engineer"))
+            .collect())
     }
 
     async fn health_check(&self) -> Result<()> {

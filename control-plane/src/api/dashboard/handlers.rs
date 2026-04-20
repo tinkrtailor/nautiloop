@@ -53,6 +53,16 @@ pub async fn login_submit(
     }
 
     let api_key = form.get("api_key").map(|s| s.as_str()).unwrap_or("");
+    let engineer_name = form.get("engineer_name").map(|s| s.as_str()).unwrap_or("");
+
+    // Validate engineer name: non-empty, safe ASCII (alphanumeric, dash, underscore, dot).
+    if engineer_name.is_empty()
+        || !engineer_name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    {
+        return Redirect::to("/dashboard/login?error=Invalid+engineer+name+format").into_response();
+    }
 
     // Validate API key contains only safe ASCII characters (prevent cookie/header injection)
     // Must happen before comparison to reject malformed keys before any other processing.
@@ -69,22 +79,26 @@ pub async fn login_submit(
         return Redirect::to("/dashboard/login?error=Invalid+API+key").into_response();
     }
 
-    // Set HttpOnly, SameSite=Strict cookie with 7-day expiry.
-    // Only set `Secure` flag when not on loopback — otherwise the browser won't
-    // send the cookie back on plain HTTP (dev environments, non-TLS setups).
-    let is_loopback = state.config.cluster.bind_addr == "127.0.0.1"
-        || state.config.cluster.bind_addr == "localhost"
-        || state.config.cluster.bind_addr == "::1";
-    let secure_flag = if is_loopback { "" } else { "; Secure" };
-    let cookie = format!(
+    // Set HttpOnly, SameSite=Strict cookies with 7-day expiry.
+    // Secure flag controlled by explicit config (defaults to auto-detect from bind_addr).
+    let secure_flag = if state.config.dashboard_secure_cookie() { "; Secure" } else { "" };
+    let api_cookie = format!(
         "nautiloop_api_key={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800{}",
         api_key, secure_flag
+    );
+    let engineer_cookie = format!(
+        "nautiloop_engineer={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800{}",
+        engineer_name, secure_flag
     );
 
     let mut response = Redirect::to("/dashboard").into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        cookie.parse().unwrap(),
+        api_cookie.parse().unwrap(),
+    );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        engineer_cookie.parse().unwrap(),
     );
     response
 }
@@ -103,20 +117,24 @@ pub async fn logout(
         return Redirect::to("/dashboard/login?error=Invalid+request,+please+try+again").into_response();
     }
 
-    let is_loopback = state.config.cluster.bind_addr == "127.0.0.1"
-        || state.config.cluster.bind_addr == "localhost"
-        || state.config.cluster.bind_addr == "::1";
-    let secure_flag = if is_loopback { "" } else { "; Secure" };
-    let cookie = format!(
+    let secure_flag = if state.config.dashboard_secure_cookie() { "; Secure" } else { "" };
+    let api_clear = format!(
         "nautiloop_api_key=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
+        secure_flag
+    );
+    let engineer_clear = format!(
+        "nautiloop_engineer=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
         secure_flag
     );
     let csrf_clear = "nautiloop_csrf=; HttpOnly; SameSite=Strict; Path=/dashboard; Max-Age=0";
     let mut response = Redirect::to("/dashboard/login").into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        cookie.parse().unwrap(),
+        api_clear.parse().unwrap(),
     );
+    if let Ok(val) = engineer_clear.parse() {
+        response.headers_mut().append(header::SET_COOKIE, val);
+    }
     if let Ok(val) = csrf_clear.parse() {
         response.headers_mut().append(header::SET_COOKIE, val);
     }
@@ -139,13 +157,26 @@ pub async fn grid_page(
     State(state): State<AppState>,
     Query(query): Query<GridQuery>,
     csrf_ext: Option<axum::Extension<CsrfToken>>,
+    engineer_ext: Option<axum::Extension<super::auth::EngineerName>>,
 ) -> Result<Html<String>, NautiloopError> {
     let csrf_token = csrf_from(csrf_ext);
+    let viewer_engineer = engineer_ext.map(|e| e.0 .0.clone());
     let show_team = query.team.unwrap_or(false);
+
+    // Resolve engineer filter: explicit query param > 'mine' (default, uses viewer cookie) > all
+    let effective_engineer = if let Some(ref eng) = query.engineer {
+        Some(eng.clone())
+    } else if !show_team {
+        // 'Mine' mode: scope to the viewer's own loops (FR-3e)
+        viewer_engineer.clone()
+    } else {
+        None
+    };
+
     let loops = state
         .store
         .get_loops_for_engineer(
-            query.engineer.as_deref(),
+            effective_engineer.as_deref(),
             show_team,
             true, // include terminal for card grid
         )
@@ -464,11 +495,23 @@ pub struct CountsJson {
 pub async fn dashboard_state(
     State(state): State<AppState>,
     Query(query): Query<GridQuery>,
+    engineer_ext: Option<axum::Extension<super::auth::EngineerName>>,
 ) -> Result<Json<DashboardStateResponse>, NautiloopError> {
+    let viewer_engineer = engineer_ext.map(|e| e.0 .0.clone());
     let show_team = query.team.unwrap_or(false);
+
+    // Resolve engineer filter same as grid_page (FR-3e)
+    let effective_engineer = if let Some(ref eng) = query.engineer {
+        Some(eng.clone())
+    } else if !show_team {
+        viewer_engineer
+    } else {
+        None
+    };
+
     let loops = state
         .store
-        .get_loops_for_engineer(query.engineer.as_deref(), show_team, true)
+        .get_loops_for_engineer(effective_engineer.as_deref(), show_team, true)
         .await?;
 
     let state_filter = query.state_filter.as_deref().unwrap_or("active");
@@ -669,19 +712,8 @@ async fn fetch_feed_items_with_engineers(
         .and_then(|c| chrono::DateTime::parse_from_rfc3339(c).ok())
         .map(|dt| dt.with_timezone(&Utc));
 
-    // Fetch engineers list from all terminal loops (unfiltered) for filter chips.
-    // Use a large limit to capture all unique engineers.
-    let all_terminal = state
-        .store
-        .get_terminal_loops(None, None, None, None, 10_000)
-        .await?;
-
-    let engineers: Vec<String> = all_terminal
-        .iter()
-        .map(|l| l.engineer.clone())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    // Fetch distinct engineer names via a lightweight query (no full row scan).
+    let engineers = state.store.get_distinct_engineers().await?;
 
     // Fetch the page of terminal loops with DB-level filtering.
     let terminal_loops_raw = state
@@ -728,18 +760,24 @@ async fn fetch_feed_items_with_engineers(
 }
 
 /// GET /dashboard/specs/:path — per-spec history (FR-13).
+/// Shows ALL past loops for the spec (including active ones), not just terminal.
 pub async fn specs_page(
     State(state): State<AppState>,
     Path(spec_path): Path<String>,
     csrf_ext: Option<axum::Extension<CsrfToken>>,
 ) -> Result<Html<String>, NautiloopError> {
     let csrf_token = csrf_from(csrf_ext);
-    // Use get_terminal_loops with spec_path filter for DB-level filtering.
-    // FR-13 shows only terminal loops for the spec, so this is appropriate.
-    let matching = state
+
+    // Fetch all loops (terminal + active) and filter by spec_path.
+    // get_loops_for_engineer(None, true, true) returns everything.
+    let all_loops = state
         .store
-        .get_terminal_loops(None, Some(&spec_path), None, None, 10_000)
+        .get_loops_for_engineer(None, true, true)
         .await?;
+    let matching: Vec<_> = all_loops
+        .into_iter()
+        .filter(|l| l.spec_path == spec_path)
+        .collect();
 
     // Fetch rounds for all matching loops in one query
     let spec_loop_ids: Vec<Uuid> = matching.iter().map(|l| l.id).collect();
@@ -747,16 +785,13 @@ pub async fn specs_page(
 
     let mut items = Vec::new();
     let mut total_cost = 0.0;
-    let mut total_rounds = 0;
     let mut converged_count = 0;
-    // All loops from get_terminal_loops are terminal by definition.
-    let terminal_count = matching.len();
+    let terminal_count = matching.iter().filter(|l| l.state.is_terminal()).count();
 
     for l in &matching {
         let rounds = spec_rounds.get(&l.id).map(|v| v.as_slice()).unwrap_or(&[]);
         let (_, cost, _) = compute_round_metrics(rounds);
         total_cost += cost;
-        total_rounds += l.round;
         if matches!(
             l.state,
             LoopState::Converged | LoopState::Hardened | LoopState::Shipped
@@ -784,8 +819,13 @@ pub async fn specs_page(
         } else {
             0.0
         },
-        avg_rounds: if !matching.is_empty() {
-            total_rounds as f64 / matching.len() as f64
+        avg_rounds: if terminal_count > 0 {
+            matching
+                .iter()
+                .filter(|l| l.state.is_terminal())
+                .map(|l| l.round as f64)
+                .sum::<f64>()
+                / terminal_count as f64
         } else {
             0.0
         },
@@ -1509,7 +1549,7 @@ mod tests {
         // Step 2: POST with valid CSRF but wrong API key
         let app2 = crate::api::dashboard::build_dashboard_router_with_key(Some("test-api-key".to_string()))
             .with_state(state);
-        let body = format!("api_key=wrong-key&csrf_token={}", csrf_token);
+        let body = format!("engineer_name=alice&api_key=wrong-key&csrf_token={}", csrf_token);
         let response = app2
             .oneshot(
                 Request::builder()
@@ -1555,7 +1595,7 @@ mod tests {
         // Step 2: POST with CSRF token + API key
         let app2 = crate::api::dashboard::build_dashboard_router_with_key(Some("test-api-key".to_string()))
             .with_state(state);
-        let body = format!("api_key=test-api-key&csrf_token={}", csrf_token);
+        let body = format!("engineer_name=alice&api_key=test-api-key&csrf_token={}", csrf_token);
         let response = app2
             .oneshot(
                 Request::builder()
@@ -1572,7 +1612,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         let location = response.headers().get("location").unwrap().to_str().unwrap();
         assert_eq!(location, "/dashboard");
-        // Should set cookie
+        // Should set both api_key and engineer cookies
         let cookies: Vec<_> = response.headers().get_all("set-cookie")
             .iter()
             .filter_map(|v| v.to_str().ok())
@@ -1580,6 +1620,8 @@ mod tests {
         let api_cookie = cookies.iter().find(|c| c.contains("nautiloop_api_key=test-api-key")).unwrap();
         assert!(api_cookie.contains("HttpOnly"));
         assert!(api_cookie.contains("SameSite=Strict"));
+        let eng_cookie = cookies.iter().find(|c| c.contains("nautiloop_engineer=alice")).unwrap();
+        assert!(eng_cookie.contains("HttpOnly"));
     }
 
     #[tokio::test]

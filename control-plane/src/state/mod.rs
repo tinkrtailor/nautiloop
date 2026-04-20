@@ -150,6 +150,11 @@ pub trait StateStore: Send + Sync + 'static {
         terminated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<()>;
 
+    /// Get distinct engineer names from terminal loops.
+    /// Much lighter than fetching full loop records when only names are needed
+    /// (e.g., for dashboard feed filter chips).
+    async fn get_distinct_engineers(&self) -> Result<Vec<String>>;
+
     /// Health check: verify the store is reachable (e.g., SELECT 1).
     async fn health_check(&self) -> Result<()>;
 }
@@ -435,10 +440,11 @@ pub mod memory {
             &self,
             loop_ids: &[Uuid],
         ) -> Result<std::collections::HashMap<Uuid, Vec<RoundRecord>>> {
+            let id_set: std::collections::HashSet<Uuid> = loop_ids.iter().copied().collect();
             let rounds = self.rounds.read().await;
             let mut map: std::collections::HashMap<Uuid, Vec<RoundRecord>> = std::collections::HashMap::new();
             for r in rounds.iter() {
-                if loop_ids.contains(&r.loop_id) {
+                if id_set.contains(&r.loop_id) {
                     map.entry(r.loop_id).or_default().push(r.clone());
                 }
             }
@@ -576,6 +582,19 @@ pub mod memory {
 
         async fn advisory_unlock(&self, _loop_id: Uuid) -> Result<()> {
             Ok(())
+        }
+
+        async fn get_distinct_engineers(&self) -> Result<Vec<String>> {
+            let loops = self.loops.read().await;
+            let mut engineers: Vec<String> = loops
+                .values()
+                .filter(|l| l.state.is_terminal())
+                .map(|l| l.engineer.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            engineers.sort();
+            Ok(engineers)
         }
 
         async fn health_check(&self) -> Result<()> {

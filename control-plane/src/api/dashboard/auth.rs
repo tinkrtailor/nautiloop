@@ -15,6 +15,11 @@ pub struct DashboardApiKey(pub String);
 #[derive(Clone)]
 pub struct CsrfToken(pub String);
 
+/// Extension type carrying the engineer name from the `nautiloop_engineer` cookie.
+/// Used by the 'Mine' filter (FR-3e) to scope loops to the logged-in engineer.
+#[derive(Clone)]
+pub struct EngineerName(pub String);
+
 /// Dashboard auth middleware: checks for `nautiloop_api_key` cookie OR Bearer header.
 /// Unauthenticated requests to `/dashboard/*` (except `/dashboard/login` and
 /// `/dashboard/static/*`) are redirected to `/dashboard/login`.
@@ -59,7 +64,13 @@ pub async fn dashboard_auth_middleware(
 
     if bearer_valid {
         let csrf_token = generate_csrf_token();
+        // Extract engineer name before taking mutable borrow on extensions
+        let eng_name = extract_cookie_value(request.headers(), "nautiloop_engineer")
+            .map(|s| s.to_string());
         request.extensions_mut().insert(CsrfToken(csrf_token.clone()));
+        if let Some(eng) = eng_name {
+            request.extensions_mut().insert(EngineerName(eng));
+        }
         let mut response = next.run(request).await;
         let csrf_cookie = format!(
             "nautiloop_csrf={}; HttpOnly; SameSite=Strict; Path=/dashboard; Max-Age=604800",
@@ -77,7 +88,12 @@ pub async fn dashboard_auth_middleware(
 
     if cookie_valid {
         let csrf_token = generate_csrf_token();
+        let eng_name = extract_cookie_value(request.headers(), "nautiloop_engineer")
+            .map(|s| s.to_string());
         request.extensions_mut().insert(CsrfToken(csrf_token.clone()));
+        if let Some(eng) = eng_name {
+            request.extensions_mut().insert(EngineerName(eng));
+        }
         let mut response = next.run(request).await;
         let csrf_cookie = format!(
             "nautiloop_csrf={}; HttpOnly; SameSite=Strict; Path=/dashboard; Max-Age=604800",
