@@ -1,0 +1,70 @@
+{
+  "round": 12,
+  "source": "review",
+  "issues": [
+    {
+      "severity": "high",
+      "category": "correctness",
+      "file": "control-plane/assets/dashboard.js",
+      "line": 20,
+      "description": "FR-7a tab title and bell notification are completely non-functional in the default view. The `ut()` function counts converged loops from `d.loops`, and `bell()` triggers when that count increases. But in the default `state_filter=active` view, the `dashboard_state` handler sets `include_terminal=false` (handlers.rs:742), so converged/hardened/shipped loops are never included in the response's `loops` array. The converged count from `d.loops` is always 0, so the tab title never shows '(N) nautiloop' and the bell never fires. The response DOES include `d.counts.converged` from the fleet cache, but the JS ignores it.",
+      "suggestion": "Use `d.counts.converged` instead of counting from `d.loops` for both bell and tab-title logic. Track `d.counts.converged` across polls: `const vc = d.counts ? d.counts.converged : 0;`. This works regardless of state_filter since counts are always computed from all loops via the fleet cache."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/assets/dashboard.js",
+      "line": 20,
+      "description": "Bell notification is scoped to fleet-wide converged count, not the viewer's loops. When Alice views 'Mine' and Bob's loop converges, Alice's bell fires and tab title updates — even though the convergence is not her loop. FR-7a doesn't explicitly scope the bell, but scoping to the viewer's loops would be more useful.",
+      "suggestion": "If using d.counts.converged (fleet-wide), document that the bell fires for any team convergence. Or add a 'my_converged' count to the dashboard_state response filtered by the effective_engineer, and use that for bell/title."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/handlers.rs",
+      "line": 910,
+      "description": "Feed pagination can under-report results. `fetch_feed_items_with_engineers` fetches in batches of `limit+50=100` with `max_fetches=20`, examining at most 2000 rows. When filtering for 'converged' but most terminal loops are 'failed', fewer than 50 matching items may be found. Since `items.len() < 50`, the 'Load more' button is not rendered, giving the false impression there are no more results. The state sub-filter (converged/failed) is applied in memory rather than at the DB level.",
+      "suggestion": "Pass the state sub-filter to `get_terminal_loops` at the DB level. Add optional state list parameters: `states: Option<&[LoopState]>` and use `AND state = ANY($N)` in the query. This eliminates the fetch-filter loop entirely and guarantees correct pagination."
+    },
+    {
+      "severity": "medium",
+      "category": "performance",
+      "file": "control-plane/src/state/postgres.rs",
+      "line": 456,
+      "description": "The team/all query path in `get_loops_for_engineer` has LIMIT 10000. The `grid_page` handler uses this for initial fleet summary computation when `has_all_loops=true` (team mode, no engineer filter). For deployments with >10000 loops, the initial page render's fleet summary will show incomplete data (truncated costs, incorrect converge rates). The polled `dashboard_state` endpoint uses `compute_fleet_cached` which calls `get_loops_for_aggregation` (unbounded by time), so subsequent polls are correct — but there's a visible flash of wrong data on first load.",
+      "suggestion": "In `grid_page`, always use `compute_fleet_cached` for the fleet summary instead of computing it inline from the grid's loop data. This ensures consistency between initial render and polled updates, and the 10s cache means the extra query is almost always a cache hit."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/api/dashboard/handlers.rs",
+      "line": 37,
+      "description": "CSRF cookie Max-Age is 86400 (24 hours) on the login page, but the auth middleware's CSRF cookie (set on every authenticated request) also uses Max-Age=604800 (7 days) via `set_csrf_cookie`. These different lifetimes create a subtle bug: if a user is authenticated (7-day CSRF cookie set), then their auth cookie expires (7 days), they return to /dashboard/login. The login page sets a NEW CSRF token with 24h expiry. When they submit the form, the browser sends BOTH the old auth-middleware CSRF cookie (Path=/dashboard, not yet expired) and the new login CSRF cookie (same Path=/dashboard). `extract_cookie_value` takes the LAST match, which could be either one depending on browser cookie ordering. If it picks the auth-middleware's stale token, the CSRF check fails.",
+      "suggestion": "Use a different cookie name for the login CSRF (e.g., `nautiloop_login_csrf`) to avoid collision with the auth middleware's `nautiloop_csrf` cookie, or clear the existing nautiloop_csrf cookie when rendering the login page."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "control-plane/assets/dashboard.js",
+      "line": 42,
+      "description": "FR-12b specifies feed filter selection should persist in localStorage across visits. The implementation uses localStorage but restores via `location.replace()` which triggers a full page reload. On mobile (the primary use case), this causes a visible flash on every feed page visit when a filter is saved.",
+      "suggestion": "Apply the saved filter client-side by hiding/showing feed items with CSS classes, or accept the current behavior as adequate for v1."
+    },
+    {
+      "severity": "low",
+      "category": "style",
+      "file": "control-plane/assets/dashboard.js",
+      "line": 1,
+      "description": "The JS file is hand-minified with single-letter variable names, making it difficult to maintain and debug. No build-time minification step exists. While the file is within the <10KB budget at ~3KB effective, the lack of a readable source file creates maintenance risk.",
+      "suggestion": "Maintain a readable source file (e.g., dashboard.src.js) as the source of truth and add a build.rs minification step, or write readable code and rely on gzip to meet the size budget."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "control-plane/assets/dashboard.js",
+      "line": 24,
+      "description": "When new loops appear in polled data that aren't in the current DOM, a 'tap to refresh' banner is shown instead of rendering new cards. FR-3d says 'auto-refreshes every 5s via a small vanilla-JS poll that re-renders card fields in place.' New loops requiring manual interaction deviates from the spec intent, though the banner is arguably better UX than complex DOM manipulation.",
+      "suggestion": "Acceptable as-is — the banner avoids HTML duplication in JS while keeping the user informed."
+    }
+  ]
+}
