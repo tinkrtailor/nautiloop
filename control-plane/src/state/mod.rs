@@ -37,6 +37,35 @@ pub trait StateStore: Send + Sync + 'static {
         include_terminal: bool,
     ) -> Result<Vec<LoopRecord>>;
 
+    /// Get active (non-terminal) loops matching a specific spec_path.
+    /// Filters at the DB level to avoid fetching all active loops when only
+    /// a few match (FR-13 spec history page optimization).
+    async fn get_active_loops_for_spec(&self, spec_path: &str) -> Result<Vec<LoopRecord>>;
+
+    /// Get ALL loops created within a time window (no row LIMIT).
+    /// Used by fleet summary (FR-9) and stats (FR-14) aggregation where
+    /// completeness matters more than bounding result size.
+    /// The `since` parameter bounds results by `created_at >= since`.
+    async fn get_loops_for_aggregation(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<LoopRecord>>;
+
+    /// Get terminal loops ordered by updated_at DESC, with optional filters.
+    /// Unlike `get_loops_for_engineer`, this has no hard row limit and filters
+    /// at the DB level for efficiency (FR-12, FR-9, FR-13, FR-14).
+    /// When `states` is Some, only loops matching those states are returned
+    /// (DB-level filter). When None, all terminal states are included.
+    async fn get_terminal_loops(
+        &self,
+        engineer: Option<&str>,
+        spec_path: Option<&str>,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        cursor: Option<chrono::DateTime<chrono::Utc>>,
+        limit: usize,
+        states: Option<&[LoopState]>,
+    ) -> Result<Vec<LoopRecord>>;
+
     /// Update loop state and sub-state. Also updates `updated_at`.
     async fn update_loop_state(
         &self,
@@ -65,6 +94,13 @@ pub trait StateStore: Send + Sync + 'static {
 
     /// Get all rounds for a loop.
     async fn get_rounds(&self, loop_id: Uuid) -> Result<Vec<RoundRecord>>;
+
+    /// Get rounds for multiple loops in a single query (avoids N+1).
+    /// Returns a map from loop_id to its rounds.
+    async fn get_rounds_for_loops(
+        &self,
+        loop_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<RoundRecord>>>;
 
     /// Append a log event.
     async fn append_log(&self, event: &LogEvent) -> Result<()>;
@@ -130,6 +166,17 @@ pub trait StateStore: Send + Sync + 'static {
         final_state: &str,
         terminated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<()>;
+
+    /// Count loops grouped by state. Returns a map from LoopState to count.
+    /// Uses `SELECT state, COUNT(*) FROM loops GROUP BY state` in Postgres —
+    /// O(1) in result size regardless of total loops — giving exact counts
+    /// without fetching full row data (dashboard filter chip badges).
+    async fn get_loop_state_counts(&self) -> Result<std::collections::HashMap<LoopState, usize>>;
+
+    /// Get distinct engineer names from terminal loops.
+    /// Much lighter than fetching full loop records when only names are needed
+    /// (e.g., for dashboard feed filter chips).
+    async fn get_distinct_engineers(&self) -> Result<Vec<String>>;
 
     /// Health check: verify the store is reachable (e.g., SELECT 1).
     async fn health_check(&self) -> Result<()>;
@@ -281,6 +328,76 @@ pub mod memory {
                 .collect())
         }
 
+        async fn get_active_loops_for_spec(&self, spec_path: &str) -> Result<Vec<LoopRecord>> {
+            let loops = self.loops.read().await;
+            Ok(loops
+                .values()
+                .filter(|l| !l.state.is_terminal() && l.spec_path == spec_path)
+                .cloned()
+                .collect())
+        }
+
+        async fn get_loops_for_aggregation(
+            &self,
+            since: chrono::DateTime<chrono::Utc>,
+        ) -> Result<Vec<LoopRecord>> {
+            let loops = self.loops.read().await;
+            Ok(loops
+                .values()
+                .filter(|l| l.created_at >= since)
+                .cloned()
+                .collect())
+        }
+
+        async fn get_terminal_loops(
+            &self,
+            engineer: Option<&str>,
+            spec_path: Option<&str>,
+            since: Option<chrono::DateTime<chrono::Utc>>,
+            cursor: Option<chrono::DateTime<chrono::Utc>>,
+            limit: usize,
+            states: Option<&[LoopState]>,
+        ) -> Result<Vec<LoopRecord>> {
+            let loops = self.loops.read().await;
+            let mut result: Vec<_> = loops
+                .values()
+                .filter(|l| {
+                    if let Some(s) = states {
+                        if !s.contains(&l.state) {
+                            return false;
+                        }
+                    } else if !l.state.is_terminal() {
+                        return false;
+                    }
+                    if let Some(eng) = engineer
+                        && l.engineer != eng
+                    {
+                        return false;
+                    }
+                    if let Some(sp) = spec_path
+                        && l.spec_path != sp
+                    {
+                        return false;
+                    }
+                    if let Some(s) = since
+                        && l.updated_at < s
+                    {
+                        return false;
+                    }
+                    if let Some(c) = cursor
+                        && l.updated_at >= c
+                    {
+                        return false;
+                    }
+                    true
+                })
+                .cloned()
+                .collect();
+            result.sort_by_key(|l| std::cmp::Reverse(l.updated_at));
+            result.truncate(limit);
+            Ok(result)
+        }
+
         async fn update_loop_state(
             &self,
             id: Uuid,
@@ -366,6 +483,21 @@ pub mod memory {
                 .filter(|r| r.loop_id == loop_id)
                 .cloned()
                 .collect())
+        }
+
+        async fn get_rounds_for_loops(
+            &self,
+            loop_ids: &[Uuid],
+        ) -> Result<std::collections::HashMap<Uuid, Vec<RoundRecord>>> {
+            let id_set: std::collections::HashSet<Uuid> = loop_ids.iter().copied().collect();
+            let rounds = self.rounds.read().await;
+            let mut map: std::collections::HashMap<Uuid, Vec<RoundRecord>> = std::collections::HashMap::new();
+            for r in rounds.iter() {
+                if id_set.contains(&r.loop_id) {
+                    map.entry(r.loop_id).or_default().push(r.clone());
+                }
+            }
+            Ok(map)
         }
 
         async fn append_log(&self, event: &LogEvent) -> Result<()> {
@@ -499,6 +631,28 @@ pub mod memory {
 
         async fn advisory_unlock(&self, _loop_id: Uuid) -> Result<()> {
             Ok(())
+        }
+
+        async fn get_loop_state_counts(&self) -> Result<std::collections::HashMap<LoopState, usize>> {
+            let loops = self.loops.read().await;
+            let mut counts = std::collections::HashMap::new();
+            for l in loops.values() {
+                *counts.entry(l.state).or_insert(0) += 1;
+            }
+            Ok(counts)
+        }
+
+        async fn get_distinct_engineers(&self) -> Result<Vec<String>> {
+            let loops = self.loops.read().await;
+            let mut engineers: Vec<String> = loops
+                .values()
+                .filter(|l| l.state.is_terminal())
+                .map(|l| l.engineer.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            engineers.sort();
+            Ok(engineers)
         }
 
         async fn health_check(&self) -> Result<()> {

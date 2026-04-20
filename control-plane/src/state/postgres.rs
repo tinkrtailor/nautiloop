@@ -444,18 +444,119 @@ impl StateStore for PgStateStore {
         let rows = match engineer {
             Some(eng) if !team => {
                 let q = format!(
-                    "SELECT * FROM loops WHERE engineer = $1{terminal_filter} ORDER BY created_at DESC LIMIT 100"
+                    "SELECT * FROM loops WHERE engineer = $1{terminal_filter} ORDER BY created_at DESC LIMIT 10000"
                 );
                 sqlx::query(&q).bind(eng).fetch_all(&self.pool).await?
             }
             _ => {
+                // Bounded to prevent unbounded memory consumption on long-running
+                // deployments. 10000 rows is sufficient for aggregation (fleet
+                // summary, stats, specs) while protecting the polling endpoint.
                 let q = format!(
-                    "SELECT * FROM loops WHERE true{terminal_filter} ORDER BY created_at DESC LIMIT 100"
+                    "SELECT * FROM loops WHERE true{terminal_filter} ORDER BY created_at DESC LIMIT 10000"
                 );
                 sqlx::query(&q).fetch_all(&self.pool).await?
             }
         };
 
+        rows.iter().map(row_to_loop_record).collect()
+    }
+
+    async fn get_active_loops_for_spec(&self, spec_path: &str) -> Result<Vec<LoopRecord>> {
+        let rows = sqlx::query(
+            "SELECT * FROM loops \
+             WHERE spec_path = $1 \
+               AND state NOT IN ('CONVERGED', 'FAILED', 'CANCELLED', 'HARDENED', 'SHIPPED') \
+             ORDER BY created_at DESC",
+        )
+        .bind(spec_path)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(row_to_loop_record).collect()
+    }
+
+    async fn get_loops_for_aggregation(
+        &self,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<LoopRecord>> {
+        let rows = sqlx::query(
+            "SELECT * FROM loops WHERE created_at >= $1 ORDER BY created_at DESC",
+        )
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(row_to_loop_record).collect()
+    }
+
+    async fn get_terminal_loops(
+        &self,
+        engineer: Option<&str>,
+        spec_path: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        cursor: Option<DateTime<Utc>>,
+        limit: usize,
+        states: Option<&[LoopState]>,
+    ) -> Result<Vec<LoopRecord>> {
+        // Build a dynamic query that filters at the DB level.
+        // When `states` is provided, filter to exactly those states (DB-level).
+        // Otherwise, default to all terminal states.
+        let state_condition = if let Some(s) = states {
+            let state_strs: Vec<String> = s.iter().map(|st| format!("'{}'", loop_state_str(*st))).collect();
+            format!("state IN ({})", state_strs.join(", "))
+        } else {
+            "state IN ('CONVERGED', 'FAILED', 'CANCELLED', 'HARDENED', 'SHIPPED')".to_string()
+        };
+        let mut conditions = vec![state_condition];
+        let mut bind_idx = 1u32;
+        let mut engineer_val = None;
+        let mut spec_val = None;
+        let mut since_val = None;
+        let mut cursor_val = None;
+
+        if let Some(eng) = engineer {
+            conditions.push(format!("engineer = ${bind_idx}"));
+            bind_idx += 1;
+            engineer_val = Some(eng.to_string());
+        }
+        if let Some(sp) = spec_path {
+            conditions.push(format!("spec_path = ${bind_idx}"));
+            bind_idx += 1;
+            spec_val = Some(sp.to_string());
+        }
+        if since.is_some() {
+            conditions.push(format!("updated_at >= ${bind_idx}"));
+            bind_idx += 1;
+            since_val = since;
+        }
+        if cursor.is_some() {
+            conditions.push(format!("updated_at < ${bind_idx}"));
+            bind_idx += 1;
+            cursor_val = cursor;
+        }
+
+        let where_clause = conditions.join(" AND ");
+        let q = format!(
+            "SELECT * FROM loops WHERE {where_clause} ORDER BY updated_at DESC LIMIT ${bind_idx}"
+        );
+
+        let mut query = sqlx::query(&q);
+        if let Some(eng) = &engineer_val {
+            query = query.bind(eng);
+        }
+        if let Some(sp) = &spec_val {
+            query = query.bind(sp);
+        }
+        if let Some(s) = since_val {
+            query = query.bind(s);
+        }
+        if let Some(c) = cursor_val {
+            query = query.bind(c);
+        }
+        query = query.bind(limit as i64);
+
+        let rows = query.fetch_all(&self.pool).await?;
         rows.iter().map(row_to_loop_record).collect()
     }
 
@@ -621,6 +722,28 @@ impl StateStore for PgStateStore {
         .await?;
 
         Ok(rows.iter().map(row_to_round_record).collect())
+    }
+
+    async fn get_rounds_for_loops(
+        &self,
+        loop_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<RoundRecord>>> {
+        if loop_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = sqlx::query(
+            "SELECT * FROM rounds WHERE loop_id = ANY($1) ORDER BY round ASC, started_at ASC",
+        )
+        .bind(loop_ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut map: std::collections::HashMap<Uuid, Vec<RoundRecord>> = std::collections::HashMap::new();
+        for row in &rows {
+            let record = row_to_round_record(row);
+            map.entry(record.loop_id).or_default().push(record);
+        }
+        Ok(map)
     }
 
     async fn append_log(&self, event: &LogEvent) -> Result<()> {
@@ -895,6 +1018,37 @@ impl StateStore for PgStateStore {
         .await
         .map_err(crate::error::NautiloopError::Database)?;
         Ok(result.rows_affected())
+    }
+
+    async fn get_loop_state_counts(&self) -> Result<std::collections::HashMap<LoopState, usize>> {
+        let rows = sqlx::query("SELECT state, COUNT(*) as cnt FROM loops GROUP BY state")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(crate::error::NautiloopError::Database)?;
+
+        let mut counts = std::collections::HashMap::new();
+        for row in &rows {
+            let state: LoopState = sqlx::Row::get(row, "state");
+            let cnt: i64 = sqlx::Row::get(row, "cnt");
+            counts.insert(state, cnt as usize);
+        }
+        Ok(counts)
+    }
+
+    async fn get_distinct_engineers(&self) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT engineer FROM loops \
+             WHERE state IN ('CONVERGED', 'FAILED', 'CANCELLED', 'HARDENED', 'SHIPPED') \
+             ORDER BY engineer",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(crate::error::NautiloopError::Database)?;
+
+        Ok(rows
+            .iter()
+            .map(|r| sqlx::Row::get::<String, _>(r, "engineer"))
+            .collect())
     }
 
     async fn health_check(&self) -> Result<()> {

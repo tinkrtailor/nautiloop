@@ -132,6 +132,17 @@ impl NautiloopConfig {
             Some(c) => c.clone(),
         }
     }
+
+    /// Whether dashboard cookies should have the `Secure` flag.
+    /// Explicit config takes precedence; otherwise auto-detect from bind_addr.
+    pub fn dashboard_secure_cookie(&self) -> bool {
+        if let Some(explicit) = self.cluster.dashboard_secure_cookie {
+            return explicit;
+        }
+        // Auto-detect: Secure unless bound to loopback
+        let addr = &self.cluster.bind_addr;
+        addr != "127.0.0.1" && addr != "localhost" && addr != "::1"
+    }
 }
 
 /// Ship configuration from `[ship]` in nemo.toml.
@@ -414,6 +425,12 @@ pub struct ClusterConfig {
     /// to production. Egress enforcement is best-effort in dev.
     #[serde(default)]
     pub skip_iptables: bool,
+    /// Explicit control for the `Secure` flag on dashboard cookies.
+    /// `None` (default) = auto-detect from `bind_addr` (Secure unless loopback).
+    /// `true` = always set Secure. `false` = never set Secure.
+    /// Useful when running behind Tailscale without TLS termination.
+    #[serde(default)]
+    pub dashboard_secure_cookie: Option<bool>,
 }
 
 impl Default for ClusterConfig {
@@ -435,6 +452,7 @@ impl Default for ClusterConfig {
             reconcile_interval_secs: default_reconcile_interval(),
             default_branch: default_branch_name(),
             skip_iptables: false,
+            dashboard_secure_cookie: None,
         }
     }
 }

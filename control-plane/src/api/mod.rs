@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod cache;
+pub mod dashboard;
 pub mod handlers;
 pub mod introspect;
 pub mod sse;
@@ -17,6 +18,15 @@ use crate::config::NautiloopConfig;
 use crate::git::GitOperations;
 use crate::state::StateStore;
 
+/// Cached stats entry: (window_key, stats_data, cached_at).
+pub type StatsCacheEntry = Option<(String, dashboard::render::StatsData, chrono::DateTime<chrono::Utc>)>;
+
+/// Cached fleet summary + counts: (fleet_json, counts_json, full_fleet_summary, cached_at).
+/// Short TTL (10s) for the dashboard_state endpoint which is polled every 5s.
+/// The full `FleetSummary` is included so grid_page can use the cached data
+/// directly without recomputing (avoids LIMIT 10000 truncation on initial render).
+pub type FleetCacheEntry = Option<(dashboard::handlers::FleetSummaryJson, dashboard::handlers::CountsJson, dashboard::render::FleetSummary, chrono::DateTime<chrono::Utc>)>;
+
 /// Shared application state for all API handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -30,16 +40,26 @@ pub struct AppState {
     /// Separate from the trait-based StateStore so we can write directly
     /// without adding snapshot methods to the test-focused trait.
     pub pool: Option<sqlx::PgPool>,
+    /// Per-instance stats cache for the dashboard (FR-14b).
+    pub stats_cache: Arc<tokio::sync::RwLock<StatsCacheEntry>>,
+    /// Per-instance fleet summary cache for the dashboard_state endpoint.
+    /// 10s TTL — reduces DB load from the 5s card-grid poll.
+    pub fleet_cache: Arc<tokio::sync::RwLock<FleetCacheEntry>>,
+    /// API key for dashboard auth. Read from NAUTILOOP_API_KEY env var at startup
+    /// and injected here so tests can set it without `unsafe { set_var() }`.
+    pub api_key: Option<String>,
 }
 
 /// Build the axum router with all endpoints and auth middleware.
 /// The /health endpoint is outside the auth layer so K8s probes work without an API key.
 pub fn build_router(state: AppState) -> Router {
     let authed = build_routes(state.clone()).layer(middleware::from_fn(auth::auth_middleware));
+    let dashboard = dashboard::build_dashboard_router_with_key(state.api_key.clone());
 
     Router::new()
         .route("/health", get(health))
         .merge(authed)
+        .merge(dashboard)
         .with_state(state)
 }
 
@@ -110,6 +130,9 @@ mod tests {
             config: Arc::new(NautiloopConfig::default()),
             kube_client: None,
             pool: None,
+            stats_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            fleet_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            api_key: None,
         };
         build_router(state)
     }
@@ -149,6 +172,29 @@ mod tests {
         ) -> crate::error::Result<Vec<LoopRecord>> {
             unimplemented!()
         }
+        async fn get_active_loops_for_spec(
+            &self,
+            _: &str,
+        ) -> crate::error::Result<Vec<LoopRecord>> {
+            unimplemented!()
+        }
+        async fn get_loops_for_aggregation(
+            &self,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> crate::error::Result<Vec<LoopRecord>> {
+            unimplemented!()
+        }
+        async fn get_terminal_loops(
+            &self,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: Option<chrono::DateTime<chrono::Utc>>,
+            _: Option<chrono::DateTime<chrono::Utc>>,
+            _: usize,
+            _: Option<&[LoopState]>,
+        ) -> crate::error::Result<Vec<LoopRecord>> {
+            unimplemented!()
+        }
         async fn update_loop_state(
             &self,
             _: Uuid,
@@ -181,6 +227,12 @@ mod tests {
             unimplemented!()
         }
         async fn get_rounds(&self, _: Uuid) -> crate::error::Result<Vec<RoundRecord>> {
+            unimplemented!()
+        }
+        async fn get_rounds_for_loops(
+            &self,
+            _: &[Uuid],
+        ) -> crate::error::Result<std::collections::HashMap<Uuid, Vec<RoundRecord>>> {
             unimplemented!()
         }
         async fn append_log(&self, _: &LogEvent) -> crate::error::Result<()> {
@@ -251,6 +303,14 @@ mod tests {
         async fn count_exit_clean_decisions(&self, _: Uuid) -> crate::error::Result<u32> {
             unimplemented!()
         }
+        async fn get_loop_state_counts(
+            &self,
+        ) -> crate::error::Result<std::collections::HashMap<LoopState, usize>> {
+            unimplemented!()
+        }
+        async fn get_distinct_engineers(&self) -> crate::error::Result<Vec<String>> {
+            unimplemented!()
+        }
     }
 
     #[tokio::test]
@@ -297,6 +357,9 @@ mod tests {
             config: Arc::new(NautiloopConfig::default()),
             kube_client: None,
             pool: None,
+            stats_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            fleet_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            api_key: None,
         };
         let app = build_router(state);
 
