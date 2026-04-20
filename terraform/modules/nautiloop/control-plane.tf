@@ -1,12 +1,23 @@
 # Control plane: nemo.toml config, repo-init job, API server, loop engine — applied via SSH+kubectl.
 
 locals {
+  # dashboard_secure_cookie resolution:
+  # - If operator explicitly set it, use that.
+  # - Otherwise, default to false when no TLS-terminating domain is configured
+  #   (IP-only / Tailscale HTTP deployments — Secure cookies get dropped over HTTP).
+  # - When a domain is set, leave unset (binary auto-detects and defaults to Secure).
+  _dashboard_secure_cookie_resolved = (
+    var.dashboard_secure_cookie != null ? var.dashboard_secure_cookie :
+    ((var.domain == null || var.domain == "") ? false : null)
+  )
+
   nautiloop_toml = <<-TOML
 [cluster]
 git_repo_url = "${var.git_repo_url}"
 agent_image = "${var.agent_base_image}"
 sidecar_image = "${var.sidecar_image}"
 ${var.image_pull_secret_dockerconfigjson != null ? "image_pull_secret = \"nautiloop-registry-creds\"" : ""}
+${local._dashboard_secure_cookie_resolved != null ? "dashboard_secure_cookie = ${local._dashboard_secure_cookie_resolved}" : ""}
 TOML
 
   config_checksum = sha256(local.nautiloop_toml)
