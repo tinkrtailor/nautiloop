@@ -1,0 +1,48 @@
+{
+  "round": 2,
+  "source": "audit",
+  "issues": [
+    {
+      "severity": "medium",
+      "category": "completeness",
+      "file": "specs/dashboard-contrast-theme-toggle.md",
+      "description": "Light-mode semantic/brand colors are not addressed. The current light media query (dashboard.css:48-58) only overrides layout/text variables — brand (--primary, --accent) and semantic (--success, --error, --info) colors fall through from the dark-mode :root. Helm's light theme defines different values for teal (#145A4B), amber (#B47814), green (#1E643C), red (#B4281E), blue (#2864AA) vs the dark theme. The spec aligns layout/text with helm light but leaves semantic colors using dark-mode values in light mode, creating a partial alignment. FR-1d explicitly says 'no changes to dark-mode values' for these, but doesn't address whether light-mode overrides should be added.",
+      "suggestion": "Add a requirement or explicit out-of-scope note for light-mode semantic color alignment with helm. Either add them to the FR-1c table or explicitly state 'light-mode semantic colors (--primary, --accent, --success, --error, --info) are out of scope for this spec — dark-mode values are used in both themes today and remain unchanged.'"
+    },
+    {
+      "severity": "medium",
+      "category": "completeness",
+      "file": "specs/dashboard-contrast-theme-toggle.md",
+      "description": "Light-mode --text-tertiary (#8A8784) is not checked for WCAG AA compliance. The spec keeps this value unchanged, but with the new light --bg (#FAFAF8), the contrast ratio of #8A8784 on #FAFAF8 is approximately 3.5:1 — below WCAG AA 4.5:1 for normal text. If --text-tertiary is used for visible text (not just decorative), this creates a new accessibility regression in light mode.",
+      "suggestion": "Verify where --text-tertiary is used in light mode. If it applies to readable text (not just decorative elements or large text where 3:1 suffices), either bump it to pass 4.5:1 against #FAFAF8, or document that it's only used for large text/decorative elements where 3:1 is sufficient."
+    },
+    {
+      "severity": "medium",
+      "category": "clarity",
+      "file": "specs/dashboard-contrast-theme-toggle.md",
+      "description": "FR-2a reorders the existing menu items without explicitly calling out the reordering. The current menu order is: Cancel all → Bell → Logout. The spec proposes: Theme → Bell → Cancel all → Logout. Moving 'Cancel all' (a destructive action) from first position to third is a UX change that isn't discussed or motivated.",
+      "suggestion": "Explicitly acknowledge the menu reorder and state the rationale (e.g., theme is most frequently used so goes first, or group by category: settings → actions)."
+    },
+    {
+      "severity": "low",
+      "category": "clarity",
+      "file": "specs/dashboard-contrast-theme-toggle.md",
+      "description": "FR-2a says 'Menu closes automatically after theme selection' but the existing initMenu() close logic (document.onclick handler) only closes on clicks outside the dropdown. Theme radio clicks inside the dropdown would NOT trigger auto-close without explicit code. The spec doesn't specify whether this should be handled by the click propagation or explicit close logic in the theme handler.",
+      "suggestion": "Clarify in FR-2e that each theme click handler should explicitly close the dropdown (e.g., add 'hidden' class to #menu-dropdown) after applying the theme, since clicks inside the dropdown don't trigger the existing outside-click handler."
+    },
+    {
+      "severity": "low",
+      "category": "clarity",
+      "file": "specs/dashboard-contrast-theme-toggle.md",
+      "description": "FR-2d shows a CSS structure with both :root (dark default) and [data-theme='dark'] containing the same values, plus @media light and [data-theme='light'] with the same light values. The spec says 'CSS variables or a :where() grouping to avoid duplication' but doesn't specify a concrete dedup strategy. In practice, the simplest approach is just duplicating the declarations, which is fine for ~7 variables but the spec frames duplication as something to avoid.",
+      "suggestion": "Either accept the duplication as acceptable (two blocks of ~7 variables each is minimal) or specify the concrete pattern, e.g., 'duplication of the 7 color variables across :root/[data-theme] is acceptable given the small count.'"
+    },
+    {
+      "severity": "low",
+      "category": "completeness",
+      "file": "specs/dashboard-contrast-theme-toggle.md",
+      "description": "The existing dashboard.js appears to be written in a highly compressed/minified single-line style (functions on single lines, short variable names). The spec says '~30 lines' for initTheme() following the initBell() pattern. An implementor should match the existing code style, but this isn't mentioned.",
+      "suggestion": "Note that dashboard.js uses a compressed coding style and initTheme() should match it, or clarify if a more readable style is acceptable."
+    }
+  ]
+}
