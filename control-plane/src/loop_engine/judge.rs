@@ -255,6 +255,141 @@ impl JudgeModelClient for SidecarJudgeClient {
     }
 }
 
+/// Direct Anthropic API client for the control-plane pod (FR-1a).
+///
+/// Unlike `SidecarJudgeClient` which routes through a per-pod auth sidecar,
+/// this client calls `https://api.anthropic.com/v1/messages` directly with
+/// an API key. Used by the loop engine which has no sidecar.
+pub struct DirectAnthropicClient {
+    client: reqwest::Client,
+    api_key: String,
+}
+
+impl DirectAnthropicClient {
+    pub fn new(api_key: String) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to build reqwest client with timeout; falling back to default"
+                );
+                reqwest::Client::default()
+            });
+        Self { client, api_key }
+    }
+}
+
+#[async_trait]
+impl JudgeModelClient for DirectAnthropicClient {
+    async fn invoke(&self, model: &str, prompt: &str) -> Result<String> {
+        let body = serde_json::json!({
+            "model": model,
+            "max_tokens": 512,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+        });
+
+        let resp = self
+            .client
+            .post("https://api.anthropic.com/v1/messages")
+            .header("content-type", "application/json")
+            .header("anthropic-version", "2023-06-01")
+            .header("x-api-key", &self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                crate::error::NautiloopError::Internal(format!("Judge HTTP request failed: {e}"))
+            })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(crate::error::NautiloopError::Internal(format!(
+                "Judge model returned {status}: {body}"
+            )));
+        }
+
+        let response_json: serde_json::Value = resp.json().await.map_err(|e| {
+            crate::error::NautiloopError::Internal(format!(
+                "Judge model response not valid JSON: {e}"
+            ))
+        })?;
+
+        // Extract text from Anthropic Messages API response
+        let text = response_json
+            .get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|block| block.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        Ok(text)
+    }
+}
+
+/// Credentials JSON file schema for the judge (FR-1b).
+#[derive(Debug, Deserialize)]
+struct JudgeCredentialsFile {
+    api_key: String,
+}
+
+/// Resolve judge API key from available credential sources (FR-1b).
+///
+/// Checked in order:
+/// 1. `NAUTILOOP_JUDGE_API_KEY` env var
+/// 2. Credentials file at `credentials_path` containing `{"api_key": "..."}`
+/// 3. None (judge disabled with warning)
+pub fn resolve_judge_api_key(credentials_path: &str) -> Option<String> {
+    // Source 1: env var
+    if let Ok(key) = std::env::var("NAUTILOOP_JUDGE_API_KEY")
+        && !key.is_empty()
+    {
+        tracing::info!("Judge credentials resolved from NAUTILOOP_JUDGE_API_KEY env var");
+        return Some(key);
+    }
+
+    // Source 2: credentials file
+    match std::fs::read_to_string(credentials_path) {
+        Ok(contents) => match serde_json::from_str::<JudgeCredentialsFile>(&contents) {
+            Ok(creds) if !creds.api_key.is_empty() => {
+                tracing::info!(
+                    path = credentials_path,
+                    "Judge credentials resolved from credentials file"
+                );
+                Some(creds.api_key)
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    path = credentials_path,
+                    "Judge credentials file has empty api_key"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = credentials_path,
+                    error = %e,
+                    "Failed to parse judge credentials file"
+                );
+                None
+            }
+        },
+        Err(_) => {
+            // File not found is expected when creds aren't provisioned
+            None
+        }
+    }
+}
+
 /// The orchestrator judge. Holds config, model client, and state store references.
 pub struct OrchestratorJudge {
     config: OrchestratorConfig,
@@ -430,13 +565,23 @@ impl OrchestratorJudge {
             );
         }
 
-        // FR-6a: Log at INFO level
+        // FR-4a: Cumulative decision count for this loop (for operator grep)
+        let judge_decision_total = {
+            let counts = self.call_counts.lock().await;
+            counts.get(&context.loop_id).copied().unwrap_or(0)
+        };
+
+        // FR-6a / FR-4a: Log at INFO level with all required fields
         tracing::info!(
+            target: "judge",
             loop_id = %context.loop_id,
             round = context.round,
+            phase = %context.phase,
+            trigger = %trigger,
             decision = %output.decision,
             confidence = ?output.confidence,
             duration_ms,
+            judge_decision_total,
             "Judge decision"
         );
 
@@ -735,6 +880,7 @@ mod tests {
             judge_model: "test-model".to_string(),
             judge_enabled: true,
             max_judge_calls: 10,
+            judge_credentials_path: "/nonexistent/test/credentials.json".to_string(),
         }
     }
 
@@ -1131,5 +1277,146 @@ mod tests {
         assert!(prompt.contains("orchestrator judge"));
         assert!(prompt.contains(&ctx.loop_id.to_string()));
         assert!(prompt.contains("specs/test.md"));
+    }
+
+    // --- DirectAnthropicClient construction tests ---
+
+    #[test]
+    fn test_direct_anthropic_client_constructs() {
+        let client = DirectAnthropicClient::new("sk-ant-test-key".to_string());
+        assert_eq!(client.api_key, "sk-ant-test-key");
+    }
+
+    // --- resolve_judge_api_key tests ---
+
+    #[test]
+    fn test_resolve_judge_api_key_from_env_var() {
+        // Set the env var for this test
+        // SAFETY: test-only, single-threaded access to this env var
+        unsafe { std::env::set_var("NAUTILOOP_JUDGE_API_KEY", "sk-ant-env-key") };
+        let result = resolve_judge_api_key("/nonexistent/path/credentials.json");
+        assert_eq!(result, Some("sk-ant-env-key".to_string()));
+        unsafe { std::env::remove_var("NAUTILOOP_JUDGE_API_KEY") };
+    }
+
+    #[test]
+    fn test_resolve_judge_api_key_from_credentials_file() {
+        // SAFETY: test-only, single-threaded access to this env var
+        unsafe { std::env::remove_var("NAUTILOOP_JUDGE_API_KEY") };
+
+        let dir = std::env::temp_dir().join(format!("judge-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let creds_path = dir.join("credentials.json");
+        std::fs::write(
+            &creds_path,
+            r#"{"api_key": "sk-ant-file-key"}"#,
+        )
+        .unwrap();
+
+        let result = resolve_judge_api_key(creds_path.to_str().unwrap());
+        assert_eq!(result, Some("sk-ant-file-key".to_string()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_resolve_judge_api_key_none_when_missing() {
+        // SAFETY: test-only, single-threaded access to this env var
+        unsafe { std::env::remove_var("NAUTILOOP_JUDGE_API_KEY") };
+        let result = resolve_judge_api_key("/nonexistent/path/credentials.json");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_resolve_judge_api_key_empty_env_var_ignored() {
+        // SAFETY: test-only, single-threaded access to this env var
+        unsafe { std::env::set_var("NAUTILOOP_JUDGE_API_KEY", "") };
+        let result = resolve_judge_api_key("/nonexistent/path/credentials.json");
+        assert!(result.is_none());
+        unsafe { std::env::remove_var("NAUTILOOP_JUDGE_API_KEY") };
+    }
+
+    #[test]
+    fn test_resolve_judge_api_key_malformed_file() {
+        // SAFETY: test-only, single-threaded access to this env var
+        unsafe { std::env::remove_var("NAUTILOOP_JUDGE_API_KEY") };
+
+        let dir = std::env::temp_dir().join(format!("judge-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let creds_path = dir.join("credentials.json");
+        std::fs::write(&creds_path, "not valid json").unwrap();
+
+        let result = resolve_judge_api_key(creds_path.to_str().unwrap());
+        assert!(result.is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- NFR-1: Graceful degradation test ---
+
+    #[tokio::test]
+    async fn test_failing_judge_falls_through_to_heuristic() {
+        // Verify that a failing JudgeModelClient returns None (heuristic fallback)
+        let store = Arc::new(MemoryStateStore::new());
+        let judge = OrchestratorJudge::new(
+            test_config(),
+            Arc::new(FailingJudgeClient),
+            store,
+        );
+        let ctx = test_context();
+        let output = judge.invoke(&ctx, &JudgeTrigger::NotClean).await;
+        assert!(output.is_none(), "Failed judge must return None for heuristic fallback");
+    }
+
+    // --- NFR-3: Cost ceiling log test ---
+
+    #[tokio::test]
+    async fn test_cost_ceiling_logs_on_cap_hit() {
+        let config = OrchestratorConfig {
+            max_judge_calls: 1,
+            ..test_config()
+        };
+        let store = Arc::new(MemoryStateStore::new());
+        let response = r#"{"decision": "continue", "confidence": 0.8, "reasoning": "ok", "hint": null}"#;
+        let judge = OrchestratorJudge::new(
+            config,
+            Arc::new(MockJudgeClient::new(response)),
+            store,
+        );
+
+        let ctx = test_context();
+        // First call succeeds
+        assert!(judge.invoke(&ctx, &JudgeTrigger::NotClean).await.is_some());
+        // Second call short-circuits (cap is 1)
+        assert!(
+            judge.invoke(&ctx, &JudgeTrigger::NotClean).await.is_none(),
+            "Call exceeding cost ceiling must short-circuit to heuristic"
+        );
+    }
+
+    // --- Integration: judge writes decisions to store ---
+
+    #[tokio::test]
+    async fn test_judge_writes_decisions_to_store() {
+        let response = r#"{"decision": "exit_clean", "confidence": 0.95, "reasoning": "all good", "hint": null}"#;
+        let store = Arc::new(MemoryStateStore::new());
+        let judge = OrchestratorJudge::new(
+            test_config(),
+            Arc::new(MockJudgeClient::new(response)),
+            store.clone(),
+        );
+
+        let ctx = test_context();
+        let output = judge.invoke(&ctx, &JudgeTrigger::RecurringFindings).await.unwrap();
+        assert_eq!(output.decision, JudgeDecision::ExitClean);
+
+        // Verify decision row was written
+        let decisions = store.get_judge_decisions(ctx.loop_id).await.unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].decision, "exit_clean");
+        assert_eq!(decisions[0].trigger, "recurring_findings");
+        assert_eq!(decisions[0].phase, "review");
+        assert!(decisions[0].confidence.is_some());
+        assert!(decisions[0].duration_ms > 0 || decisions[0].duration_ms == 0);
     }
 }

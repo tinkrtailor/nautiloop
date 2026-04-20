@@ -12,6 +12,7 @@ use nautiloop_control_plane::git::GitOperations;
 use nautiloop_control_plane::k8s::JobDispatcher;
 use nautiloop_control_plane::k8s::client::KubeJobDispatcher;
 use nautiloop_control_plane::loop_engine::{ConvergentLoopDriver, Reconciler, watcher::JobWatcher};
+use nautiloop_control_plane::loop_engine::judge::{DirectAnthropicClient, resolve_judge_api_key};
 use nautiloop_control_plane::state::StateStore;
 use nautiloop_control_plane::state::postgres::PgStateStore;
 
@@ -143,12 +144,44 @@ async fn main() -> anyhow::Result<()> {
                 nautiloop_control_plane::git::bare::BareRepoGitOperations::new(&bare_repo_path),
             );
 
-            let driver = Arc::new(ConvergentLoopDriver::new(
-                store.clone(),
-                dispatcher,
-                git,
-                config.clone(),
-            ));
+            let driver = if config.orchestrator.judge_enabled {
+                match resolve_judge_api_key(&config.orchestrator.judge_credentials_path) {
+                    Some(api_key) => {
+                        let model_client = Arc::new(DirectAnthropicClient::new(api_key));
+                        tracing::info!(
+                            model = %config.orchestrator.judge_model,
+                            "Orchestrator judge: enabled, model={}",
+                            config.orchestrator.judge_model
+                        );
+                        Arc::new(ConvergentLoopDriver::with_judge(
+                            store.clone(),
+                            dispatcher,
+                            git,
+                            config.clone(),
+                            model_client,
+                        ))
+                    }
+                    None => {
+                        tracing::warn!(
+                            "Orchestrator judge: enabled in config but NAUTILOOP_JUDGE_API_KEY/credentials missing; skipping"
+                        );
+                        Arc::new(ConvergentLoopDriver::new(
+                            store.clone(),
+                            dispatcher,
+                            git,
+                            config.clone(),
+                        ))
+                    }
+                }
+            } else {
+                tracing::info!("Orchestrator judge: disabled (judge_enabled=false)");
+                Arc::new(ConvergentLoopDriver::new(
+                    store.clone(),
+                    dispatcher,
+                    git,
+                    config.clone(),
+                ))
+            };
 
             let wake = Arc::new(Notify::new());
 

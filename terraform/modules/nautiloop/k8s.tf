@@ -456,6 +456,30 @@ resource "null_resource" "k8s_secrets" {
   }
 }
 
+# Judge credentials (conditional — only when judge_api_key provided)
+resource "null_resource" "k8s_judge_creds" {
+  count      = var.judge_api_key != null ? 1 : 0
+  depends_on = [null_resource.k8s_foundation]
+
+  triggers = {
+    key_hash  = sha256(var.judge_api_key)
+    server_ip = var.server_ip
+  }
+
+  connection {
+    type        = "ssh"
+    host        = var.server_ip
+    user        = var.ssh_user
+    private_key = var.ssh_private_key
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "kubectl -n nautiloop-system create secret generic nautiloop-judge-creds --from-literal='credentials.json={\"api_key\": \"${var.judge_api_key}\"}' --dry-run=client -o yaml | kubectl apply -f -",
+    ]
+  }
+}
+
 # Registry credentials (conditional — only when image_pull_secret provided)
 resource "null_resource" "k8s_registry_creds" {
   count      = var.image_pull_secret_dockerconfigjson != null ? 1 : 0
