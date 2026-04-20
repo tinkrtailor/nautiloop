@@ -1,0 +1,55 @@
+{
+  "round": 1,
+  "source": "audit",
+  "issues": [
+    {
+      "severity": "high",
+      "category": "correctness",
+      "file": "specs/judge-unified-auth.md",
+      "description": "FR-3b deprecation alias is contradictory with FR-1d secret shape change. If operator sets deprecated `judge_api_key` (raw API key string), the spec says 'existing behavior still works for one release' (AC #4). But FR-1d changes the secret shape to `data.claude: <OAuth bundle>`. A raw API key is not an OAuth bundle — the sidecar cannot use it. The spec must clarify: does the deprecation period maintain the OLD secret shape + DirectAnthropicClient path for one release? Or does it reject `judge_api_key` at plan-time with a warning?",
+      "suggestion": "Clarify that when `judge_api_key` is set during deprecation, terraform still creates the OLD-format secret AND the loop-engine still uses DirectAnthropicClient for that one release (i.e., removal of DirectAnthropicClient is deferred until the deprecation period ends). Alternatively, make it a hard break with no deprecation — just emit an error telling operators to switch."
+    },
+    {
+      "severity": "high",
+      "category": "correctness",
+      "file": "specs/judge-unified-auth.md",
+      "description": "FR-1d says the secret format 'mirrors what agent pods already consume', but the current agent pod secrets (from dev/setup.sh and job_builder.rs) use `anthropic=<raw_API_key>` and `openai=<raw_key>` literals — NOT a `claude` key with an OAuth bundle. The spec claims the sidecar already handles OAuth bundle refresh, but the existing credential provisioning path (dev/setup.sh lines 120-135) stores raw API keys. The spec doesn't clarify whether the sidecar already supports reading a `claude` key with OAuth bundle format, or whether the sidecar itself also needs modification.",
+      "suggestion": "Add a prerequisite statement: either (a) confirm the sidecar already reads a `claude` key and performs OAuth refresh (cite the code path), or (b) add a dependency on a sidecar enhancement spec that adds OAuth bundle support. Without this, the implementer won't know if the sidecar image works as-is or needs changes (which would violate NFR-1: 'no new Docker images')."
+    },
+    {
+      "severity": "medium",
+      "category": "completeness",
+      "file": "specs/judge-unified-auth.md",
+      "description": "FR-3c states 'the script already has `nemo auth --claude` logic and stores the bundle' but dev/setup.sh (lines 120-147) has NO `nemo auth --claude` handling. It reads raw API keys from NAUTILOOP_ANTHROPIC_KEY env var. The spec's claim is factually incorrect — there is no existing bundle-detection logic to 'extend'.",
+      "suggestion": "Rewrite FR-3c to acknowledge that `nemo auth --claude` integration must be ADDED to dev/setup.sh (not 'extended'). Specify where the local Claude bundle lives (e.g., `~/.claude/.credentials.json`), what format it has, and the fallback behavior if the file doesn't exist."
+    },
+    {
+      "severity": "medium",
+      "category": "completeness",
+      "file": "specs/judge-unified-auth.md",
+      "description": "FR-3b says 'emit a terraform warning' when deprecated variable is set, but Terraform HCL has no native `warning` output mechanism. The existing deprecation pattern in this codebase (variables.tf:140-145 for cargo_cache_volume_size) uses only a description string — no runtime warning. Terraform validation blocks can produce errors but not warnings. The spec doesn't specify the mechanism.",
+      "suggestion": "Specify the concrete mechanism: either (a) use a `check` block with `warn` condition (Terraform 1.5+), (b) use a `terraform_data` resource with a `precondition` that outputs a message, (c) use a `locals` block that outputs via a `null_resource` provisioner, or (d) just document it in the variable description (matching existing pattern). Option (a) is cleanest if the cluster runs TF >= 1.5."
+    },
+    {
+      "severity": "medium",
+      "category": "clarity",
+      "file": "specs/judge-unified-auth.md",
+      "description": "FR-2b says 'unconditionally wires SidecarJudgeClient' but FR-2c still acknowledges a disabled state ('judge_enabled = false'). The word 'unconditionally' is ambiguous — does it mean 'when judge is enabled, always use sidecar (no fallback to DirectAnthropicClient)' or 'always construct the client regardless of config'? The current code has `judge: Option<OrchestratorJudge>` where None means disabled.",
+      "suggestion": "Clarify: 'When `judge_enabled = true`, unconditionally construct `SidecarJudgeClient::new(\"http://localhost:9090\")` — no credential resolution, no alternative client. When `judge_enabled = false`, omit the judge entirely (existing `Option<OrchestratorJudge>` remains None).'"
+    },
+    {
+      "severity": "low",
+      "category": "completeness",
+      "file": "specs/judge-unified-auth.md",
+      "description": "NFR-5 specifies a unit test in 'control-plane/src/main.rs' but main.rs is a binary entry point with no existing test module. Testing startup construction logic typically requires extracting it into a testable function or using integration tests.",
+      "suggestion": "Either specify that the test lives in `control-plane/src/loop_engine/mod.rs` (where `build_loop_driver()` already exists and is testable), or note that main.rs construction should be extracted into a testable helper."
+    },
+    {
+      "severity": "low",
+      "category": "clarity",
+      "file": "specs/judge-unified-auth.md",
+      "description": "The spec says the sidecar adds '~3-5 seconds' startup cost (NFR-3) but the existing sidecar startup probe in job_builder.rs has failure_threshold=30 with period_seconds=2 (60s timeout). If the sidecar takes longer than 5s in practice, this could affect loop-engine pod readiness during deploys.",
+      "suggestion": "Note that the startup probe parameters should match what agent pods use (period: 2s, failure_threshold: 30) and that the 3-5s is typical, not guaranteed. Acceptable for control-plane since it's not in the hot path."
+    }
+  ]
+}
