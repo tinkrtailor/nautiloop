@@ -37,6 +37,11 @@ pub trait StateStore: Send + Sync + 'static {
         include_terminal: bool,
     ) -> Result<Vec<LoopRecord>>;
 
+    /// Get active (non-terminal) loops matching a specific spec_path.
+    /// Filters at the DB level to avoid fetching all active loops when only
+    /// a few match (FR-13 spec history page optimization).
+    async fn get_active_loops_for_spec(&self, spec_path: &str) -> Result<Vec<LoopRecord>>;
+
     /// Get ALL loops created within a time window (no row LIMIT).
     /// Used by fleet summary (FR-9) and stats (FR-14) aggregation where
     /// completeness matters more than bounding result size.
@@ -310,6 +315,15 @@ pub mod memory {
                     };
                     eng_match && (include_terminal || !l.state.is_terminal())
                 })
+                .cloned()
+                .collect())
+        }
+
+        async fn get_active_loops_for_spec(&self, spec_path: &str) -> Result<Vec<LoopRecord>> {
+            let loops = self.loops.read().await;
+            Ok(loops
+                .values()
+                .filter(|l| !l.state.is_terminal() && l.spec_path == spec_path)
                 .cloned()
                 .collect())
         }

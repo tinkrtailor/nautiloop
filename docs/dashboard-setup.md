@@ -23,6 +23,16 @@ The dashboard requires the same API key used by the `nemo` CLI (`NAUTILOOP_API_K
 
 The API key is **defense in depth**, not the sole security boundary. It prevents casual access if someone happens to reach the host, but it is a shared secret — not a per-user credential.
 
+### Login Form: Engineer Name + API Key
+
+The login form at `/dashboard/login` collects two fields:
+
+1. **Engineer name** — a short identifier (alphanumeric, dash, underscore, dot) used to scope the default "Mine" view filter on the card grid. Since the cluster uses a single shared API key, the key alone cannot identify which engineer is logged in. The engineer name is stored as an HttpOnly cookie (`nautiloop_engineer`) alongside the API key cookie.
+
+2. **API key** — the shared cluster key (`NAUTILOOP_API_KEY`).
+
+The engineer name is **not an authentication credential** — it is a display/filter preference. Any authenticated user can switch to "Team" view and see all engineers' loops regardless of the name they entered at login. This matches the existing CLI behavior where `nemo status` defaults to the current engineer's loops and `nemo status --team` shows everyone's.
+
 ### Do NOT Expose to the Public Internet
 
 **The dashboard must not be exposed to the public internet without an external authentication proxy.**

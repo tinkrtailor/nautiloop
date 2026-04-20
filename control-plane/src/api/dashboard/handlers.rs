@@ -967,18 +967,14 @@ pub async fn specs_page(
 
     // Fetch loops matching this spec_path efficiently:
     // - Terminal loops: use get_terminal_loops with spec_path filter (DB-level)
-    // - Active loops: use get_loops_for_engineer(None, true, false) and filter in memory
-    //   (active loops are a small set, so in-memory filtering is fine)
-    let (terminal_loops, active_loops) = tokio::join!(
+    // - Active loops: use get_active_loops_for_spec with spec_path filter (DB-level)
+    // Both queries filter at the database level to avoid fetching unrelated loops.
+    let (terminal_loops, active_matching) = tokio::join!(
         state.store.get_terminal_loops(None, Some(&spec_path), None, None, 500),
-        state.store.get_loops_for_engineer(None, true, false),
+        state.store.get_active_loops_for_spec(&spec_path),
     );
     let terminal_loops = terminal_loops?;
-    let active_loops = active_loops?;
-    let active_matching: Vec<_> = active_loops
-        .into_iter()
-        .filter(|l| l.spec_path == spec_path)
-        .collect();
+    let active_matching = active_matching?;
     let mut matching = terminal_loops;
     matching.extend(active_matching);
 
@@ -1133,6 +1129,10 @@ pub struct EngineerStatsJson {
 /// The fleet summary aggregates ALL loops regardless of the current view filter,
 /// so it's the same for every poll. Caching avoids fetching unbounded historical
 /// data on every 5s card-grid poll cycle.
+///
+/// Counts (active/converged/failed) are computed from ALL loops regardless of
+/// age, not bounded by the 14-day fleet summary window. This ensures active
+/// loops older than 14 days still appear in filter chip badges.
 async fn compute_fleet_cached(
     state: &AppState,
 ) -> Result<(FleetSummaryJson, CountsJson), NautiloopError> {
@@ -1145,23 +1145,28 @@ async fn compute_fleet_cached(
             return Ok((fleet.clone(), counts.clone()));
         }
     }
-    // Cache miss — compute from all loops within a 14-day window (current +
-    // prior week for FR-9b trend comparison). Uses time-bounded query without
-    // row LIMIT so aggregates are accurate on long-running deployments.
+    // Fleet summary: 14-day window (current + prior week for FR-9b trend).
     let since = Utc::now() - Duration::days(14);
-    let all_loops = state
-        .store
-        .get_loops_for_aggregation(since)
-        .await?;
-    let all_ids: Vec<Uuid> = all_loops.iter().map(|l| l.id).collect();
-    let all_rounds = state.store.get_rounds_for_loops(&all_ids).await?;
+    let (agg_loops, all_loops_for_counts) = tokio::join!(
+        state.store.get_loops_for_aggregation(since),
+        // Counts must reflect ALL current-state loops, not just the 14-day
+        // window. An active loop running for 3 weeks must appear in the
+        // "Active (N)" chip badge. Use include_terminal=true to get every
+        // loop, then count by state.
+        state.store.get_loops_for_engineer(None, true, true),
+    );
+    let agg_loops = agg_loops?;
+    let all_loops_for_counts = all_loops_for_counts?;
+
+    let agg_ids: Vec<Uuid> = agg_loops.iter().map(|l| l.id).collect();
+    let all_rounds = state.store.get_rounds_for_loops(&agg_ids).await?;
     let mut loop_costs: HashMap<Uuid, f64> = HashMap::new();
-    for l in &all_loops {
+    for l in &agg_loops {
         let rounds = all_rounds.get(&l.id).map(|v| v.as_slice()).unwrap_or(&[]);
         let (_, cost, _) = compute_round_metrics(rounds);
         loop_costs.insert(l.id, cost);
     }
-    let fleet = compute_fleet_summary(&all_loops, &loop_costs);
+    let fleet = compute_fleet_summary(&agg_loops, &loop_costs);
     let fleet_json = FleetSummaryJson {
         text: format_fleet_text(&fleet),
         total_loops: fleet.total_loops,
@@ -1169,9 +1174,10 @@ async fn compute_fleet_cached(
         converge_rate: fleet.converge_rate,
         avg_rounds: fleet.avg_rounds,
     };
+    // Counts from ALL loops (unbounded by time window).
     let counts = CountsJson {
-        active: all_loops.iter().filter(|l| !l.state.is_terminal()).count(),
-        converged: all_loops
+        active: all_loops_for_counts.iter().filter(|l| !l.state.is_terminal()).count(),
+        converged: all_loops_for_counts
             .iter()
             .filter(|l| {
                 matches!(
@@ -1180,7 +1186,7 @@ async fn compute_fleet_cached(
                 )
             })
             .count(),
-        failed: all_loops.iter().filter(|l| l.state == LoopState::Failed).count(),
+        failed: all_loops_for_counts.iter().filter(|l| l.state == LoopState::Failed).count(),
     };
     {
         let mut guard = state.fleet_cache.write().await;

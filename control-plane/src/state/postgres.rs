@@ -462,6 +462,20 @@ impl StateStore for PgStateStore {
         rows.iter().map(row_to_loop_record).collect()
     }
 
+    async fn get_active_loops_for_spec(&self, spec_path: &str) -> Result<Vec<LoopRecord>> {
+        let rows = sqlx::query(
+            "SELECT * FROM loops \
+             WHERE spec_path = $1 \
+               AND state NOT IN ('CONVERGED', 'FAILED', 'CANCELLED', 'HARDENED', 'SHIPPED') \
+             ORDER BY created_at DESC",
+        )
+        .bind(spec_path)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(row_to_loop_record).collect()
+    }
+
     async fn get_loops_for_aggregation(
         &self,
         since: DateTime<Utc>,
