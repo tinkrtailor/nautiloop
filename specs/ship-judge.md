@@ -57,7 +57,7 @@ Today neither is wired.
 
 **FR-1c.** Uses the existing `claude-haiku-4-5` model by default. Model name from config `[orchestrator] judge_model`. No sticker price change from the spec's original $0.05/loop ceiling.
 
-**FR-1d.** `DirectAnthropicClient` must follow the same request format as `SidecarJudgeClient`: 30-second HTTP timeout, `Content-Type: application/json`, and `anthropic-version: 2023-06-01` header. No retry on failure — a failed invocation falls through to the heuristic path per NFR-1.
+**FR-1d.** `DirectAnthropicClient` must use the same request body format and timeout as `SidecarJudgeClient`: 30-second HTTP timeout, `Content-Type: application/json`, `anthropic-version: 2023-06-01` header, and `max_tokens=512` in the request body (matching `SidecarJudgeClient`'s existing value). Auth headers differ by design — `DirectAnthropicClient` adds `x-api-key` and targets `api.anthropic.com` instead of a localhost sidecar. No retry on failure — a failed invocation falls through to the heuristic path per NFR-1.
 
 ### FR-2: Wire the driver correctly in main.rs
 
@@ -78,7 +78,7 @@ Today neither is wired.
 
 ### FR-4: Observability of running judge
 
-**FR-4a.** Every judge invocation logs at INFO with: `loop_id`, `round`, `phase`, `trigger`, `decision`, `confidence`, `duration_ms`.
+**FR-4a.** Verify that every judge invocation logs at INFO with: `loop_id`, `round`, `phase`, `trigger`, `decision`, `confidence`, `duration_ms`. The existing `judge.rs` already logs at INFO level — confirm these fields are all present and add any that are missing.
 
 **FR-4b.** `nemo inspect <branch>` output includes the `judge_decisions` array (already planned in #128 FR-6c — verify it's actually rendering).
 
@@ -102,7 +102,7 @@ Spec #128 capped at 10 judge invocations per loop. Verify that cap is enforced (
 
 ### NFR-4: Tests
 
-- **Unit**: `DirectAnthropicClient` constructs with env-var API key; with mounted OAuth bundle; errors cleanly when neither present.
+- **Unit**: `DirectAnthropicClient` constructs with env-var API key; with credentials file at configured path; errors cleanly when neither present.
 - **Unit**: `main.rs` initialization picks the right driver constructor based on env/config/secret availability.
 - **Integration**: loop runs end-to-end with judge enabled on a mock Anthropic endpoint; verify `judge_decisions` rows written.
 
