@@ -1,0 +1,45 @@
+{
+  "round": 5,
+  "source": "review",
+  "issues": [
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/loop_engine/judge.rs",
+      "description": "NFR-4 integration test gap: The spec requires 'Integration: loop runs end-to-end with judge enabled on a mock Anthropic endpoint; verify judge_decisions rows written.' The test `test_judge_writes_decisions_to_store` exercises OrchestratorJudge with a MockJudgeClient (not over HTTP), and the wiremock tests verify DirectAnthropicClient HTTP format separately — but no single test runs the full path: DirectAnthropicClient → OrchestratorJudge → store write. A bug in how OrchestratorJudge constructs the prompt or how it wires DirectAnthropicClient would not be caught.",
+      "suggestion": "Add an integration test that constructs OrchestratorJudge with a DirectAnthropicClient pointed at a wiremock server, invokes it, and asserts judge_decisions rows are written to the store."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/loop_engine/judge.rs",
+      "line": 489,
+      "description": "The call_count is incremented BEFORE the API call (counts attempts). The field logged as `judge_decision_total` therefore includes failed attempts, timeouts, and parse failures — not just successful decisions. The spec FR-4d says 'judge_decision_total = <cumulative count for this loop>' after each invocation, which is technically satisfied, but the name 'decision_total' is misleading when it includes non-decisions. Operators grepping for this to track successful invocation rate will get inflated numbers.",
+      "suggestion": "Either rename to `judge_invocation_total` or `judge_attempt_total` (and update the spec accordingly), or maintain a separate counter that only increments on successful decision persistence. The current naming creates a semantic mismatch that will confuse operators."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "file": "control-plane/src/loop_engine/judge.rs",
+      "line": 184,
+      "description": "SidecarJudgeClient still uses `unwrap_or_else` with a fallback to `reqwest::Client::default()` (no timeout) on builder failure. Round-3 review flagged this for DirectAnthropicClient which was fixed with `.expect()`, but SidecarJudgeClient retains the unsafe pattern. While SidecarJudgeClient isn't the focus of this PR, it's in-scope code that was noted in review feedback — a sidecar client without a timeout could hang indefinitely.",
+      "suggestion": "Apply the same `.expect()` fix to SidecarJudgeClient::new for consistency, or document why the fallback is acceptable for the sidecar case."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "file": "control-plane/src/loop_engine/judge.rs",
+      "line": 570,
+      "description": "The `judge_decision_total` field is emitted on failure paths (timeout, model error, parse failure) but these are WARN-level logs with target 'judge'. The spec says 'Emit an INFO-level tracing::info! event... after each invocation'. The failure-path emissions are WARN, not INFO. Operators grepping for INFO-level `judge_decision_total` will miss failure cases.",
+      "suggestion": "This is acceptable behavior (failures at WARN, successes at INFO) but slightly diverges from the literal spec reading of 'after each invocation'. Consider documenting that operators should grep both INFO and WARN for complete coverage."
+    },
+    {
+      "severity": "low",
+      "category": "style",
+      "file": "control-plane/src/main.rs",
+      "line": 156,
+      "description": "The log message `\"Orchestrator judge: enabled, model={model}\"` duplicates the model value — it appears both as a structured field (`model = %model`) and interpolated in the message string. This creates redundant output in structured log viewers.",
+      "suggestion": "Use either the structured field or message interpolation, not both: e.g., `\"Orchestrator judge: enabled\"` with just the structured `model` field."
+    }
+  ]
+}
