@@ -166,6 +166,18 @@ data:
   id_ed25519: ${base64encode(local.deploy_private_key)}
 YAML
 
+  # Judge credentials (only rendered when judge_api_key provided)
+  judge_creds_yaml = var.judge_api_key != null ? <<-YAML
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nautiloop-judge-creds
+  namespace: nautiloop-system
+data:
+  credentials.json: ${base64encode(jsonencode({ api_key = var.judge_api_key }))}
+YAML
+  : ""
+
   # Registry creds (only rendered when image_pull_secret provided)
   _dockerconfigjson_b64 = var.image_pull_secret_dockerconfigjson != null ? base64encode(var.image_pull_secret_dockerconfigjson) : ""
 
@@ -475,7 +487,7 @@ resource "null_resource" "k8s_judge_creds" {
 
   provisioner "remote-exec" {
     inline = [
-      "kubectl -n nautiloop-system create secret generic nautiloop-judge-creds --from-literal='credentials.json={\"api_key\": \"${var.judge_api_key}\"}' --dry-run=client -o yaml | kubectl apply -f -",
+      "echo '${base64encode(local.judge_creds_yaml)}' | base64 -d | kubectl apply -f -",
     ]
   }
 }

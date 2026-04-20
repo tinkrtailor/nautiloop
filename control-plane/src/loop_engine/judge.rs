@@ -270,13 +270,7 @@ impl DirectAnthropicClient {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    error = %e,
-                    "Failed to build reqwest client with timeout; falling back to default"
-                );
-                reqwest::Client::default()
-            });
+            .expect("Failed to build reqwest client with 30s timeout — TLS backend misconfigured");
         Self { client, api_key }
     }
 }
@@ -344,13 +338,23 @@ struct JudgeCredentialsFile {
 
 /// Resolve judge API key from available credential sources (FR-1b).
 ///
+/// Delegates to `resolve_judge_api_key_with` using the real environment.
+pub fn resolve_judge_api_key(credentials_path: &str) -> Option<String> {
+    resolve_judge_api_key_with(credentials_path, |name| std::env::var(name))
+}
+
+/// Inner resolver that accepts an env-reader function for testability.
+///
 /// Checked in order:
-/// 1. `NAUTILOOP_JUDGE_API_KEY` env var
+/// 1. `NAUTILOOP_JUDGE_API_KEY` env var (via `env_reader`)
 /// 2. Credentials file at `credentials_path` containing `{"api_key": "..."}`
 /// 3. None (judge disabled with warning)
-pub fn resolve_judge_api_key(credentials_path: &str) -> Option<String> {
+pub fn resolve_judge_api_key_with<F>(credentials_path: &str, env_reader: F) -> Option<String>
+where
+    F: Fn(&str) -> std::result::Result<String, std::env::VarError>,
+{
     // Source 1: env var
-    if let Ok(key) = std::env::var("NAUTILOOP_JUDGE_API_KEY")
+    if let Ok(key) = env_reader("NAUTILOOP_JUDGE_API_KEY")
         && !key.is_empty()
     {
         tracing::info!("Judge credentials resolved from NAUTILOOP_JUDGE_API_KEY env var");
@@ -565,8 +569,8 @@ impl OrchestratorJudge {
             );
         }
 
-        // FR-4a: Cumulative decision count for this loop (for operator grep)
-        let judge_decision_total = {
+        // FR-4a: Cumulative attempt count for this loop (for operator grep)
+        let judge_attempt_total = {
             let counts = self.call_counts.lock().await;
             counts.get(&context.loop_id).copied().unwrap_or(0)
         };
@@ -581,7 +585,7 @@ impl OrchestratorJudge {
             decision = %output.decision,
             confidence = ?output.confidence,
             duration_ms,
-            judge_decision_total,
+            judge_attempt_total,
             "Judge decision"
         );
 
@@ -1288,22 +1292,24 @@ mod tests {
     }
 
     // --- resolve_judge_api_key tests ---
+    // Uses resolve_judge_api_key_with() with a closure to avoid unsafe env var
+    // mutation, which is unsound under Rust's default multi-threaded test runner.
+
+    fn no_env(_name: &str) -> std::result::Result<String, std::env::VarError> {
+        Err(std::env::VarError::NotPresent)
+    }
 
     #[test]
     fn test_resolve_judge_api_key_from_env_var() {
-        // Set the env var for this test
-        // SAFETY: test-only, single-threaded access to this env var
-        unsafe { std::env::set_var("NAUTILOOP_JUDGE_API_KEY", "sk-ant-env-key") };
-        let result = resolve_judge_api_key("/nonexistent/path/credentials.json");
+        let result = resolve_judge_api_key_with(
+            "/nonexistent/path/credentials.json",
+            |_| Ok("sk-ant-env-key".to_string()),
+        );
         assert_eq!(result, Some("sk-ant-env-key".to_string()));
-        unsafe { std::env::remove_var("NAUTILOOP_JUDGE_API_KEY") };
     }
 
     #[test]
     fn test_resolve_judge_api_key_from_credentials_file() {
-        // SAFETY: test-only, single-threaded access to this env var
-        unsafe { std::env::remove_var("NAUTILOOP_JUDGE_API_KEY") };
-
         let dir = std::env::temp_dir().join(format!("judge-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let creds_path = dir.join("credentials.json");
@@ -1313,7 +1319,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = resolve_judge_api_key(creds_path.to_str().unwrap());
+        let result = resolve_judge_api_key_with(creds_path.to_str().unwrap(), no_env);
         assert_eq!(result, Some("sk-ant-file-key".to_string()));
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1321,32 +1327,27 @@ mod tests {
 
     #[test]
     fn test_resolve_judge_api_key_none_when_missing() {
-        // SAFETY: test-only, single-threaded access to this env var
-        unsafe { std::env::remove_var("NAUTILOOP_JUDGE_API_KEY") };
-        let result = resolve_judge_api_key("/nonexistent/path/credentials.json");
+        let result = resolve_judge_api_key_with("/nonexistent/path/credentials.json", no_env);
         assert!(result.is_none());
     }
 
     #[test]
     fn test_resolve_judge_api_key_empty_env_var_ignored() {
-        // SAFETY: test-only, single-threaded access to this env var
-        unsafe { std::env::set_var("NAUTILOOP_JUDGE_API_KEY", "") };
-        let result = resolve_judge_api_key("/nonexistent/path/credentials.json");
+        let result = resolve_judge_api_key_with(
+            "/nonexistent/path/credentials.json",
+            |_| Ok(String::new()),
+        );
         assert!(result.is_none());
-        unsafe { std::env::remove_var("NAUTILOOP_JUDGE_API_KEY") };
     }
 
     #[test]
     fn test_resolve_judge_api_key_malformed_file() {
-        // SAFETY: test-only, single-threaded access to this env var
-        unsafe { std::env::remove_var("NAUTILOOP_JUDGE_API_KEY") };
-
         let dir = std::env::temp_dir().join(format!("judge-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let creds_path = dir.join("credentials.json");
         std::fs::write(&creds_path, "not valid json").unwrap();
 
-        let result = resolve_judge_api_key(creds_path.to_str().unwrap());
+        let result = resolve_judge_api_key_with(creds_path.to_str().unwrap(), no_env);
         assert!(result.is_none());
 
         std::fs::remove_dir_all(&dir).ok();
