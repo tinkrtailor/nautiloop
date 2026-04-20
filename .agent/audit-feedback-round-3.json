@@ -1,0 +1,41 @@
+{
+  "round": 3,
+  "source": "audit",
+  "issues": [
+    {
+      "severity": "medium",
+      "category": "consistency",
+      "file": "specs/dashboard-contrast-theme-toggle.md",
+      "description": "FR-3c contradicts FR-1d. FR-1d explicitly states 'No changes to the dark-mode values for --success, --error' but FR-3c says 'If it fails 4.5:1 for the badge text, use #3A9A65 instead' — it is ambiguous whether this means changing the CSS variable (which contradicts FR-1d) or applying a per-element color override on badge text only.",
+      "suggestion": "Clarify in FR-3c that if the badge contrast check fails, the fix should be a per-element CSS override (e.g., `.badge-converged { color: #3A9A65; }`) rather than changing the global `--success` variable. This preserves FR-1d's constraint that dark-mode semantic variables stay aligned with helm."
+    },
+    {
+      "severity": "medium",
+      "category": "completeness",
+      "file": "specs/dashboard-contrast-theme-toggle.md",
+      "description": "FR-2d does not address the `color-scheme: dark light;` declaration in `:root` (line 45 of dashboard.css). When a user forces `data-theme=\"light\"` on a dark-OS system, the CSS custom properties change but `color-scheme` remains `dark light`, which means native browser controls (scrollbars, checkboxes, select elements) may render in the OS-preferred dark style, visually clashing with the forced light palette. The dashboard uses a checkbox (bell toggle) and form buttons that are affected.",
+      "suggestion": "Add to FR-2d: `[data-theme=\"dark\"] { color-scheme: dark; }` and `[data-theme=\"light\"] { color-scheme: light; }` so native browser UI elements match the forced theme. The existing `:root { color-scheme: dark light; }` remains as the system-auto fallback."
+    },
+    {
+      "severity": "medium",
+      "category": "completeness",
+      "file": "specs/dashboard-contrast-theme-toggle.md",
+      "description": "FR-1f uses conditional language ('If it is only applied to large text... If it is applied to normal text...') but the codebase answer is deterministic: all 13 usages of --text-tertiary in dashboard.css are normal-sized text (0.6875rem–0.75rem, none ≥18px or bold ≥14px). The spec leaves the decision to the implementor, but since the outcome is certain, the spec should give a concrete directive to avoid ambiguity about what value to use in light mode.",
+      "suggestion": "Replace the conditional in FR-1f with a concrete directive: '--text-tertiary is used for normal text (12px card IDs, 11px elapsed times, metrics, feed timestamps, etc.) — all below the large-text threshold. Bump light-mode --text-tertiary to #5C5A57 (the current dashboard light --text-secondary value, ~5.0:1 against #FAFAF8). Verify the measured ratio.' This removes implementor guesswork."
+    },
+    {
+      "severity": "low",
+      "category": "completeness",
+      "file": "specs/dashboard-contrast-theme-toggle.md",
+      "description": "FR-2a describes the theme selector as 'three radio-button-like items' with a 'checkmark or filled dot prefix' but does not specify the HTML element type. For NFR-4 (accessibility / WCAG AA), the toggle should use semantic HTML or ARIA attributes — plain styled divs would fail keyboard navigation and screen reader tests.",
+      "suggestion": "Add a note to FR-2a: 'Use either native `<input type=\"radio\">` elements within a `<fieldset>` or styled `<button>` elements with `role=\"radiogroup\"` / `role=\"radio\"` and `aria-checked` attributes to ensure keyboard and screen-reader accessibility.'"
+    },
+    {
+      "severity": "low",
+      "category": "clarity",
+      "file": "specs/dashboard-contrast-theme-toggle.md",
+      "description": "FR-2f says the inline script 'Must ship before any CSS or other JS runs' but the current `<head>` in render.rs has the CSS `<link>` at the end of head. The spec doesn't specify whether the inline script goes before or after the CSS link. Placing it after the CSS link still works (data-theme is set before body renders) but the wording could confuse an implementor into thinking they need to reorder the CSS link.",
+      "suggestion": "Clarify: 'Place the inline `<script>` immediately after `<meta>` tags and before the `<link rel=\"stylesheet\">` tag in `<head>`. This ensures `data-theme` is set on `<html>` before the browser begins applying stylesheet rules.'"
+    }
+  ]
+}
