@@ -2,6 +2,14 @@
 
 Nautiloop ships as a reusable Terraform module that installs on any Linux server with SSH access. You provision the server (Hetzner, AWS, DigitalOcean, bare metal) — the module handles k3s, Postgres, and the control plane.
 
+## What the module installs
+
+- **k3s** — lightweight Kubernetes distribution
+- **Postgres 16** — state store for loops, jobs, and events (Pod + PVC)
+- **Control plane** — a single binary running the API server, loop engine, orchestrator judge, and web dashboard as in-process async tasks. Not separate deployments.
+- **Agent base image** — the container image used for implement, test, and review job pods
+- **Sidecar image** — the auth sidecar that proxies model API calls and git pushes, injecting credentials without exposing them to agent containers
+
 ## Quick start (minimal)
 
 Four required variables. Everything else has sane defaults.
@@ -81,6 +89,7 @@ module "nautiloop" {
 | `k3s_version` | no | `v1.32.13+k3s1` | k3s version (v1.32+ required) |
 | `postgres_password` | no | auto-generated | Postgres password |
 | `postgres_volume_size` | no | `20` | Postgres volume size (Gi) |
+| `cache_volume_size` | no | `50` | Size of the shared `/cache` compiler cache PVC in GiB; used by sccache, ccache, npm, pnpm, yarn, bun, pip, turbo, go, and any tool configured via `[cache.env]` in nemo.toml. Deprecated alias: `cargo_cache_volume_size` (exists for one release cycle, then removed). |
 
 ## Module outputs
 
@@ -138,6 +147,54 @@ Set `domain = null` (the default). The control plane runs on HTTP at `http://IP:
 ### With domain + TLS
 
 Set `domain = "nautiloop.mydomain.com"` and `acme_email = "you@example.com"`. The module installs cert-manager, provisions a Let's Encrypt certificate, and configures Traefik with HTTPS.
+
+### Accessing the dashboard
+
+The control plane serves a web dashboard at `/dashboard`. No separate deployment needed.
+
+- **Default URL:** `https://<server-ip-or-hostname>/dashboard`
+- **Hetzner example:** `https://<tailscale-ipv4>/dashboard` — already bound to tailnet-only by the terraform module.
+- **Log in:** use the API key from the cluster:
+  ```bash
+  kubectl get secret nautiloop-api-key -o jsonpath='{.data.NAUTILOOP_API_KEY}' | base64 -d
+  ```
+  Engineer name is self-declared on login.
+- **Security:** the dashboard is as private as the server. Do NOT expose to the public internet without fronting with oauth2-proxy or similar.
+
+### Pod introspection RBAC
+
+`nemo ps` and the `/pod-introspect/:id` endpoint require `pods/exec` permission on the `nautiloop-jobs` namespace. The terraform module provisions this RBAC by default. Operators installing manifests by hand need to grant `pods/exec` to the control plane's service account in the `nautiloop-jobs` namespace.
+
+### Cache configuration examples
+
+The pluggable cache mounts a shared PVC at `/cache` in implement and revise pods. Configure which tools use it via `[cache.env]` in `nemo.toml`.
+
+**Default (Rust-only, sccache):**
+
+```toml
+[cache.env]
+SCCACHE_DIR = "/cache/sccache"
+RUSTC_WRAPPER = "sccache"
+```
+
+**Polyglot (Rust + TypeScript):**
+
+```toml
+[cache.env]
+SCCACHE_DIR = "/cache/sccache"
+RUSTC_WRAPPER = "sccache"
+npm_config_cache = "/cache/npm"
+PNPM_HOME = "/cache/pnpm"
+```
+
+**Disabled:**
+
+```toml
+[cache]
+disabled = true
+```
+
+See `specs/pluggable-cache.md` for the canonical env var list.
 
 ## Prerequisites
 

@@ -112,6 +112,7 @@
         </div>
       </div>
       <p class="arch-tagline">Your agents keep working when you close your laptop.</p>
+      <p class="arch-tagline">An orchestrator judge (LLM) decides transitions when the reviewer disagrees with itself or churns.</p>
     </div>
   </section>
 
@@ -209,7 +210,22 @@
           <p class="result-value">Code shipped</p>
         </div>
       </div>
-      <p class="verbs-note">Add <code>--harden</code> to <code>start</code> or <code>ship</code> to harden the spec before implementing.</p>
+      <p class="verbs-note">Add <code>--no-harden</code> to skip the harden phase (default: on).</p>
+    </div>
+  </section>
+
+  <!-- Watch from anywhere -->
+  <section id="dashboard">
+    <div class="container">
+      <h2>Watch from anywhere</h2>
+      <p class="text-secondary">The control plane serves a web dashboard at <code>/dashboard</code> — no separate deployment, no extra infra.</p>
+      <!-- TODO: dashboard screenshot -->
+      <ul class="security-list">
+        <li>Mobile-first: cards on phone, tables on desktop</li>
+        <li>Tailscale-native security — the dashboard is as private as the server you run nautiloop on</li>
+        <li>At-a-glance: cost, convergence rate, engineer breakdown, recent terminal events</li>
+        <li>One-tap actions: approve, cancel, extend from the phone</li>
+      </ul>
     </div>
   </section>
 
@@ -258,6 +274,7 @@
         <li>Shared API key auth (V1) — designed for single-tenant / small-team deployments</li>
         <li>Egress logging on all outbound traffic from agent pods</li>
         <li>Tailscale recommended for private API access</li>
+        <li>Dashboard auth = same API key as the CLI. HttpOnly cookies. Behind Tailscale by default. See <a href="https://github.com/tinkrtailor/nautiloop/blob/main/docs/dashboard-setup.md">docs/dashboard-setup.md</a>.</li>
       </ul>
     </div>
   </section>
@@ -266,46 +283,35 @@
   <section class="built-section" id="built">
     <div class="container">
       <h2>Built with Nautiloop</h2>
-      <p class="built-lead">Nautiloop was built through the exact process it automates. Three parallel implementation lanes, each hardened by cross-model adversarial review.</p>
+      <p class="built-lead">Nautiloop was built through the exact process it automates — and v0.6.0 was shipped by nautiloop itself.</p>
 
       <table class="stats-table">
         <thead>
           <tr>
-            <th>Lane</th>
-            <th>Rounds</th>
-            <th>Findings</th>
+            <th>Phase</th>
+            <th>What</th>
+            <th>Output</th>
+            <th>Notes</th>
           </tr>
         </thead>
         <tbody>
           <tr>
-            <td>Core loop engine</td>
-            <td>28</td>
-            <td>124</td>
+            <td>Original build</td>
+            <td>Core loop + infrastructure</td>
+            <td>3 PRs across 3 lanes, 81 rounds, 331 findings</td>
+            <td>Hardened + implemented across three parallel lanes</td>
           </tr>
           <tr>
-            <td>Infrastructure</td>
-            <td>25</td>
-            <td>88</td>
-          </tr>
-          <tr>
-            <td>Agent runtime</td>
-            <td>21</td>
-            <td>107</td>
-          </tr>
-          <tr>
-            <td>Integration</td>
-            <td>7</td>
-            <td>12</td>
-          </tr>
-          <tr>
-            <td><strong>Total</strong></td>
-            <td class="amber">81</td>
-            <td class="amber">331</td>
+            <td>v0.6.0 (self-hosted dogfood)</td>
+            <td>Judge, dashboard, helm phase 2, pluggable cache, CLI polish, mobile UX</td>
+            <td>12+ machine-produced convergent PRs in one session</td>
+            <td>Nautiloop implementing its own features against its own codebase</td>
           </tr>
         </tbody>
       </table>
 
       <p class="built-callout"><span class="amber">331</span> production bugs caught by cross-model review before first deploy.</p>
+      <p class="built-callout">v0.6.0: nautiloop shipped <span class="amber">12+</span> of its own feature PRs in a single day of dogfooding.</p>
     </div>
   </section>
 
@@ -333,6 +339,10 @@
         <li><a href="https://github.com/tinkrtailor/nautiloop/blob/main/docs/deploy.md">Docs</a></li>
         <li><span class="footer-sep">·</span></li>
         <li><a href="https://github.com/tinkrtailor/nautiloop/blob/main/LICENSE">Apache 2.0</a></li>
+        <li><span class="footer-sep">·</span></li>
+        <li><a href="https://github.com/tinkrtailor/nautiloop/blob/main/docs/local-dev-quickstart.md">Local Dev</a></li>
+        <li><span class="footer-sep">·</span></li>
+        <li><a href="https://github.com/tinkrtailor/nautiloop/blob/main/docs/dashboard-setup.md">Dashboard Setup</a></li>
       </ul>
     </div>
   </footer>
