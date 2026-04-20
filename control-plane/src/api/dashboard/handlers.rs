@@ -6,6 +6,7 @@ use chrono::{Duration, Utc};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use super::auth::CsrfToken;
 use super::render;
 use crate::api::AppState;
 use crate::error::NautiloopError;
@@ -13,17 +14,44 @@ use crate::types::LoopState;
 
 // Stats cache moved to AppState to avoid global state and cross-test contamination.
 
-/// GET /dashboard/login — render login form.
-pub async fn login_page(Query(params): Query<HashMap<String, String>>) -> impl IntoResponse {
-    let error = params.get("error").map(|s| s.as_str());
-    Html(render::render_login(error).into_string())
+/// Extract the CSRF token string from the optional extension (set by auth middleware).
+fn csrf_from(ext: Option<axum::Extension<CsrfToken>>) -> String {
+    ext.map(|e| e.0 .0.clone()).unwrap_or_default()
 }
 
-/// POST /dashboard/login — validate API key, set cookie, redirect.
+
+/// GET /dashboard/login — render login form with CSRF token.
+pub async fn login_page(Query(params): Query<HashMap<String, String>>) -> Response {
+    let error = params.get("error").map(|s| s.as_str());
+    let csrf_token = super::auth::generate_csrf_token();
+    let html = render::render_login(error, &csrf_token).into_string();
+
+    let csrf_cookie = format!(
+        "nautiloop_csrf={}; HttpOnly; SameSite=Strict; Path=/dashboard/login; Max-Age=600",
+        csrf_token
+    );
+    let mut response = Html(html).into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        csrf_cookie.parse().unwrap(),
+    );
+    response
+}
+
+/// POST /dashboard/login — validate CSRF token + API key, set cookie, redirect.
 pub async fn login_submit(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     axum::extract::Form(form): axum::extract::Form<HashMap<String, String>>,
 ) -> Response {
+    // Validate CSRF token (double-submit cookie pattern)
+    let csrf_form = form.get("csrf_token").map(|s| s.as_str()).unwrap_or("");
+    let csrf_cookie = super::auth::extract_cookie_value(&headers, "nautiloop_csrf")
+        .unwrap_or("");
+    if !super::auth::validate_csrf_token(csrf_form, csrf_cookie) {
+        return Redirect::to("/dashboard/login?error=Invalid+request,+please+try+again").into_response();
+    }
+
     let api_key = form.get("api_key").map(|s| s.as_str()).unwrap_or("");
 
     let expected = state.api_key.as_deref().unwrap_or("");
@@ -56,8 +84,20 @@ pub async fn login_submit(
     response
 }
 
-/// POST /dashboard/logout — clear cookie and redirect to login.
-pub async fn logout(State(state): State<AppState>) -> Response {
+/// POST /dashboard/logout — validate CSRF, clear cookie and redirect to login.
+pub async fn logout(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Form(form): axum::extract::Form<HashMap<String, String>>,
+) -> Response {
+    // Validate CSRF token (double-submit cookie pattern)
+    let csrf_form = form.get("csrf_token").map(|s| s.as_str()).unwrap_or("");
+    let csrf_cookie = super::auth::extract_cookie_value(&headers, "nautiloop_csrf")
+        .unwrap_or("");
+    if !super::auth::validate_csrf_token(csrf_form, csrf_cookie) {
+        return Redirect::to("/dashboard/login?error=Invalid+request,+please+try+again").into_response();
+    }
+
     let is_loopback = state.config.cluster.bind_addr == "127.0.0.1"
         || state.config.cluster.bind_addr == "localhost"
         || state.config.cluster.bind_addr == "::1";
@@ -66,11 +106,15 @@ pub async fn logout(State(state): State<AppState>) -> Response {
         "nautiloop_api_key=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
         secure_flag
     );
+    let csrf_clear = "nautiloop_csrf=; HttpOnly; SameSite=Strict; Path=/dashboard; Max-Age=0";
     let mut response = Redirect::to("/dashboard/login").into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
         cookie.parse().unwrap(),
     );
+    if let Ok(val) = csrf_clear.parse() {
+        response.headers_mut().append(header::SET_COOKIE, val);
+    }
     response
 }
 
@@ -89,7 +133,9 @@ pub struct GridQuery {
 pub async fn grid_page(
     State(state): State<AppState>,
     Query(query): Query<GridQuery>,
+    csrf_ext: Option<axum::Extension<CsrfToken>>,
 ) -> Result<Html<String>, NautiloopError> {
+    let csrf_token = csrf_from(csrf_ext);
     let show_team = query.team.unwrap_or(false);
     let loops = state
         .store
@@ -161,29 +207,34 @@ pub async fn grid_page(
         .collect();
 
     // Fleet summary (FR-9) — always uses ALL loops regardless of current view filter.
-    // FR-9a: "Aggregates all non-terminal + terminal loops in the rolling 7-day window."
-    let all_loops_for_fleet = state
-        .store
-        .get_loops_for_engineer(None, true, true)
-        .await?;
-    // Compute costs for fleet loops (reuse already-computed costs where possible)
-    let mut fleet_costs: HashMap<Uuid, f64> = loop_costs.clone();
-    let fleet_loop_ids_needed: Vec<Uuid> = all_loops_for_fleet
-        .iter()
-        .filter(|l| !fleet_costs.contains_key(&l.id))
-        .map(|l| l.id)
-        .collect();
-    if !fleet_loop_ids_needed.is_empty() {
-        let extra_rounds = state.store.get_rounds_for_loops(&fleet_loop_ids_needed).await?;
-        for l in &all_loops_for_fleet {
-            fleet_costs.entry(l.id).or_insert_with(|| {
-                let rounds = extra_rounds.get(&l.id).map(|v| v.as_slice()).unwrap_or(&[]);
-                let (_, cost, _) = compute_round_metrics(rounds);
-                cost
-            });
+    // When show_team=true and no engineer filter, the initial query already fetched
+    // all loops — reuse them instead of issuing a second DB query.
+    let has_all_loops = show_team && query.engineer.is_none();
+    let fleet = if has_all_loops {
+        compute_fleet_summary(&loops, &loop_costs)
+    } else {
+        let all_loops_for_fleet = state
+            .store
+            .get_loops_for_engineer(None, true, true)
+            .await?;
+        let mut fleet_costs: HashMap<Uuid, f64> = loop_costs.clone();
+        let fleet_loop_ids_needed: Vec<Uuid> = all_loops_for_fleet
+            .iter()
+            .filter(|l| !fleet_costs.contains_key(&l.id))
+            .map(|l| l.id)
+            .collect();
+        if !fleet_loop_ids_needed.is_empty() {
+            let extra_rounds = state.store.get_rounds_for_loops(&fleet_loop_ids_needed).await?;
+            for l in &all_loops_for_fleet {
+                fleet_costs.entry(l.id).or_insert_with(|| {
+                    let rounds = extra_rounds.get(&l.id).map(|v| v.as_slice()).unwrap_or(&[]);
+                    let (_, cost, _) = compute_round_metrics(rounds);
+                    cost
+                });
+            }
         }
-    }
-    let fleet = compute_fleet_summary(&all_loops_for_fleet, &fleet_costs);
+        compute_fleet_summary(&all_loops_for_fleet, &fleet_costs)
+    };
 
     let engineer_filter = if show_team {
         "team".to_string()
@@ -202,6 +253,7 @@ pub async fn grid_page(
             &engineer_filter,
             show_team,
             &counts,
+            &csrf_token,
         )
         .into_string(),
     ))
@@ -211,7 +263,9 @@ pub async fn grid_page(
 pub async fn detail_page(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    csrf_ext: Option<axum::Extension<CsrfToken>>,
 ) -> Result<Html<String>, NautiloopError> {
+    let csrf_token = csrf_from(csrf_ext);
     let record = state
         .store
         .get_loop(id)
@@ -297,7 +351,7 @@ pub async fn detail_page(
         token_breakdown,
     };
 
-    Ok(Html(render::render_detail(&detail_data).into_string()))
+    Ok(Html(render::render_detail(&detail_data, &csrf_token).into_string()))
 }
 
 /// GET /dashboard/stream/:id — SSE log stream (re-expose under dashboard namespace).
@@ -456,28 +510,35 @@ pub async fn dashboard_state(
         });
     }
 
-    // Fleet summary uses ALL loops regardless of current view filter (FR-9a)
-    let all_loops_for_fleet = state
-        .store
-        .get_loops_for_engineer(None, true, true)
-        .await?;
-    let mut fleet_costs: HashMap<Uuid, f64> = loop_costs.clone();
-    let fleet_ids_needed: Vec<Uuid> = all_loops_for_fleet
-        .iter()
-        .filter(|l| !fleet_costs.contains_key(&l.id))
-        .map(|l| l.id)
-        .collect();
-    if !fleet_ids_needed.is_empty() {
-        let extra = state.store.get_rounds_for_loops(&fleet_ids_needed).await?;
-        for l in &all_loops_for_fleet {
-            fleet_costs.entry(l.id).or_insert_with(|| {
-                let rounds = extra.get(&l.id).map(|v| v.as_slice()).unwrap_or(&[]);
-                let (_, cost, _) = compute_round_metrics(rounds);
-                cost
-            });
+    // Fleet summary uses ALL loops regardless of current view filter (FR-9a).
+    // When show_team=true and no engineer filter, the initial query already fetched
+    // all loops — reuse them instead of issuing a second DB query.
+    let has_all_loops = show_team && query.engineer.is_none();
+    let fleet = if has_all_loops {
+        compute_fleet_summary(&loops, &loop_costs)
+    } else {
+        let all_loops_for_fleet = state
+            .store
+            .get_loops_for_engineer(None, true, true)
+            .await?;
+        let mut fleet_costs: HashMap<Uuid, f64> = loop_costs.clone();
+        let fleet_ids_needed: Vec<Uuid> = all_loops_for_fleet
+            .iter()
+            .filter(|l| !fleet_costs.contains_key(&l.id))
+            .map(|l| l.id)
+            .collect();
+        if !fleet_ids_needed.is_empty() {
+            let extra = state.store.get_rounds_for_loops(&fleet_ids_needed).await?;
+            for l in &all_loops_for_fleet {
+                fleet_costs.entry(l.id).or_insert_with(|| {
+                    let rounds = extra.get(&l.id).map(|v| v.as_slice()).unwrap_or(&[]);
+                    let (_, cost, _) = compute_round_metrics(rounds);
+                    cost
+                });
+            }
         }
-    }
-    let fleet = compute_fleet_summary(&all_loops_for_fleet, &fleet_costs);
+        compute_fleet_summary(&all_loops_for_fleet, &fleet_costs)
+    };
     let fleet_json = FleetSummaryJson {
         text: format_fleet_text(&fleet),
         total_loops: fleet.total_loops,
@@ -521,7 +582,9 @@ pub struct FeedQuery {
 pub async fn feed_page(
     State(state): State<AppState>,
     Query(query): Query<FeedQuery>,
+    csrf_ext: Option<axum::Extension<CsrfToken>>,
 ) -> Result<Html<String>, NautiloopError> {
+    let csrf_token = csrf_from(csrf_ext);
     let filter = query.filter.as_deref().unwrap_or("all");
     let engineer_filter = query.engineer.as_deref();
     let (items, engineers) = fetch_feed_items_with_engineers(&state, filter, engineer_filter, query.cursor.as_deref(), 50).await?;
@@ -533,7 +596,7 @@ pub async fn feed_page(
     };
 
     Ok(Html(
-        render::render_feed(&items, next_cursor.as_deref(), filter, &engineers, engineer_filter).into_string(),
+        render::render_feed(&items, next_cursor.as_deref(), filter, &engineers, engineer_filter, &csrf_token).into_string(),
     ))
 }
 
@@ -588,8 +651,9 @@ pub struct FeedJsonItem {
     pub updated_at: chrono::DateTime<Utc>,
 }
 
-/// Fetch feed items and the set of unique engineers (from all terminal loops).
-/// Returns both in one pass over the data, avoiding a second full query.
+/// Fetch feed items and the set of unique engineers (from terminal loops only).
+/// Filters to terminal loops immediately after the DB query to avoid processing
+/// non-terminal data unnecessarily.
 async fn fetch_feed_items_with_engineers(
     state: &AppState,
     filter: &str,
@@ -597,16 +661,18 @@ async fn fetch_feed_items_with_engineers(
     cursor: Option<&str>,
     limit: usize,
 ) -> Result<(Vec<render::FeedItem>, Vec<String>), NautiloopError> {
-    // Get all terminal loops (single query)
-    let loops = state
+    // Fetch all loops and immediately filter to terminal-only
+    let all_terminal: Vec<_> = state
         .store
         .get_loops_for_engineer(None, true, true)
-        .await?;
-
-    // Extract unique engineers from ALL terminal loops (for filter chips)
-    let engineers: Vec<String> = loops
-        .iter()
+        .await?
+        .into_iter()
         .filter(|l| l.state.is_terminal())
+        .collect();
+
+    // Extract unique engineers from terminal loops (for filter chips)
+    let engineers: Vec<String> = all_terminal
+        .iter()
         .map(|l| l.engineer.clone())
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
@@ -616,12 +682,10 @@ async fn fetch_feed_items_with_engineers(
         .and_then(|c| chrono::DateTime::parse_from_rfc3339(c).ok())
         .map(|dt| dt.with_timezone(&Utc));
 
-    let mut terminal_loops: Vec<_> = loops
+    // Apply per-engineer, state, and cursor filters
+    let mut terminal_loops: Vec<_> = all_terminal
         .into_iter()
         .filter(|l| {
-            if !l.state.is_terminal() {
-                return false;
-            }
             // Per-engineer filter (FR-12b)
             if let Some(eng) = engineer
                 && l.engineer != eng
@@ -670,7 +734,9 @@ async fn fetch_feed_items_with_engineers(
 pub async fn specs_page(
     State(state): State<AppState>,
     Path(spec_path): Path<String>,
+    csrf_ext: Option<axum::Extension<CsrfToken>>,
 ) -> Result<Html<String>, NautiloopError> {
+    let csrf_token = csrf_from(csrf_ext);
     let loops = state
         .store
         .get_loops_for_engineer(None, true, true)
@@ -732,7 +798,7 @@ pub async fn specs_page(
     };
 
     Ok(Html(
-        render::render_spec_history(&spec_path, &items, &aggregate).into_string(),
+        render::render_spec_history(&spec_path, &items, &aggregate, &csrf_token).into_string(),
     ))
 }
 
@@ -750,9 +816,11 @@ fn default_window() -> String {
 pub async fn stats_page(
     State(state): State<AppState>,
     Query(query): Query<StatsQuery>,
+    csrf_ext: Option<axum::Extension<CsrfToken>>,
 ) -> Result<Html<String>, NautiloopError> {
+    let csrf_token = csrf_from(csrf_ext);
     let stats = compute_stats_cached(&state, &query.window).await?;
-    Ok(Html(render::render_stats(&stats).into_string()))
+    Ok(Html(render::render_stats(&stats, &csrf_token).into_string()))
 }
 
 /// GET /dashboard/stats/json — for API consumers (FR-14b).
@@ -1117,7 +1185,7 @@ fn format_fleet_text(fleet: &render::FleetSummary) -> String {
     if let Some(avg) = fleet.avg_rounds {
         let base = format!("avg {:.1}", avg);
         if let Some(delta) = fleet.avg_rounds_trend {
-            let arrow = if delta < 0.0 { "\u{2191}" } else { "\u{2193}" }; // fewer rounds = better
+            let arrow = if delta > 0.0 { "\u{2191}" } else { "\u{2193}" }; // consistent: ↑=increased, ↓=decreased
             parts.push(format!("{} {}{:.1} rounds", base, arrow, delta.abs()));
         } else {
             parts.push(format!("{} rounds", base));
@@ -1447,16 +1515,38 @@ mod tests {
 
     #[tokio::test]
     async fn test_login_submit_valid_key() {
-        let app = crate::api::dashboard::build_dashboard_router_with_key(Some("test-api-key".to_string()))
-            .with_state(test_state());
+        use tower::ServiceExt;
+        let state = test_state();
 
-        let response = app
+        // Step 1: GET the login page to obtain CSRF token cookie
+        let app1 = crate::api::dashboard::build_dashboard_router_with_key(Some("test-api-key".to_string()))
+            .with_state(state.clone());
+        let get_response = app1
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let csrf_cookie_hdr = get_response.headers().get("set-cookie").unwrap().to_str().unwrap();
+        let csrf_token = csrf_cookie_hdr
+            .split(';').next().unwrap()
+            .strip_prefix("nautiloop_csrf=").unwrap();
+
+        // Step 2: POST with CSRF token + API key
+        let app2 = crate::api::dashboard::build_dashboard_router_with_key(Some("test-api-key".to_string()))
+            .with_state(state);
+        let body = format!("api_key=test-api-key&csrf_token={}", csrf_token);
+        let response = app2
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/dashboard/login")
                     .header("content-type", "application/x-www-form-urlencoded")
-                    .body(Body::from("api_key=test-api-key"))
+                    .header("cookie", format!("nautiloop_csrf={}", csrf_token))
+                    .body(Body::from(body))
                     .unwrap(),
             )
             .await
@@ -1466,10 +1556,13 @@ mod tests {
         let location = response.headers().get("location").unwrap().to_str().unwrap();
         assert_eq!(location, "/dashboard");
         // Should set cookie
-        let cookie = response.headers().get("set-cookie").unwrap().to_str().unwrap();
-        assert!(cookie.contains("nautiloop_api_key=test-api-key"));
-        assert!(cookie.contains("HttpOnly"));
-        assert!(cookie.contains("SameSite=Strict"));
+        let cookies: Vec<_> = response.headers().get_all("set-cookie")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        let api_cookie = cookies.iter().find(|c| c.contains("nautiloop_api_key=test-api-key")).unwrap();
+        assert!(api_cookie.contains("HttpOnly"));
+        assert!(api_cookie.contains("SameSite=Strict"));
     }
 
     #[tokio::test]
@@ -1645,24 +1738,31 @@ mod tests {
 
     #[tokio::test]
     async fn test_logout_clears_cookie() {
+        let csrf_token = "test-csrf-token-12345678";
         let app = crate::api::dashboard::build_dashboard_router_with_key(Some("test-api-key".to_string()))
             .with_state(test_state());
 
+        let body = format!("csrf_token={}", csrf_token);
         let response = app
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/dashboard/logout")
-                    .header("cookie", "nautiloop_api_key=test-api-key")
-                    .body(Body::empty())
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("cookie", format!("nautiloop_api_key=test-api-key; nautiloop_csrf={}", csrf_token))
+                    .body(Body::from(body))
                     .unwrap(),
             )
             .await
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        let cookie = response.headers().get("set-cookie").unwrap().to_str().unwrap();
-        assert!(cookie.contains("Max-Age=0"));
+        let cookies: Vec<_> = response.headers().get_all("set-cookie")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        let api_cookie = cookies.iter().find(|c| c.contains("nautiloop_api_key=")).unwrap();
+        assert!(api_cookie.contains("Max-Age=0"));
     }
 
     #[tokio::test]

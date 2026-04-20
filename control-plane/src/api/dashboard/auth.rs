@@ -2,8 +2,6 @@ use axum::extract::Request;
 use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
-use std::hash::{Hash, Hasher};
-use std::collections::hash_map::DefaultHasher;
 
 /// Extension type carrying the API key for dashboard auth.
 /// Injected as a tower Extension layer so the middleware can access it
@@ -11,13 +9,19 @@ use std::collections::hash_map::DefaultHasher;
 #[derive(Clone)]
 pub struct DashboardApiKey(pub String);
 
+/// Extension type carrying the CSRF token for the current request.
+/// Set by the auth middleware on authenticated HTML requests; handlers
+/// extract it and pass it to render functions for form embedding.
+#[derive(Clone)]
+pub struct CsrfToken(pub String);
+
 /// Dashboard auth middleware: checks for `nautiloop_api_key` cookie OR Bearer header.
 /// Unauthenticated requests to `/dashboard/*` (except `/dashboard/login` and
 /// `/dashboard/static/*`) are redirected to `/dashboard/login`.
 ///
 /// Reads the expected API key from `AppState.api_key` via request extensions.
 pub async fn dashboard_auth_middleware(
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
     let path = request.uri().path().to_string();
@@ -54,7 +58,17 @@ pub async fn dashboard_auth_middleware(
         .is_some_and(|key| constant_time_eq(key.as_bytes(), expected_key.as_bytes()));
 
     if bearer_valid {
-        return Ok(next.run(request).await);
+        let csrf_token = generate_csrf_token();
+        request.extensions_mut().insert(CsrfToken(csrf_token.clone()));
+        let mut response = next.run(request).await;
+        let csrf_cookie = format!(
+            "nautiloop_csrf={}; HttpOnly; SameSite=Strict; Path=/dashboard; Max-Age=604800",
+            csrf_token
+        );
+        if let Ok(val) = csrf_cookie.parse() {
+            response.headers_mut().append(header::SET_COOKIE, val);
+        }
+        return Ok(response);
     }
 
     // Check cookie
@@ -62,7 +76,17 @@ pub async fn dashboard_auth_middleware(
         .is_some_and(|key| constant_time_eq(key.as_bytes(), expected_key.as_bytes()));
 
     if cookie_valid {
-        return Ok(next.run(request).await);
+        let csrf_token = generate_csrf_token();
+        request.extensions_mut().insert(CsrfToken(csrf_token.clone()));
+        let mut response = next.run(request).await;
+        let csrf_cookie = format!(
+            "nautiloop_csrf={}; HttpOnly; SameSite=Strict; Path=/dashboard; Max-Age=604800",
+            csrf_token
+        );
+        if let Ok(val) = csrf_cookie.parse() {
+            response.headers_mut().append(header::SET_COOKIE, val);
+        }
+        return Ok(response);
     }
 
     // Redirect to login for HTML requests, 401 for API/JSON requests
@@ -98,6 +122,20 @@ pub fn extract_cookie_value<'a>(
         })
 }
 
+/// Generate a CSRF token using a random UUID (hex-encoded).
+pub fn generate_csrf_token() -> String {
+    uuid::Uuid::new_v4().to_string().replace('-', "")
+}
+
+/// Validate a CSRF token from the form matches the one in the cookie.
+/// Uses constant-time comparison.
+pub fn validate_csrf_token(form_token: &str, cookie_token: &str) -> bool {
+    if form_token.is_empty() || cookie_token.is_empty() {
+        return false;
+    }
+    constant_time_eq(form_token.as_bytes(), cookie_token.as_bytes())
+}
+
 /// Validate an API key against the expected key. Accepts the expected key directly
 /// rather than reading from the environment.
 pub fn validate_api_key_against(key: &str, expected: &str) -> bool {
@@ -108,27 +146,15 @@ pub fn validate_api_key_against(key: &str, expected: &str) -> bool {
 }
 
 /// Constant-time byte comparison to prevent timing side-channel attacks.
-/// Both values are hashed to a fixed-length digest before comparison,
-/// preventing length leakage via early return on length mismatch.
+/// Uses direct byte XOR accumulation, consistent with the main API auth.
+/// Length mismatch returns false — the minor timing leak on length is
+/// negligible given the deployment model (Tailscale + shared key of known length).
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    // Hash both values to a fixed 8-byte output so the comparison
-    // is always over equal-length data — no early return on length difference.
-    let hash_a = {
-        let mut h = DefaultHasher::new();
-        a.hash(&mut h);
-        h.finish()
-    };
-    let hash_b = {
-        let mut h = DefaultHasher::new();
-        b.hash(&mut h);
-        h.finish()
-    };
-
-    let a_bytes = hash_a.to_le_bytes();
-    let b_bytes = hash_b.to_le_bytes();
-
+    if a.len() != b.len() {
+        return false;
+    }
     let mut diff = 0u8;
-    for (x, y) in a_bytes.iter().zip(b_bytes.iter()) {
+    for (x, y) in a.iter().zip(b.iter()) {
         diff |= x ^ y;
     }
     diff == 0
@@ -165,8 +191,24 @@ mod tests {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));
-        // Different lengths still compared safely (no early return on length)
         assert!(!constant_time_eq(b"short", b"longer-string"));
+    }
+
+    #[test]
+    fn test_generate_csrf_token() {
+        let token1 = generate_csrf_token();
+        let token2 = generate_csrf_token();
+        assert_eq!(token1.len(), 32); // UUID without dashes
+        assert_ne!(token1, token2); // Each token is unique
+        assert!(token1.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_validate_csrf_token() {
+        assert!(validate_csrf_token("abc123", "abc123"));
+        assert!(!validate_csrf_token("abc123", "wrong"));
+        assert!(!validate_csrf_token("", "abc123"));
+        assert!(!validate_csrf_token("abc123", ""));
     }
 
     #[test]

@@ -130,14 +130,30 @@
       }
     }
 
-    // Update or insert cards
+    // Update existing cards; show banner for new loops
+    let hasNewLoops = false;
     for (const loop of data.loops) {
       const existing = grid.querySelector('[data-loop-id="' + loop.loop_id + '"]');
       if (existing) {
         updateCardFields(existing, loop);
+      } else if (existingIds.size > 0) {
+        hasNewLoops = true;
       }
-      // Don't insert new cards via JS to avoid complex HTML duplication;
-      // the next full page load will pick them up.
+    }
+
+    // Show a non-intrusive banner when new loops appear
+    const existingBanner = document.getElementById("new-loops-banner");
+    if (hasNewLoops && !existingBanner) {
+      const banner = document.createElement("div");
+      banner.id = "new-loops-banner";
+      banner.className = "new-loops-banner";
+      banner.textContent = "New loops available \u2014 tap to refresh";
+      banner.addEventListener("click", function () {
+        window.location.reload();
+      });
+      grid.parentNode.insertBefore(banner, grid);
+    } else if (!hasNewLoops && existingBanner) {
+      existingBanner.remove();
     }
   }
 

@@ -5,7 +5,7 @@ use crate::types::{JudgeDecisionRecord, LoopRecord, LoopState};
 
 /// Render the base layout shell.
 /// CSS and JS are loaded via external links (cached by browser) rather than inlined.
-fn layout(title: &str, nav_active: &str, show_team: bool, content: Markup) -> Markup {
+fn layout(title: &str, nav_active: &str, show_team: bool, csrf_token: &str, content: Markup) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -16,7 +16,7 @@ fn layout(title: &str, nav_active: &str, show_team: bool, content: Markup) -> Ma
                 link rel="stylesheet" href="/dashboard/static/dashboard.css";
             }
             body {
-                (render_header(nav_active, show_team))
+                (render_header(nav_active, show_team, csrf_token))
                 main { (content) }
                 div #status-bar class="status-bar" {}
                 script src="/dashboard/static/dashboard.js" defer {}
@@ -25,7 +25,7 @@ fn layout(title: &str, nav_active: &str, show_team: bool, content: Markup) -> Ma
     }
 }
 
-fn render_header(active: &str, show_team: bool) -> Markup {
+fn render_header(active: &str, show_team: bool, csrf_token: &str) -> Markup {
     html! {
         header class="header" {
             a href="/dashboard" class="header-brand" { "NAUTILOOP" }
@@ -39,12 +39,14 @@ fn render_header(active: &str, show_team: bool) -> Markup {
                         div #menu-dropdown class="menu-dropdown hidden" {
                             button #cancel-all-btn data-action="cancel-all" class="danger" { "Cancel all active loops" }
                             form action="/dashboard/logout" method="post" {
+                                input type="hidden" name="csrf_token" value=(csrf_token);
                                 button type="submit" { "Logout" }
                             }
                         }
                     }
                 } @else {
                     form action="/dashboard/logout" method="post" style="display:inline" {
+                        input type="hidden" name="csrf_token" value=(csrf_token);
                         button type="submit" class="menu-btn" style="font-size:0.75rem" { "Logout" }
                     }
                 }
@@ -120,7 +122,7 @@ fn short_id(id: &uuid::Uuid) -> String {
 
 // ── Login Page ──
 
-pub fn render_login(error: Option<&str>) -> Markup {
+pub fn render_login(error: Option<&str>, csrf_token: &str) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -138,6 +140,7 @@ pub fn render_login(error: Option<&str>) -> Markup {
                             p class="login-error" { (err) }
                         }
                         form method="post" action="/dashboard/login" {
+                            input type="hidden" name="csrf_token" value=(csrf_token);
                             input class="login-input" type="password" name="api_key"
                                   placeholder="API key" autocomplete="current-password" required;
                             button class="login-submit" type="submit" { "Sign in" }
@@ -171,6 +174,7 @@ pub struct FleetSummary {
     pub cost_trend: Option<f64>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn render_grid(
     cards: &[CardData],
     fleet: &FleetSummary,
@@ -179,8 +183,9 @@ pub fn render_grid(
     active_engineer_filter: &str,
     show_team: bool,
     counts: &StateCounts,
+    csrf_token: &str,
 ) -> Markup {
-    layout("nautiloop", "grid", show_team, html! {
+    layout("nautiloop", "grid", show_team, csrf_token, html! {
         // Fleet summary (FR-9) with per-field links (FR-9c) and trends (FR-9b)
         div #fleet-summary class="fleet-summary" {
             span class="fleet-field" { "This week" }
@@ -224,9 +229,10 @@ pub fn render_grid(
                 a href="/dashboard/stats?focus=rounds" class="fleet-field" {
                     "avg " (format!("{:.1}", avg))
                     @if let Some(delta) = fleet.avg_rounds_trend {
-                        // Fewer rounds = favorable (trend-up green), more = unfavorable
+                        // Consistent arrow semantics: ↑ = increased, ↓ = decreased.
+                        // Color indicates favorability: fewer rounds (↓) = green, more (↑) = red.
                         span class=(if delta <= 0.0 { "trend trend-up" } else { "trend trend-down" }) {
-                            @if delta < 0.0 {
+                            @if delta > 0.0 {
                                 " \u{2191}" (format!("{:.1}", delta.abs()))
                             } @else {
                                 " \u{2193}" (format!("{:.1}", delta.abs()))
@@ -404,11 +410,11 @@ pub struct TokenBreakdownRow {
     pub fraction: f64,
 }
 
-pub fn render_detail(data: &DetailData) -> Markup {
+pub fn render_detail(data: &DetailData, csrf_token: &str) -> Markup {
     let r = &data.record;
     let is_terminal = r.state.is_terminal();
 
-    layout(&format!("{} — nautiloop", spec_filename(&r.spec_path)), "grid", false, html! {
+    layout(&format!("{} — nautiloop", spec_filename(&r.spec_path)), "grid", false, csrf_token, html! {
         div class="detail" {
             a href="/dashboard" class="back-link" { "\u{2190} Back to loops" }
 
@@ -649,8 +655,9 @@ pub fn render_feed(
     filter: &str,
     engineers: &[String],
     active_engineer: Option<&str>,
+    csrf_token: &str,
 ) -> Markup {
-    layout("Feed — nautiloop", "feed", false, html! {
+    layout("Feed — nautiloop", "feed", false, csrf_token, html! {
         div style="padding: var(--sp-md);" {
             h2 style="font-size: 1.125rem; font-family: var(--font-display); font-weight: 700; margin-bottom: var(--sp-md);" {
                 "Notification Feed"
@@ -727,8 +734,9 @@ pub fn render_spec_history(
     spec_path: &str,
     items: &[SpecHistoryItem],
     aggregate: &SpecAggregate,
+    csrf_token: &str,
 ) -> Markup {
-    layout(&format!("{} — nautiloop", spec_filename(spec_path)), "grid", false, html! {
+    layout(&format!("{} — nautiloop", spec_filename(spec_path)), "grid", false, csrf_token, html! {
         div class="detail" {
             a href="/dashboard" class="back-link" { "\u{2190} Back to loops" }
 
@@ -814,10 +822,10 @@ pub struct DayStats {
     pub failed: usize,
 }
 
-pub fn render_stats(data: &StatsData) -> Markup {
+pub fn render_stats(data: &StatsData, csrf_token: &str) -> Markup {
     let max_daily = data.daily_series.iter().map(|d| d.started.max(d.converged).max(d.failed)).max().unwrap_or(1).max(1);
 
-    layout("Stats — nautiloop", "stats", false, html! {
+    layout("Stats — nautiloop", "stats", false, csrf_token, html! {
         div class="detail" {
             div class="flex items-center justify-between mb-md" {
                 h2 style="font-size: 1.125rem; font-family: var(--font-display); font-weight: 700;" { "Stats" }
