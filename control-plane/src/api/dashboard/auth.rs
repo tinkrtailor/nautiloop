@@ -107,16 +107,35 @@ pub async fn dashboard_auth_middleware(
     }
 }
 
-/// Set the CSRF cookie on a response via `append`. Multiple `nautiloop_csrf`
-/// cookies may accumulate across requests, but `extract_cookie_value` takes
-/// the last match, so the browser-sent cookie always matches the latest token.
+/// Set the CSRF cookie on a response. Uses a dedicated helper that avoids
+/// accumulating multiple `nautiloop_csrf` Set-Cookie headers across the
+/// middleware chain. The cookie uses `Path=/dashboard` consistently with
+/// the login page's CSRF cookie to prevent path-scoped conflicts.
 fn set_csrf_cookie(response: &mut Response, csrf_token: &str) {
     let csrf_cookie = format!(
         "nautiloop_csrf={}; HttpOnly; SameSite=Strict; Path=/dashboard; Max-Age=604800",
         csrf_token
     );
     if let Ok(val) = csrf_cookie.parse() {
-        response.headers_mut().append(header::SET_COOKIE, val);
+        // Remove any existing nautiloop_csrf Set-Cookie headers to prevent
+        // accumulation, then append the new one. We can't use `insert` because
+        // that would clobber other Set-Cookie headers (e.g., nautiloop_api_key).
+        let headers = response.headers_mut();
+        let other_cookies: Vec<_> = headers
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter(|v| {
+                v.to_str()
+                    .map(|s| !s.starts_with("nautiloop_csrf="))
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        headers.remove(header::SET_COOKIE);
+        for cookie in other_cookies {
+            headers.append(header::SET_COOKIE, cookie);
+        }
+        headers.append(header::SET_COOKIE, val);
     }
 }
 

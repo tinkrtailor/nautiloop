@@ -1322,6 +1322,7 @@ mod tests {
             kube_client: None,
             pool: None,
             stats_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            fleet_cache: Arc::new(tokio::sync::RwLock::new(None)),
             api_key: None,
         };
         let router = crate::api::build_router_no_auth(state);
@@ -1590,6 +1591,7 @@ mod tests {
             kube_client: None,
             pool: None,
             stats_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            fleet_cache: Arc::new(tokio::sync::RwLock::new(None)),
             api_key: None,
         };
         let app = crate::api::build_router_no_auth(state);

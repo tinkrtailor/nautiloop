@@ -98,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
                 kube_client: Some(kube_client),
                 pool: Some(pool.clone()),
                 stats_cache: Arc::new(tokio::sync::RwLock::new(None)),
+                fleet_cache: Arc::new(tokio::sync::RwLock::new(None)),
                 api_key: std::env::var("NAUTILOOP_API_KEY").ok(),
             };
             let router = api::build_router(app_state);

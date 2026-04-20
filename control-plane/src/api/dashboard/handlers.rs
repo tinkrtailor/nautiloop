@@ -28,7 +28,7 @@ pub async fn login_page(Query(params): Query<HashMap<String, String>>) -> Respon
     let html = render::render_login(error, &csrf_token).into_string();
 
     let csrf_cookie = format!(
-        "nautiloop_csrf={}; HttpOnly; SameSite=Strict; Path=/dashboard/login; Max-Age=3600",
+        "nautiloop_csrf={}; HttpOnly; SameSite=Strict; Path=/dashboard; Max-Age=3600",
         csrf_token
     );
     let mut response = Html(html).into_response();
@@ -658,6 +658,24 @@ pub async fn proxy_extend(
     })))
 }
 
+/// GET /dashboard/api/pod-introspect/:id — pod introspection proxy (cookie-authed, FR-5a).
+/// Proxies to the same pod introspection logic as the main API endpoint, but
+/// goes through the dashboard auth middleware (which accepts cookies) instead of
+/// the main API auth middleware (which only accepts Bearer headers).
+pub async fn proxy_pod_introspect(
+    State(state): State<AppState>,
+    Path(loop_id): Path<Uuid>,
+) -> Result<Response, NautiloopError> {
+    // Delegate to the main pod_introspect handler logic.
+    // We call it directly rather than re-implementing to keep the proxy thin.
+    let response = super::super::introspect::pod_introspect(
+        State(state),
+        Path(loop_id),
+    )
+    .await?;
+    Ok(response.into_response())
+}
+
 /// GET /dashboard/state — JSON roll-up for card grid polling (FR-8b).
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct DashboardStateResponse {
@@ -683,7 +701,7 @@ pub struct DashboardLoopSummary {
     pub updated_at: chrono::DateTime<Utc>,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FleetSummaryJson {
     pub text: String,
     pub total_loops: usize,
@@ -692,7 +710,7 @@ pub struct FleetSummaryJson {
     pub avg_rounds: Option<f64>,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CountsJson {
     pub active: usize,
     pub converged: usize,
@@ -716,24 +734,26 @@ pub async fn dashboard_state(
         None
     };
 
-    let loops = state
-        .store
-        .get_loops_for_engineer(effective_engineer.as_deref(), show_team, true)
-        .await?;
-
     let state_filter = query.state_filter.as_deref().unwrap_or("active");
 
-    // Fetch rounds for all loops in a single query (avoids N+1)
+    // Optimization: for the default "active" filter, only fetch non-terminal loops
+    // from the DB instead of fetching all (potentially 10,000+) historical loops.
+    // The "all" filter still requires include_terminal=true.
+    let include_terminal = !matches!(state_filter, "active");
+    let loops = state
+        .store
+        .get_loops_for_engineer(effective_engineer.as_deref(), show_team, include_terminal)
+        .await?;
+
+    // Fetch rounds for the view-filtered loops only
     let loop_ids: Vec<Uuid> = loops.iter().map(|l| l.id).collect();
     let all_rounds = state.store.get_rounds_for_loops(&loop_ids).await?;
 
     let mut summaries = Vec::with_capacity(loops.len());
-    let mut loop_costs: HashMap<Uuid, f64> = HashMap::new();
     for record in &loops {
         let rounds = all_rounds.get(&record.id).map(|v| v.as_slice()).unwrap_or(&[]);
         let (total_tokens, total_cost, last_verdict) = compute_round_metrics(rounds);
         let current_stage = resolve_current_stage_with_rounds(record, rounds);
-        loop_costs.insert(record.id, total_cost);
 
         let include = match state_filter {
             "active" => !record.state.is_terminal(),
@@ -765,56 +785,9 @@ pub async fn dashboard_state(
         });
     }
 
-    // Fleet summary uses ALL loops regardless of current view filter (FR-9a).
-    // When show_team=true and no engineer filter, the initial query already fetched
-    // all loops — reuse them instead of issuing a second DB query.
-    let has_all_loops = show_team && query.engineer.is_none();
-    let fleet = if has_all_loops {
-        compute_fleet_summary(&loops, &loop_costs)
-    } else {
-        let all_loops_for_fleet = state
-            .store
-            .get_loops_for_engineer(None, true, true)
-            .await?;
-        let mut fleet_costs: HashMap<Uuid, f64> = loop_costs.clone();
-        let fleet_ids_needed: Vec<Uuid> = all_loops_for_fleet
-            .iter()
-            .filter(|l| !fleet_costs.contains_key(&l.id))
-            .map(|l| l.id)
-            .collect();
-        if !fleet_ids_needed.is_empty() {
-            let extra = state.store.get_rounds_for_loops(&fleet_ids_needed).await?;
-            for l in &all_loops_for_fleet {
-                fleet_costs.entry(l.id).or_insert_with(|| {
-                    let rounds = extra.get(&l.id).map(|v| v.as_slice()).unwrap_or(&[]);
-                    let (_, cost, _) = compute_round_metrics(rounds);
-                    cost
-                });
-            }
-        }
-        compute_fleet_summary(&all_loops_for_fleet, &fleet_costs)
-    };
-    let fleet_json = FleetSummaryJson {
-        text: format_fleet_text(&fleet),
-        total_loops: fleet.total_loops,
-        total_cost: fleet.total_cost,
-        converge_rate: fleet.converge_rate,
-        avg_rounds: fleet.avg_rounds,
-    };
-
-    let counts = CountsJson {
-        active: loops.iter().filter(|l| !l.state.is_terminal()).count(),
-        converged: loops
-            .iter()
-            .filter(|l| {
-                matches!(
-                    l.state,
-                    LoopState::Converged | LoopState::Hardened | LoopState::Shipped
-                )
-            })
-            .count(),
-        failed: loops.iter().filter(|l| l.state == LoopState::Failed).count(),
-    };
+    // Fleet summary + counts use ALL loops (FR-9a). Cache with 10s TTL to
+    // avoid fetching unbounded historical data on every 5s poll cycle.
+    let (fleet_json, counts) = compute_fleet_cached(&state).await?;
 
     Ok(Json(DashboardStateResponse {
         loops: summaries,
@@ -992,16 +965,22 @@ pub async fn specs_page(
 ) -> Result<Html<String>, NautiloopError> {
     let csrf_token = csrf_from(csrf_ext);
 
-    // Fetch all loops (terminal + active) and filter by spec_path.
-    // get_loops_for_engineer(None, true, true) returns everything.
-    let all_loops = state
-        .store
-        .get_loops_for_engineer(None, true, true)
-        .await?;
-    let matching: Vec<_> = all_loops
+    // Fetch loops matching this spec_path efficiently:
+    // - Terminal loops: use get_terminal_loops with spec_path filter (DB-level)
+    // - Active loops: use get_loops_for_engineer(None, true, false) and filter in memory
+    //   (active loops are a small set, so in-memory filtering is fine)
+    let (terminal_loops, active_loops) = tokio::join!(
+        state.store.get_terminal_loops(None, Some(&spec_path), None, None, 500),
+        state.store.get_loops_for_engineer(None, true, false),
+    );
+    let terminal_loops = terminal_loops?;
+    let active_loops = active_loops?;
+    let active_matching: Vec<_> = active_loops
         .into_iter()
         .filter(|l| l.spec_path == spec_path)
         .collect();
+    let mut matching = terminal_loops;
+    matching.extend(active_matching);
 
     // Fetch rounds for all matching loops in one query
     let spec_loop_ids: Vec<Uuid> = matching.iter().map(|l| l.id).collect();
@@ -1148,6 +1127,63 @@ pub struct EngineerStatsJson {
     pub loops: usize,
     pub cost: f64,
     pub converge_rate: f64,
+}
+
+/// Compute fleet summary + counts with a 10-second cache (FR-9a performance).
+/// The fleet summary aggregates ALL loops regardless of the current view filter,
+/// so it's the same for every poll. Caching avoids fetching unbounded historical
+/// data on every 5s card-grid poll cycle.
+async fn compute_fleet_cached(
+    state: &AppState,
+) -> Result<(FleetSummaryJson, CountsJson), NautiloopError> {
+    // Check cache under read lock
+    {
+        let guard = state.fleet_cache.read().await;
+        if let Some((ref fleet, ref counts, ref cached_at)) = *guard
+            && Utc::now() - *cached_at < Duration::seconds(10)
+        {
+            return Ok((fleet.clone(), counts.clone()));
+        }
+    }
+    // Cache miss — compute from all loops and store under write lock
+    let all_loops = state
+        .store
+        .get_loops_for_engineer(None, true, true)
+        .await?;
+    let all_ids: Vec<Uuid> = all_loops.iter().map(|l| l.id).collect();
+    let all_rounds = state.store.get_rounds_for_loops(&all_ids).await?;
+    let mut loop_costs: HashMap<Uuid, f64> = HashMap::new();
+    for l in &all_loops {
+        let rounds = all_rounds.get(&l.id).map(|v| v.as_slice()).unwrap_or(&[]);
+        let (_, cost, _) = compute_round_metrics(rounds);
+        loop_costs.insert(l.id, cost);
+    }
+    let fleet = compute_fleet_summary(&all_loops, &loop_costs);
+    let fleet_json = FleetSummaryJson {
+        text: format_fleet_text(&fleet),
+        total_loops: fleet.total_loops,
+        total_cost: fleet.total_cost,
+        converge_rate: fleet.converge_rate,
+        avg_rounds: fleet.avg_rounds,
+    };
+    let counts = CountsJson {
+        active: all_loops.iter().filter(|l| !l.state.is_terminal()).count(),
+        converged: all_loops
+            .iter()
+            .filter(|l| {
+                matches!(
+                    l.state,
+                    LoopState::Converged | LoopState::Hardened | LoopState::Shipped
+                )
+            })
+            .count(),
+        failed: all_loops.iter().filter(|l| l.state == LoopState::Failed).count(),
+    };
+    {
+        let mut guard = state.fleet_cache.write().await;
+        *guard = Some((fleet_json.clone(), counts.clone(), Utc::now()));
+    }
+    Ok((fleet_json, counts))
 }
 
 // ── Shared helpers ──
@@ -1673,6 +1709,7 @@ mod tests {
             kube_client: None,
             pool: None,
             stats_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            fleet_cache: Arc::new(tokio::sync::RwLock::new(None)),
             api_key: Some(key.to_string()),
         }
     }

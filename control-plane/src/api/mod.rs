@@ -21,6 +21,10 @@ use crate::state::StateStore;
 /// Cached stats entry: (window_key, stats_data, cached_at).
 pub type StatsCacheEntry = Option<(String, dashboard::render::StatsData, chrono::DateTime<chrono::Utc>)>;
 
+/// Cached fleet summary + counts: (fleet_json, counts_json, cached_at).
+/// Short TTL (10s) for the dashboard_state endpoint which is polled every 5s.
+pub type FleetCacheEntry = Option<(dashboard::handlers::FleetSummaryJson, dashboard::handlers::CountsJson, chrono::DateTime<chrono::Utc>)>;
+
 /// Shared application state for all API handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -36,6 +40,9 @@ pub struct AppState {
     pub pool: Option<sqlx::PgPool>,
     /// Per-instance stats cache for the dashboard (FR-14b).
     pub stats_cache: Arc<tokio::sync::RwLock<StatsCacheEntry>>,
+    /// Per-instance fleet summary cache for the dashboard_state endpoint.
+    /// 10s TTL — reduces DB load from the 5s card-grid poll.
+    pub fleet_cache: Arc<tokio::sync::RwLock<FleetCacheEntry>>,
     /// API key for dashboard auth. Read from NAUTILOOP_API_KEY env var at startup
     /// and injected here so tests can set it without `unsafe { set_var() }`.
     pub api_key: Option<String>,
@@ -122,6 +129,7 @@ mod tests {
             kube_client: None,
             pool: None,
             stats_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            fleet_cache: Arc::new(tokio::sync::RwLock::new(None)),
             api_key: None,
         };
         build_router(state)
@@ -330,6 +338,7 @@ mod tests {
             kube_client: None,
             pool: None,
             stats_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            fleet_cache: Arc::new(tokio::sync::RwLock::new(None)),
             api_key: None,
         };
         let app = build_router(state);
