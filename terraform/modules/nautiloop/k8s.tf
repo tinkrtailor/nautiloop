@@ -305,6 +305,20 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["create", "update", "get"]
+  # Matches dev/k8s/02-rbac.yaml. The dashboard log-stream endpoints
+  # (/logs, /pod-logs, /ps) and /cache disk-usage endpoint all need to
+  # list pods, read their logs, and exec into running agent pods in
+  # this namespace. Without these rules every tail returns 403. See
+  # control-plane/src/api/handlers.rs:538 and api/cache.rs:142.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "get"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["get", "create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
