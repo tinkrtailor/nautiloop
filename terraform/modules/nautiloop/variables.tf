@@ -79,19 +79,19 @@ variable "acme_email" {
 variable "control_plane_image" {
   description = "Control plane container image"
   type        = string
-  default     = "ghcr.io/tinkrtailor/nautiloop-control-plane:0.7.1"
+  default     = "ghcr.io/tinkrtailor/nautiloop-control-plane:0.7.3"
 }
 
 variable "agent_base_image" {
   description = "Agent base container image"
   type        = string
-  default     = "ghcr.io/tinkrtailor/nautiloop-agent-base:0.7.1"
+  default     = "ghcr.io/tinkrtailor/nautiloop-agent-base:0.7.3"
 }
 
 variable "sidecar_image" {
   description = "Auth sidecar container image"
   type        = string
-  default     = "ghcr.io/tinkrtailor/nautiloop-sidecar:0.7.1"
+  default     = "ghcr.io/tinkrtailor/nautiloop-sidecar:0.7.3"
 }
 
 # --- Optional: tuning ---
@@ -116,6 +116,21 @@ variable "cert_manager_version" {
     condition     = can(regex("^v[0-9]+\\.[0-9]+\\.[0-9]+$", var.cert_manager_version))
     error_message = "cert_manager_version must be a semver tag (e.g., v1.14.0). No extra flags or characters."
   }
+}
+
+variable "dashboard_secure_cookie" {
+  description = <<-EOT
+    Controls the `Secure` flag on dashboard session cookies.
+    - null (default): auto-detect. When domain is unset (IP-only Tailscale
+      deployments), defaults to false so browsers accept cookies over plain HTTP.
+      When domain is set (TLS-fronted), defaults to true.
+    - false: never set Secure. Required for plain-HTTP deployments. Browsers
+      silently drop Secure cookies over HTTP; without this override, users
+      bounce off /dashboard/login forever.
+    - true: always set Secure. Use when you terminate TLS in front of the server.
+  EOT
+  type        = bool
+  default     = null
 }
 
 variable "postgres_password" {
