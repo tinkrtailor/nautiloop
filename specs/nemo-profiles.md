@@ -91,7 +91,7 @@ desktop_notifications = false
 
 **FR-1b.** Profile names MUST match `^[a-zA-Z0-9][a-zA-Z0-9-]*$` (letters, digits, hyphens; start alphanumeric; minimum 1 character — single-char names like `d` are valid). Reserved name `default` is allowed. Profile names are **case-sensitive**: `Work` and `work` are distinct profiles. No normalization is performed.
 
-**FR-1c.** `current_profile` MUST point at a defined profile. If missing or invalid, CLI errors on any command that needs a server URL. **Cold-start case (no config file):** When no `~/.nemo/config.toml` exists, `NemoConfig::default()` returns an empty `profiles` map and empty `current_profile`. Commands that require a server URL error with: `No profiles configured. Run 'nemo profile add <name> --server <url> --api-key <key> --engineer <id>' to get started.` This matches current behavior where an unconfigured CLI errors when hitting the server. Commands that don't need config (`help`, `capabilities`, `init`) work normally.
+**FR-1c.** `current_profile` MUST point at a defined profile. There are two error cases: (1) `current_profile` is `None` (not set) — this is the cold-start case; (2) `current_profile` is `Some(name)` but `name` is not a key in `profiles` — this is the "dangling reference" case. Both error on any command that needs a server URL. **Cold-start case (no config file):** When no `~/.nemo/config.toml` exists, `NemoConfig::default()` returns an empty `profiles` map and `current_profile = None`. Commands that require a server URL error with: `No profiles configured. Run 'nemo profile add <name> --server <url> --api-key <key> --engineer <id>' to get started.` **Dangling reference case:** If `current_profile` names a profile not in the map, error with: `Active profile '<name>' not found. Available: <list>. Run 'nemo use-profile <name>' to fix.` This matches current behavior where an unconfigured CLI errors when hitting the server. Commands that don't need config (`help`, `capabilities`, `init`) work normally.
 
 ### FR-2: Backward-compatible migration
 
@@ -116,9 +116,9 @@ Migration is idempotent: no-op if already in profile shape.
 | Command | Behavior |
 |---|---|
 | `nemo profile ls` (alias `list`) | Print all profiles, one per line, active one marked `*`. Include server_url and engineer for context. |
-| `nemo profile show [<name>]` | Print the full profile detail. Omit name = current profile. Redacts api_key (`***` or first/last 4 chars). |
+| `nemo profile show [<name>]` | Print the full profile detail. Omit name = current profile. Redacts api_key per NFR-3 redaction format. Pass `--unmask` to show the full api_key. |
 | `nemo profile add <name>` | All connection fields supplied via flags (see FR-3b). Defaults for `--name` and `--email` are copied from the current profile (same person, different cluster); `--server` and `--api-key` have no default and are required. Writes new profile. Does NOT switch to it; use `use-profile` separately. `--switch` flag combines both. |
-| `nemo profile rm <name>` | Remove profile. Errors if `<name>` is the active one (at least one profile must always exist; to remove the last remaining profile, create a new one, switch to it, then remove the old one). |
+| `nemo profile rm <name>` | Remove profile. Errors if `<name>` is the currently active profile with: `Cannot remove the active profile '<name>'. Switch to another profile first with 'nemo use-profile <other>'.` (The "at least one profile" invariant is implied: you can't remove the active profile, and there must always be an active profile.) |
 | `nemo profile rename <old> <new>` | Rename. `<new>` must satisfy FR-1b name regex. Errors if a profile named `<new>` already exists. If `<old>` was active, update `current_profile` accordingly. |
 | `nemo use-profile <name>` (alias `nemo profile use`) | Set `current_profile = <name>` in config. Prints new active state. Errors if `<name>` doesn't exist. |
 
@@ -134,6 +134,8 @@ Migration is idempotent: no-op if already in profile shape.
 
 **FR-4c.** If a specified profile doesn't exist (via flag or env), CLI errors with the full list: `Profile 'staging' not found. Available: dev, personal, work.`
 
+**FR-4d.** The existing `--server` flag continues to work as before: after profile resolution (per FR-4b precedence), `--server` overrides the resolved profile's `server_url` for that invocation. For example, `nemo --profile work --server http://other status` resolves the `work` profile but uses `http://other` as the server URL. All other profile fields (api_key, engineer, etc.) still come from the resolved profile. `--server` does not modify the config file.
+
 ### FR-5: `nemo status` / `nemo helm` profile indicator
 
 **FR-5a.** `nemo status` output gains a header line naming the effective profile (after precedence resolution per FR-4b — whether it came from `--profile` flag, `NAUTILOOP_PROFILE` env var, or `current_profile`):
@@ -143,7 +145,7 @@ Migration is idempotent: no-op if already in profile shape.
 LOOP ID ...
 ```
 
-**FR-5b.** `nemo helm` TUI header (existing "nautiloop" top-left) appends the profile in muted color: `nautiloop · work`. Tells the operator at a glance which cluster they're driving.
+**FR-5b.** `nemo helm` TUI header (existing "nautiloop" top-left) appends the profile using the theme's secondary/dim text color: `nautiloop · work`. Use the existing `ThemeName` system's dim/secondary text style for the profile name portion. Tells the operator at a glance which cluster they're driving.
 
 **FR-5c.** `nemo config` (with no args) now prints the active profile + all profile names, not just flat fields. Output format:
 
@@ -152,7 +154,7 @@ Active profile: work
 Profiles: default, personal, work*
 
   server_url: https://nautiloop.work.internal
-  api_key:    ****789
+  api_key:    abc1****789z
   engineer:   ggylfason
   name:       Gunnar
   email:      gunnar@work.example.com
@@ -166,7 +168,7 @@ Profiles: default, personal, work*
   reviewer: (not set)
 ```
 
-The active profile's fields are shown in full (with `api_key` redacted per NFR-3). Root-level sections (`[helm]`, `[models]`) are shown after the profile fields. Fields that are unset show `(not set)`.
+The active profile's fields are shown in full (with `api_key` redacted per NFR-3 standard format). Root-level sections (`[helm]`, `[models]`) are shown after the profile fields. Fields that are unset show `(not set)`.
 
 ### FR-6: `nemo config --set` aware of profiles
 
@@ -183,7 +185,7 @@ The active profile's fields are shown in full (with `api_key` redacted per NFR-3
 
 ### FR-6g: `nemo config --get` aware of profiles
 
-**FR-6g.** `nemo config --get <key>` reads from the active profile for profile-scoped keys (`server_url`, `api_key`, `engineer`, `name`, `email`) and from the root for root-scoped keys (`helm.desktop_notifications`, `helm.theme`, `models.implementor`, `models.reviewer`). The same allow-list from FR-6c applies. `--profile` flag overrides which profile to read from, following the same precedence as FR-4b. `api_key` is printed redacted unless `--unmask` is passed (consistent with `nemo profile show` redaction in NFR-3). Unrecognized keys are rejected with the same error message as FR-6c. If a key is unset (e.g., `name` is `None`), print nothing and exit with code 1.
+**FR-6g.** `nemo config --get <key>` reads from the active profile for profile-scoped keys (`server_url`, `api_key`, `engineer`, `name`, `email`) and from the root for root-scoped keys (`helm.desktop_notifications`, `helm.theme`, `models.implementor`, `models.reviewer`). The same allow-list from FR-6c applies. `--profile` flag overrides which profile to read from, following the same precedence as FR-4b. `api_key` is printed redacted (per NFR-3 format) unless `--unmask` is passed. `--unmask` is a flag on the `nemo config` subcommand (not a global flag). It applies to both `--get api_key` and the no-args display (FR-5c). `nemo profile show` also accepts `--unmask` (see FR-3a). Unrecognized keys are rejected with the same error message as FR-6c. If a key is unset (e.g., `name` is `None`), print nothing and exit with code 1.
 
 ### FR-6d: Internal struct layout (implementation note)
 
@@ -191,7 +193,7 @@ The current `EngineerConfig` struct holds all fields flat. After this change, th
 
 ```rust
 struct NemoConfig {
-    current_profile: String,
+    current_profile: Option<String>,  // None = no profile selected (cold-start); Some(name) = active profile
     profiles: HashMap<String, ProfileConfig>,
     helm: HelmConfig,        // root-level, engineer-global
     models: ModelsSection,   // root-level, engineer-global
@@ -206,7 +208,11 @@ struct ProfileConfig {
 }
 ```
 
+`current_profile` is `Option<String>` to distinguish "not set" (`None`, cold-start case per FR-1c) from "set but dangling" (`Some(name)` where name is not in `profiles`). Serde deserializes a missing `current_profile` key as `None`. An empty string `""` is treated the same as `None` (normalized on load).
+
 `api_key` is `Option<String>` to match current behavior where `api_key` can be absent in the config file. Migration preserves whatever value (or absence) was in the flat config. Commands that require an API key (e.g., those hitting the server) bail at runtime if `api_key` is `None`, matching the current behavior. `nemo profile add --api-key` requires a non-empty value (FR-3b), but profiles created via migration may have `api_key = None`.
+
+`engineer` is `String` (non-optional). Migration preserves whatever value exists in the flat config, including empty string from serde default. Commands that require an engineer name (e.g., `start`, `harden`, `ship`) fail at runtime if `engineer` is empty — matching current behavior where an empty `engineer` field causes server-side errors. `nemo profile add --engineer` requires a non-empty value (FR-3b), but migrated profiles may have `engineer: ""`.
 
 A resolved accessor (e.g., `NemoConfig::active_profile(&self) -> &ProfileConfig`) returns the active profile's fields after applying the precedence chain (`--profile` > `NAUTILOOP_PROFILE` > `current_profile`). Code that currently reads `config.server_url` changes to `config.active_profile().server_url`. Code that reads `config.helm` or `config.models` continues reading from the root struct unchanged.
 
@@ -240,13 +246,15 @@ Any existing `~/.nemo/config.toml` works via FR-2 migration. First command after
 
 ### NFR-3: Secret handling
 
-API keys in the file stay at 0600 permissions (matches current behavior). `nemo profile show` redacts by default. No logging of keys.
+API keys in the file stay at 0600 permissions (matches current behavior). `nemo profile show` and `nemo config` redact api_key by default. No logging of keys.
+
+**Redaction format** (consistent across all display commands — `profile show`, `config`, `config --get api_key`): keys longer than 12 characters show first 4 + `****` + last 4 characters (e.g., `abc1****789z`); keys 12 characters or shorter show `****`. This matches the current `config.rs` redaction behavior. Pass `--unmask` on `nemo config` or `nemo profile show` to display the full key.
 
 ### NFR-4: Tests
 
 - **Unit** (`cli/src/config.rs`): migration from flat → profiles is idempotent; adds a profile; removes a profile; renames; switches active.
 - **Unit**: precedence chain `--profile` > `NAUTILOOP_PROFILE` > `current_profile`.
-- **Integration** (`cli/tests/profiles.rs`): spawn nemo with a test HOME, run migration, run `profile ls`, `use-profile`, `profile rm`.
+- **Integration** (`cli/tests/profiles.rs`): spawn nemo with a test HOME, run migration, run `profile ls`, `use-profile`, `profile rm`. Note: this requires creating the `cli/tests/` directory, which does not currently exist. The existing codebase uses inline `#[cfg(test)]` modules; integration tests in a separate `tests/` directory are appropriate here since they spawn the binary as a subprocess.
 
 ## Acceptance Criteria
 
