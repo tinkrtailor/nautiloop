@@ -146,8 +146,15 @@ spec:
               cpu: 100m
               memory: 64Mi
           startupProbe:
-            tcpSocket:
-              port: 9090
+            # Port 9090 (model proxy) binds on loopback only, so kubelet
+            # probes get connection-refused. Port 9093 (health endpoint)
+            # binds on all interfaces and its /healthz returns 200 once
+            # all four sidecar listeners are up (see sidecar/src/main.rs
+            # FR-20, FR-22). Matches the agent-pod pattern in
+            # control-plane/src/k8s/job_builder.rs.
+            httpGet:
+              path: /healthz
+              port: 9093
             periodSeconds: 2
             failureThreshold: 30
       containers:
@@ -300,8 +307,15 @@ spec:
               cpu: 100m
               memory: 64Mi
           startupProbe:
-            tcpSocket:
-              port: 9090
+            # Port 9090 (model proxy) binds on loopback only, so kubelet
+            # probes get connection-refused. Port 9093 (health endpoint)
+            # binds on all interfaces and its /healthz returns 200 once
+            # all four sidecar listeners are up (see sidecar/src/main.rs
+            # FR-20, FR-22). Matches the agent-pod pattern in
+            # control-plane/src/k8s/job_builder.rs.
+            httpGet:
+              path: /healthz
+              port: 9093
             periodSeconds: 2
             failureThreshold: 30
       containers:
