@@ -166,10 +166,19 @@ data:
   id_ed25519: ${base64encode(local.deploy_private_key)}
 YAML
 
-  # Judge credentials (only rendered when judge_anthropic_key provided).
-  # Secret shape: data.anthropic = raw API key string (base64-encoded by K8s).
-  # This matches the format that nautiloop-creds-<engineer> secrets use,
-  # so the auth-sidecar reads /secrets/model-credentials/anthropic as-is.
+  # Judge credentials — prefers Claude OAuth bundle (Anthropic subscription),
+  # falls back to raw Anthropic API key. Secret shape matches nautiloop-creds-<engineer>
+  # so the auth-sidecar reads /secrets/model-credentials/{claude,anthropic} as-is.
+  # Precedence (higher wins):
+  #   1. judge_claude_credentials — JSON bundle from `nemo auth --claude` / ~/.claude/.credentials.json
+  #   2. judge_anthropic_key — raw Anthropic API key (legacy fallback)
+  _judge_has_claude    = var.judge_claude_credentials != null && var.judge_claude_credentials != ""
+  _judge_has_anthropic = var.judge_anthropic_key != null && var.judge_anthropic_key != ""
+  _judge_creds_data = (
+    local._judge_has_claude ? "  claude: ${base64encode(coalesce(var.judge_claude_credentials, ""))}" :
+    local._judge_has_anthropic ? "  anthropic: ${base64encode(coalesce(var.judge_anthropic_key, ""))}" :
+    ""
+  )
   _judge_creds_yaml_template = <<-YAML
 apiVersion: v1
 kind: Secret
@@ -177,9 +186,9 @@ metadata:
   name: nautiloop-judge-creds
   namespace: nautiloop-system
 data:
-  anthropic: ${base64encode(coalesce(var.judge_anthropic_key, ""))}
+${local._judge_creds_data}
 YAML
-  judge_creds_yaml           = var.judge_anthropic_key != null ? local._judge_creds_yaml_template : ""
+  judge_creds_yaml = (local._judge_has_claude || local._judge_has_anthropic) ? local._judge_creds_yaml_template : ""
 
   # Registry creds (only rendered when image_pull_secret provided)
   _dockerconfigjson_b64 = var.image_pull_secret_dockerconfigjson != null ? base64encode(var.image_pull_secret_dockerconfigjson) : ""

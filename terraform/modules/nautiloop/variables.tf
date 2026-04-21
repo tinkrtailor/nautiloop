@@ -181,7 +181,19 @@ variable "judge_api_key" {
 }
 
 variable "judge_anthropic_key" {
-  description = "Raw Anthropic API key for the orchestrator judge. Creates nautiloop-judge-creds secret with data.anthropic (same format as agent creds). If null, judge falls back to heuristic."
+  description = "Raw Anthropic API key for the orchestrator judge (fallback path). Prefer judge_claude_credentials for subscription-based auth. If null AND judge_claude_credentials is null, judge falls back to heuristic."
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
+variable "judge_claude_credentials" {
+  description = <<-EOT
+    Claude OAuth bundle (contents of ~/.claude/.credentials.json) for the orchestrator judge.
+    This uses your Anthropic subscription via OAuth — the same auth path agent pods use.
+    Preferred over judge_anthropic_key. Creates nautiloop-judge-creds secret with data.claude.
+    If null AND judge_anthropic_key is null, judge falls back to heuristic.
+  EOT
   type        = string
   default     = null
   sensitive   = true
