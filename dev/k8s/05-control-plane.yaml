@@ -31,6 +31,14 @@ spec:
           restartPolicy: Always
           ports:
             - containerPort: 9090
+          env:
+            # Sidecar fatals without GIT_REPO_URL (FR-24). Control-plane
+            # doesn't use the git SSH proxy but the binary binds all
+            # four listeners unconditionally. In dev this points at the
+            # nautiloop repo itself; setup.sh patches the value via
+            # kubectl set env if NAUTILOOP_GIT_REPO_URL differs.
+            - name: GIT_REPO_URL
+              value: "git@github.com:tinkrtailor/nautiloop.git"
           volumeMounts:
             - name: judge-creds
               mountPath: /secrets/model-credentials
@@ -43,8 +51,11 @@ spec:
               cpu: 100m
               memory: 64Mi
           startupProbe:
-            tcpSocket:
-              port: 9090
+            # 9090 is loopback-only; kubelet must probe the health port
+            # (9093, bound on all interfaces).
+            httpGet:
+              path: /healthz
+              port: 9093
             periodSeconds: 2
             failureThreshold: 30
       containers:
@@ -176,6 +187,14 @@ spec:
           restartPolicy: Always
           ports:
             - containerPort: 9090
+          env:
+            # Sidecar fatals without GIT_REPO_URL (FR-24). Control-plane
+            # doesn't use the git SSH proxy but the binary binds all
+            # four listeners unconditionally. In dev this points at the
+            # nautiloop repo itself; setup.sh patches the value via
+            # kubectl set env if NAUTILOOP_GIT_REPO_URL differs.
+            - name: GIT_REPO_URL
+              value: "git@github.com:tinkrtailor/nautiloop.git"
           volumeMounts:
             - name: judge-creds
               mountPath: /secrets/model-credentials
@@ -188,8 +207,11 @@ spec:
               cpu: 100m
               memory: 64Mi
           startupProbe:
-            tcpSocket:
-              port: 9090
+            # 9090 is loopback-only; kubelet must probe the health port
+            # (9093, bound on all interfaces).
+            httpGet:
+              path: /healthz
+              port: 9093
             periodSeconds: 2
             failureThreshold: 30
       containers:
