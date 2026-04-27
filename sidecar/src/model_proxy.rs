@@ -1119,31 +1119,40 @@ const DEFAULT_INSTRUCTIONS: &str = "Follow the instructions provided in the inpu
 ///
 /// Always: inject `"instructions"` if absent.
 ///
-/// Token-limit field: `max_output_tokens` for both upstreams.
+/// Token-limit field handling depends on the upstream:
 ///
-/// **History.** v0.5.x (commit 9711e86) added a CodexOauth-specific
-/// inverted rename — `max_output_tokens → max_tokens` — under the
-/// belief that `chatgpt.com/backend-api/codex/responses` required the
-/// legacy `max_tokens` name. That was true at the time. OpenAI has
-/// since unified the wire format across `api.openai.com/v1/responses`
-/// and the chatgpt-codex endpoint; both now require
-/// `max_output_tokens` and reject `max_tokens` with `Bad Request:
-/// {"detail":"Unsupported parameter: max_tokens"}`. The previously
-/// "necessary" inverted rename became the regression.
+/// - **api.openai.com/v1/responses** (api-key path): expects
+///   `max_output_tokens`. We rename `max_tokens → max_output_tokens`
+///   so opencode/codex clients that emit either name reach the
+///   upstream with the modern field.
 ///
-/// We now rewrite `max_tokens → max_output_tokens` regardless of
-/// credential type. Clients (opencode ≤1.3.17) emit either name and
-/// can't tell which upstream the sidecar routes to; the sidecar
-/// normalizes once before forwarding so neither client nor server has
-/// to care.
+/// - **chatgpt.com/backend-api/codex/responses** (CodexOauth path):
+///   does not accept any token-limit field on the request. Verified
+///   two ways:
+///     1. Direct probe (curl through the sidecar) returned 400
+///        `{"detail":"Unsupported parameter: <field>"}` for every
+///        name tried (`max_tokens`, `max_output_tokens`,
+///        `max_completion_tokens`, `max_response_output_tokens`,
+///        `max_response_tokens`, `response_max_tokens`,
+///        `output_tokens`); only the no-field body returned 200.
+///     2. The OpenAI Codex CLI's own bug tracker confirms it —
+///        `openai/codex#4138` reports that `model_max_output_tokens`
+///        in `~/.codex/config.toml` is a no-op because the CLI never
+///        sends a token-limit field on this endpoint.
+///   We strip both `max_tokens` and `max_output_tokens`; the upstream
+///   applies its own default.
 ///
-/// `is_codex_oauth` is retained in the signature because the body
-/// patch may yet need to diverge by upstream (e.g. an
-/// account-id-bearing header) — but as of this fix it's a no-op
-/// distinguisher and both branches do the same thing.
+/// **History.** v0.5.x (commit 9711e86) added an inverted rename
+/// `max_output_tokens → max_tokens` for CodexOauth under the (then
+/// correct) assumption that chatgpt codex required the legacy
+/// `max_tokens` name. v0.7.18 swung the other way and renamed
+/// uniformly to `max_output_tokens`, which moved the symptom from
+/// `Unsupported parameter: max_tokens` to `Unsupported parameter:
+/// max_output_tokens`. v0.7.19 verified via direct probe that
+/// chatgpt codex accepts no field — the right move is to strip.
 ///
 /// Returns the original bytes unchanged if the body is not valid JSON.
-fn patch_responses_body(bytes: Bytes, _is_codex_oauth: bool) -> Bytes {
+fn patch_responses_body(bytes: Bytes, is_codex_oauth: bool) -> Bytes {
     let Ok(mut payload) =
         serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&bytes)
     else {
@@ -1157,12 +1166,21 @@ fn patch_responses_body(bytes: Bytes, _is_codex_oauth: bool) -> Bytes {
         );
         modified = true;
     }
-    if let Some(v) = payload.remove("max_tokens") {
-        // `insert` overwrites any pre-existing `max_output_tokens`,
-        // which is the right behavior when both names appear in the
-        // same body (some opencode versions hedge by sending both).
-        // The two values are intended to mean the same thing; an
-        // explicit operator-set max_tokens wins.
+    if is_codex_oauth {
+        // chatgpt codex rejects every token-limit field we know about.
+        // Strip both names — the endpoint applies its own default.
+        if payload.remove("max_tokens").is_some() {
+            modified = true;
+        }
+        if payload.remove("max_output_tokens").is_some() {
+            modified = true;
+        }
+    } else if let Some(v) = payload.remove("max_tokens") {
+        // api.openai.com path: rename to the modern name. `insert`
+        // overwrites any pre-existing `max_output_tokens` so a body
+        // hedging with both names lands with a single canonical
+        // value (the explicit `max_tokens` wins, since the two are
+        // semantically the same).
         payload.insert("max_output_tokens".to_string(), v);
         modified = true;
     }
@@ -1629,27 +1647,41 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_oauth_renames_max_tokens_to_max_output_tokens() {
-        // chatgpt.com/backend-api/codex/responses now uses the same
-        // `max_output_tokens` field name as api.openai.com/v1/responses;
-        // a bare `max_tokens` is rejected. v0.7.18 unified the rewrite
-        // so the CodexOauth path no longer keeps the legacy name.
+    fn test_codex_oauth_strips_max_tokens() {
+        // Verified via direct probe (2026-04): chatgpt.com codex's
+        // /backend-api/codex/responses endpoint rejects max_tokens,
+        // max_output_tokens, max_completion_tokens, and every other
+        // token-limit name we tested. It accepts the request only when
+        // no such field is present. Strip rather than rename.
         let input = br#"{"model":"gpt-5.4","input":"review","max_tokens":4096}"#;
         let result = patch_responses_body(Bytes::from_static(input), true);
         let out: serde_json::Value = serde_json::from_slice(&result).unwrap();
-        assert_eq!(out["max_output_tokens"], 4096);
         assert!(out.get("max_tokens").is_none());
+        assert!(out.get("max_output_tokens").is_none());
     }
 
     #[test]
-    fn test_codex_oauth_preserves_max_output_tokens() {
-        // Already in the modern shape — the patch has nothing to do
-        // for the token field.
+    fn test_codex_oauth_strips_max_output_tokens() {
+        // Same upstream constraint applies in the modern-shape direction.
         let input = br#"{"model":"gpt-5.4","input":"review","max_output_tokens":4096}"#;
         let result = patch_responses_body(Bytes::from_static(input), true);
         let out: serde_json::Value = serde_json::from_slice(&result).unwrap();
-        assert_eq!(out["max_output_tokens"], 4096);
         assert!(out.get("max_tokens").is_none());
+        assert!(out.get("max_output_tokens").is_none());
+    }
+
+    #[test]
+    fn test_codex_oauth_strips_both_when_both_present() {
+        // Hedging body shape — strip both, leave the model and input
+        // alone so the request still validates.
+        let input =
+            br#"{"model":"gpt-5.4","input":"review","max_tokens":4096,"max_output_tokens":2048}"#;
+        let result = patch_responses_body(Bytes::from_static(input), true);
+        let out: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert!(out.get("max_tokens").is_none());
+        assert!(out.get("max_output_tokens").is_none());
+        assert_eq!(out["model"], "gpt-5.4");
+        assert_eq!(out["input"], "review");
     }
 
     #[test]
@@ -1674,22 +1706,12 @@ mod tests {
     }
 
     #[test]
-    fn test_both_token_fields_max_tokens_wins() {
-        // Some opencode builds send both names in the same body. The
-        // patch removes max_tokens and inserts max_output_tokens with
-        // its value, overwriting any pre-existing max_output_tokens.
-        // This is the right call: an operator who explicitly set
-        // max_tokens almost certainly meant THAT value, and the two
-        // fields are supposed to mean the same thing.
+    fn test_non_codex_oauth_both_fields_max_tokens_wins() {
+        // Api-key path with both names: keep the modern field name,
+        // use max_tokens' value (semantically the same; explicit wins).
         let input =
             br#"{"model":"gpt-5.4","input":"review","max_tokens":4096,"max_output_tokens":2048}"#;
         let result = patch_responses_body(Bytes::from_static(input), false);
-        let out: serde_json::Value = serde_json::from_slice(&result).unwrap();
-        assert_eq!(out["max_output_tokens"], 4096);
-        assert!(out.get("max_tokens").is_none());
-
-        // Same on the codex-oauth route.
-        let result = patch_responses_body(Bytes::from_static(input), true);
         let out: serde_json::Value = serde_json::from_slice(&result).unwrap();
         assert_eq!(out["max_output_tokens"], 4096);
         assert!(out.get("max_tokens").is_none());
