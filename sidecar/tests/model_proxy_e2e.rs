@@ -256,16 +256,18 @@ async fn test_api_key_injects_instructions() {
 
 /// POST /openai/v1/responses with a CodexOauth credential.
 ///
-/// Assert: `instructions` injected, body's token field is
-/// `max_output_tokens` (regardless of whether the client sent
-/// `max_tokens` or `max_output_tokens`), Authorization = Bearer
-/// <access>, chatgpt-account-id header present.
+/// Assert: `instructions` injected, both `max_tokens` and
+/// `max_output_tokens` STRIPPED from the body (chatgpt codex rejects
+/// every token-limit field name; the endpoint accepts the request only
+/// when no such field is present), Authorization = Bearer <access>,
+/// chatgpt-account-id header present.
 ///
-/// v0.7.18 unified the rename: chatgpt.com/backend-api/codex/responses
-/// now requires `max_output_tokens` like api.openai.com does. The old
-/// inverted rename (max_output_tokens → max_tokens for CodexOauth) was
-/// the regression that surfaced as `Bad Request: {"detail":"Unsupported
-/// parameter: max_tokens"}`.
+/// **v0.7.19 corrects v0.7.18.** v0.7.18 thought renaming to
+/// `max_output_tokens` would work; the actual chatgpt-codex endpoint
+/// then returned `Bad Request: {"detail":"Unsupported parameter:
+/// max_output_tokens"}`. Direct probe (curl through the running sidecar
+/// against chatgpt-codex) confirmed every plausible token-limit name
+/// is rejected. Stripping is the only request body that gets accepted.
 #[tokio::test]
 async fn test_codex_oauth_patches_body() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -284,8 +286,8 @@ async fn test_codex_oauth_patches_body() {
     })
     .await;
 
-    // Send `max_tokens` — the legacy name. The sidecar must rewrite to
-    // `max_output_tokens` even on the codex-oauth route.
+    // Send `max_tokens` — the legacy name. The sidecar must STRIP it
+    // entirely on the codex-oauth route (not rename).
     let (status, _body) = post(
         proxy_addr,
         "/openai/v1/responses",
@@ -321,21 +323,20 @@ async fn test_codex_oauth_patches_body() {
         );
     }
 
-    // Body: instructions injected, max_tokens rewritten to max_output_tokens.
+    // Body: instructions injected, BOTH token-limit fields stripped.
     let body: serde_json::Value =
         serde_json::from_slice(&req.body).expect("upstream body must be JSON");
     assert!(
         body.get("instructions").is_some(),
         "instructions must be injected: {body}"
     );
-    assert_eq!(
-        body.get("max_output_tokens").and_then(|v| v.as_u64()),
-        Some(4096),
-        "max_output_tokens must be 4096 after rename: {body}"
+    assert!(
+        body.get("max_output_tokens").is_none(),
+        "max_output_tokens must be stripped on codex-oauth route: {body}"
     );
     assert!(
         body.get("max_tokens").is_none(),
-        "max_tokens must be removed: {body}"
+        "max_tokens must be stripped on codex-oauth route: {body}"
     );
 }
 
