@@ -194,6 +194,20 @@ spec:
                 secretKeyRef:
                   name: nautiloop-git-host-token
                   key: GIT_HOST_TOKEN
+            # gh CLI requires GH_TOKEN (or GITHUB_TOKEN) for non-interactive
+            # auth — it does NOT read GIT_HOST_TOKEN. Without this, the
+            # converge_harden_clean() path's server-side `gh pr create`
+            # shellout (control-plane/src/git/mod.rs::create_pr) fails with
+            # "gh auth login required" and the harden loop wedges on
+            # repeated transient-tick retries after audit returns clean.
+            # Source the same cluster PAT the secret already holds.
+            # Mirrors dev/k8s/05-control-plane.yaml since commit 9520014;
+            # that fix never propagated into the terraform module until now.
+            - name: GH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: nautiloop-git-host-token
+                  key: GIT_HOST_TOKEN
             - name: BARE_REPO_PATH
               value: /bare-repo
             # The api-server shells out to `git fetch` against the upstream
@@ -344,6 +358,15 @@ spec:
                   name: nautiloop-postgres-credentials
                   key: DATABASE_URL
             - name: GIT_HOST_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: nautiloop-git-host-token
+                  key: GIT_HOST_TOKEN
+            # The loop engine is the one that invokes converge_harden_clean
+            # (control-plane/src/loop_engine/driver.rs:1249) and from there
+            # the server-side `gh pr create`. Same auth requirement as the
+            # api-server above. See that block for the full reasoning.
+            - name: GH_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: nautiloop-git-host-token
